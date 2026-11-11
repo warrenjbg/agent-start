@@ -1,4 +1,4 @@
-# Hermes Controller — Spec & Interface Contracts (v2 — LOCKED after Fable 5.2 review)
+# Hermes Controller — Spec & Interface Contracts (v2 — LOCKED after Fable 5.2 review; v1.1 amendments at the end)
 
 Windows 11 desktop widget (Python 3.11+, venv is 3.14; CustomTkinter 6, dark mode, 360x260 logical px) that:
 1. **ON**: optionally force-closes RAM-hungry apps/games (only those the user ticks), then starts the local
@@ -10,8 +10,9 @@ and wants "little else open"); VRAM only changes speed. Only ONE Strata may run 
 
 Project dir: `C:\Users\<user>\Downloads\Hermes Controller` · interpreter `.venv\Scripts\python.exe`
 (customtkinter 6.0, psutil 7.2, pywin32 (win32gui/win32process/win32pdh/win32event/win32api/win32con/winerror),
-winotify; Pillow 13 is installed for test screenshots only). **No pynvml** (verified: NVML reports
-`usedGpuMemory=None` for all 48 GPU processes on this WDDM box).
+winotify; Pillow 13 is installed for test screenshots only). **No pynvml for per-process VRAM** (verified: NVML
+reports `usedGpuMemory=None` for all 48 GPU processes on this WDDM box); v1.1 uses pynvml (nvidia-ml-py) only for
+the device-level total in the stats section.
 Shipped code has no TODO/FIXME/placeholder text and no stub `pass` bodies.
 
 ## Files & ownership
@@ -334,3 +335,90 @@ class EndpointManager:
   destroy; a failed cancel shows ERROR instead of IDLE.
 - Verified: a Strata spawned by the controller survives the controller exiting under the venv `pythonw.exe`
   redirector (no job-object kill) — so "No" to "Stop Strata before exit?" leaves it running.
+
+## v1.1.0 amendments (configurable launcher, stats section, central version)
+
+### Files added
+| File | Purpose |
+|---|---|
+| `version.py` | `__version__` — the single source. `tools/sync_version.py` generates `installer/version_info.txt` + `installer/version.iss` (included by the .iss); `build.bat` runs it first and names the installer from it |
+| `launcher_bat.py` | Pure parser: run-*.bat → `LauncherInfo(bat_path, argv, cwd, strata_dir, port, config_path, model_name)`; `list_launchers`, `configured_bat`, `apply_to_config`, `same_launch`, `missing_files`; raises `LauncherError` (message shown inline) |
+| `settings_dialog.py` | `SettingsDialog(master, cfg, detector, on_save, on_closed, current_bat, running, on_whitelist_saved)` — 340x252, same modal recipe |
+| `metrics_store.py` | `MetricsStore` (accumulate /metrics requests by id, keep 30; live values), `decode_rate`, `prompt_rate`, `fetch_metrics(root_url)` |
+| `vram_sampler.py` | `VramSampler` — daemon thread, NVML device memory every 2 s, 5-minute deque, `snapshot()`, `push_external()` fallback |
+| `graphs.py` | `LineGraph`, `BarGraph` (tk.Canvas), `StatRow`; `nice_ceil`, `fmt_scale`, `fmt_rate` |
+| `tests/test_launcher_bat.py`, `tests/test_stats.py`, `tests/test_e2e_fake.py` | see README |
+
+### Launcher (.bat)
+- The .bat is READ, never executed. Parsing: `\r\r\n`/`\r\n` line ends; `^` continuations; `@`, `rem`, `::`, labels
+  skipped; `set VAR=v` / `set "VAR=v"`; `%VAR%` (bat-local, then environment, unknown → empty), `%~dp0`-style
+  modifiers, `%%`; `cd /d` / `chdir` / `pushd` set the working directory (initially the .bat's folder); lines are
+  split at unquoted `&` `|`, redirections dropped; tokens follow the MSVCRT rules.
+- The launch line is the first command containing a token that ends with `serve\server.py` (path-segment boundary,
+  same rule as `server_manager._is_strata_cmd`) preceded within 6 tokens by a `python*`/`py`/`pyw` interpreter
+  (so `call`, `start "" /b`, `if … (` prefixes and `-u`-style options work). Otherwise → `LauncherError`
+  "… does not start Strata".
+- Result: interpreter, script and `--config` value made absolute against the working directory; `--open` removed;
+  `--port N` / `--port=N` extracted (default 8080; invalid → error). `strata_dir` = parent of `serve\`.
+  `model_name` = config json `model`, else `model_name`, else the config file name without `strata-`, else the .bat
+  name without `run-`. `endpoint_url` = `http://127.0.0.1:<port>/v1`.
+- config.json keys written together on Save (`launcher_bat.LAUNCHER_KEYS`): `launcher_bat` (FULL path),
+  `launch_cmd`, `launch_cwd` (new; `Popen` cwd, falls back to `strata_dir`), `strata_dir`, `port`, `endpoint_url`,
+  `model_name`. Save re-reads config.json from disk and replaces only these keys (same pattern as the whitelist).
+- Backward compatibility: a v1.0 config (relative `launcher_bat`, hand-written `launch_cmd`, no `launch_cwd`) starts
+  unchanged; `configured_bat()` resolves the relative name against `strata_dir` to preselect it in the dropdown.
+- **Applying**: `EndpointManager` reads `port` / `endpoint_url` / `strata_dir` live from the shared dict, so the
+  dict is only switched while the UI is IDLE/ERROR **and** `endpoint.is_running()` is False. Otherwise the choice is
+  saved to disk, kept as `_pending_launcher`, shown as "`<bat>` applies next start" in the ACTIVE detail line, and
+  applied on the next transition to IDLE/ERROR or at the next ON. Never restarts Strata.
+- `_launcher_cmd` (stop path) also recognises `cmd.exe /c <configured launcher_bat>` when that .bat is outside
+  `strata_dir`.
+
+### Settings dialog
+- Gear → `SettingsDialog` (disabled while STARTING/STOPPING, as before). Dropdown = `list_launchers(strata_dir)`
+  (only `run-*.bat`) + the current/pending launcher if it lives elsewhere; "Browse…" (`filedialog`, any .bat);
+  read-only line `model · config file · port` or the rejection reason in `T.RED_TEXT` (Save disabled);
+  "Protected apps…" opens `WhitelistModal` on top (Settings releases its grab, re-grabs when the modal closes,
+  closes it if Settings closes); Cancel / Save; version label.
+- Shared dialog helpers in `sweep_dialog.py`: `style_dialog` (dark caption + app icon — CTkToplevel otherwise swaps
+  in CustomTkinter's icon after 200 ms), `later` (tracked `after`), `release_modal` (cancels them).
+
+### Stats section
+- Chevron (`T.CHEVRON_DOWN`/`UP`, 20x16) in the memory-card header; collapsed geometry is exactly 360x268.
+  Expanded: memory card bottom pad 16 → 8, stats card (`STATS_H` = 3 x 82 + 2) gridded at row 5,
+  geometry 360x`HEIGHT_EXPANDED` (524); the window is slid up if it would leave the monitor's work area.
+  `stats_expanded` persisted in state.json (written on a worker).
+- Rows (`StatRow`, 82 px: 16 header + 40 canvas): title · muted tag (`live`/`last`) · mono value with unit;
+  graph with a 34 px left gutter holding the light max-scale label, dashed line at the maximum, solid baseline.
+  tk.Canvas is not scaled by CTk: all sizes/fonts are multiplied by the widget scaling at draw time
+  (fonts in negative = pixel sizes).
+  - **VRAM · 5 min** — `VramSampler` (own thread, always running; one NVML call per 2 s). Scale = card total.
+    Line grey (`T.TEXT_3`), and green (`T.ACCENT`, tinted area) inside the spans where Strata was alive
+    (server launch → stopped, tracked in `_track_span`). NVML missing/failing → "VRAM unavailable"; if Strata's
+    `/metrics` `hardware.gpu_mem_used/total` (bytes) is available it is fed in via `push_external` instead.
+  - **Decode · per request** — bars of `requests[].decode_tok_s`, last 30; live bar = `live.tok_s`
+    (`tok_s_mean` while 0) when `live.state == "generating"`.
+  - **Prompt reading · per request** — `prompt_read / (prompt_ms / 1000)`; without `prompt_read`:
+    `prompt_total − reused`. Skipped when `prompt_ms` is missing or < 50 ms, or fewer than 64 tokens were read.
+    Live = `live.prefill_tok_s_mean`, else Δ`prompt_read`/Δt between two polls, when `live.state == "reading"`.
+- `/metrics`: `GET <server root>/metrics` with `Accept: application/json` (Strata answers Prometheus text only for
+  `text/plain`/openmetrics/`format=prometheus`), no proxy, 1.5 s timeout, on the `hc-metrics` worker every 2 s,
+  **only** while state is ACTIVE/STOPPING and the section is expanded and the window is not iconified. Results go
+  through `self.post`; an epoch counter drops answers of a previous server. Strata returns its newest 12 requests
+  → accumulated by `id` (fallback key: time) to 30. History is cleared at each server start, kept after OFF.
+- Empty states: "Strata is off" (not serving, no data), "No requests yet" / "No prompt reads yet", "Metrics
+  unavailable" (3 failed polls and no data), "VRAM unavailable", "Collecting…".
+- Test seams: `HermesControllerApp(..., metrics_fetcher=None, vram_sampler=None)`.
+
+### Code review (v1.1) — fixed
+- A monitor reading probed before a state change is dropped (`_state_seq`): a stale "active" delivered after OFF no
+  longer flips the idle window back to Serving.
+- Result notes ("Stopped · freed …", "Start cancelled", …) are held 4 s (`_set_note`); before, the sweep preview
+  requested right after replaced them within a fraction of a second.
+- Second instance: the running window is found by class `TkTopLevel` + title (an Explorer window of the folder
+  "Hermes Controller" has the same title).
+- Dialog icon (see `style_dialog`), dialog `after` scripts cancelled on close, dialogs centred within the virtual
+  desktop (multi-monitor) instead of being pulled to the primary screen.
+- `config_store.save_state` read-modify-write under the lock; `os.replace` retried on `PermissionError`;
+  `_check_config` also handles `OSError` and a reset that fails.
+- Stop path: `/unload` is no longer POSTed to a port whose listener could not be identified as Strata.

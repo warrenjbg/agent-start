@@ -976,6 +976,34 @@ def test_stats_section(app, det, ep) -> None:
     check(not app.expanded, "collapsed again")
 
 
+def test_notes_and_stale_status(app, det, ep) -> None:
+    """Review fixes: result notes stay readable; a monitor reading taken before a state change is dropped."""
+    ep.status_value = dict(IDLE_STATUS)
+    app._set_state("IDLE")
+    to_active(app, ep)
+    app.on_toggle()
+    ep.status_value = dict(IDLE_STATUS)
+    seq_before_stop = app._state_seq
+    fire(ep.stop_calls[-1][0], stop_result())
+    check(pump_until(app, lambda: app.state_name == "IDLE"), "OFF -> IDLE (note test)")
+    n = len(det.sweep_calls)
+    pump(app, 1.5)
+    check(app.preview.cget("text") == "Stopped · freed 2.0 GB" and len(det.sweep_calls) == n,
+          f"'Stopped · freed' note is held, not replaced by the sweep preview at once ({app.preview.cget('text')!r})")
+    app._on_monitor_status(seq_before_stop, active_status())      # probed while Strata was still up
+    check(app.state_name == "IDLE", "stale 'active' monitor reading after OFF is ignored")
+    check(pump_until(app, lambda: "pre-selected" in app.preview.cget("text"), 6),
+          f"sweep preview returns when the note expires ({app.preview.cget('text')!r})")
+    app._on_monitor_status(app._state_seq, active_status())       # a current reading still reconciles
+    check(app.state_name == "ACTIVE", "fresh monitor reading IDLE -> ACTIVE")
+    ep.status_value = dict(IDLE_STATUS)
+    app.on_status(ep.status()); app.on_status(ep.status())
+    pump(app, 0.1)
+    check(app.state_name == "IDLE" and app.preview.cget("text") == "Endpoint is no longer running",
+          "ACTIVE -> IDLE note")
+    app._set_state("IDLE")
+
+
 def test_stats_persist_and_scaling() -> None:
     """A saved 'expanded' flag is honoured at startup; the section fits at 100 % and at 150 % scaling."""
     config_store.save_state({"stats_expanded": True})
@@ -1027,7 +1055,7 @@ def test_stats_persist_and_scaling() -> None:
 
 # ---------------------------------------------------------------- v1.1: settings dialog / launcher
 def make_strata(root: Path, name: str, ports: dict[str, int]) -> Path:
-    """A fake Strata install: serve\\server.py, a python.exe placeholder, run-<n>.bat + strata-<n>.json per model."""
+    """A fake Strata install: serve\\server.py, a python.exe stub file, run-<n>.bat + strata-<n>.json per model."""
     sdir = root / name
     (sdir / "serve").mkdir(parents=True)
     (sdir / ".venv" / "Scripts").mkdir(parents=True)
@@ -1258,7 +1286,7 @@ def run() -> int:
                              (test_off_flow, (app, det, ep, dialogs)), (test_error_and_cancel, (app, det, ep)),
                              (test_sweep_dialog_close_x, (app, det, ep)), (test_whitelist_modal, (app, det, ep)),
                              (test_load_progress_view, (app, det, ep)), (test_strata_estimate, (app, det, ep)),
-                             (test_stats_section, (app, det, ep))):
+                             (test_stats_section, (app, det, ep)), (test_notes_and_stale_status, (app, det, ep))):
                 print(f"-- {fn.__name__}")
                 try:
                     fn(*args)

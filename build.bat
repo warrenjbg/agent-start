@@ -3,7 +3,9 @@ rem Build HermesController.exe (PyInstaller one-folder) and the per-user install
 setlocal
 cd /d "%~dp0"
 set PY=.venv\Scripts\python.exe
-set ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe
+set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
+rem machine-wide Inno Setup install (winget run elevated) lives under Program Files (x86)
+if not exist "%ISCC%" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
 
 if not exist "%PY%" (echo Project venv not found: %PY% & goto :fail)
 

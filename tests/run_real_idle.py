@@ -9,12 +9,9 @@ def snap():
     app.attributes("-topmost", True); app.update(); time.sleep(0.3)
     x, y = app.winfo_rootx(), app.winfo_rooty()
     ImageGrab.grab(bbox=(x, y, x + app.winfo_width(), y + app.winfo_height())).save(shot)
-    print("state:", getattr(app, "_state", "?"))
-    for attr in ("_preview", "_preview_label", "preview_label"):
-        w = getattr(app, attr, None)
-        if w is not None:
-            print("preview:", w.cget("text").replace("\n", " | "))
-    app._shutdown() if hasattr(app, "_shutdown") else app.destroy()
+    print("state:", app.state_name)
+    print("preview:", app.preview.cget("text").replace("\n", " | "))
+    app._finish_exit()
 app.after(12000, snap)
 app.mainloop()
 print("exited cleanly")

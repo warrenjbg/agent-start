@@ -69,6 +69,7 @@ PROGRESS_MS = 500
 MEMORY_S = 2.0
 STATS_MS = 2000                          # stats redraw + /metrics poll period
 METRICS_FAILS_SHOWN = 3                  # consecutive failed polls before "Metrics unavailable"
+NOTE_HOLD_S = 4.0                        # a one-off result line stays this long before the sweep preview returns
 ERROR_HOLD_S = 15.0
 
 _SINGLETON_MUTEX = None  # kept referenced for process life (see main())
@@ -140,6 +141,8 @@ class HermesControllerApp(ctk.CTk):
         self._tick_id: str | None = None
         self._first_id: str | None = None
         self._stats_id: str | None = None
+        self._note_id: str | None = None
+        self._note_until = 0.0
         self._stop_evt = threading.Event()
 
         self.state_name = IDLE
@@ -355,9 +358,27 @@ class HermesControllerApp(ctk.CTk):
     def _set_preview(self, text: str, color: str = T.TEXT_2) -> None:
         self.preview.configure(text=text, text_color=color)
 
+    def _set_note(self, text: str) -> None:
+        """A one-off result line ("Stopped · freed 13.5 GB", "Start cancelled") that stays readable for a few
+        seconds. Without the hold the idle sweep preview, requested right after, replaced it within ~0.3 s."""
+        self._set_preview(text)
+        self._note_until = time.monotonic() + NOTE_HOLD_S
+        if self._note_id is not None:
+            try:
+                self.after_cancel(self._note_id)
+            except Exception:  # noqa: BLE001
+                log.debug("after_cancel failed", exc_info=True)
+        self._note_id = self.after(int(NOTE_HOLD_S * 1000) + 50, self._note_expired)
+
+    def _note_expired(self) -> None:
+        self._note_id = None
+        self._note_until = 0.0
+        self._request_preview()
+
     def _set_state(self, st: str) -> None:
         self.state_name = st
         self._state_seq += 1
+        self._note_until = 0.0                   # a note belongs to the state it was shown in
         if st != ERROR:
             self._error_hold_until = 0.0
         if st in (IDLE, ERROR):                  # no Strata of ours any more: drop memory baselines
@@ -405,7 +426,7 @@ class HermesControllerApp(ctk.CTk):
     def toggle_stats(self) -> None:
         self.expanded = not self.expanded
         self._apply_expanded()
-        config_store.save_state({"stats_expanded": self.expanded})
+        self._run_worker("hc-state", config_store.save_state, {"stats_expanded": self.expanded})   # fsync off the UI
 
     def _apply_expanded(self) -> None:
         """Grow the window downward to show the stats card, or shrink back to the exact v1.0 size."""
@@ -680,6 +701,8 @@ class HermesControllerApp(ctk.CTk):
             if status.get("model_id"):
                 self.model_id = status.get("model_id")
             if changed:
+                if self.state_name != ACTIVE:
+                    self._metrics_fails = 0     # failed polls of the previous server say nothing about this one
                 self._set_state(ACTIVE)
         elif self.state_name == ACTIVE and live == "idle":
             self._idle_streak += 1
@@ -688,7 +711,7 @@ class HermesControllerApp(ctk.CTk):
             self._idle_streak = 0
             self.model_id, self.loaded = None, None
             self._set_state(IDLE)
-            self._set_preview("Endpoint is no longer running")
+            self._set_note("Endpoint is no longer running")
             self._request_preview()
 
     def _reconcile_now(self, note: str | None = None) -> None:
@@ -696,7 +719,7 @@ class HermesControllerApp(ctk.CTk):
         self._start_phase = None
         self._set_state(IDLE)
         if note:
-            self._set_preview(note)
+            self._set_note(note)
 
         def work() -> None:
             try:
@@ -711,7 +734,7 @@ class HermesControllerApp(ctk.CTk):
     def _after_reconcile(self, status: dict) -> None:
         live = (status or {}).get("state")
         if live in ("starting", "stopping") and self.state_name == IDLE:
-            self._set_preview(f"Endpoint is busy ({live}) — try again shortly")
+            self._set_note(f"Endpoint is busy ({live}) — try again shortly")
         self.on_status(status)
         if self._exit_pending and self.state_name in (IDLE, ERROR):
             self._finish_exit()
@@ -737,7 +760,7 @@ class HermesControllerApp(ctk.CTk):
         # ERROR keeps its message (and log link) until the user acts; only IDLE shows the sweep preview
         if self.state_name != IDLE or self._preview_busy:
             return
-        if time.monotonic() < self._error_hold_until:
+        if time.monotonic() < max(self._error_hold_until, self._note_until):
             return
         try:
             if self.state() == "iconic":
@@ -757,7 +780,7 @@ class HermesControllerApp(ctk.CTk):
 
     def _apply_preview(self, res: dict) -> None:
         self._preview_busy = False
-        if self.state_name != IDLE:
+        if self.state_name != IDLE or time.monotonic() < self._note_until:
             return
         if "_error" in res:
             self._set_preview(f"Scan failed: {res['_error']}")
@@ -814,7 +837,7 @@ class HermesControllerApp(ctk.CTk):
         if decision == "cancel":
             self._start_phase = None
             self._set_state(IDLE)
-            self._set_preview("Start cancelled")
+            self._set_note("Start cancelled")
             if self._exit_pending:
                 self._finish_exit()
             return
@@ -892,7 +915,7 @@ class HermesControllerApp(ctk.CTk):
         if elapsed > 15:                         # a real cold load (adopting a running server is ~instant)
             old = self._expected_s
             self._expected_s = elapsed if not old else max(elapsed, 0.5 * old + 0.5 * elapsed)
-            config_store.save_state({"last_cold_load_s": round(self._expected_s, 1)})
+            self._run_worker("hc-state", config_store.save_state, {"last_cold_load_s": round(self._expected_s, 1)})
         if self._avail_at_launch is not None:
             try:
                 self._strata_est = max(0.0, self._avail_at_launch - psutil.virtual_memory().available / 1048576.0)
@@ -938,7 +961,7 @@ class HermesControllerApp(ctk.CTk):
             if self._dialog_open() and isinstance(self.dialog, SweepDialog):
                 self.dialog._decide("cancel")
             self._set_state(IDLE)
-            self._set_preview("Start cancelled")
+            self._set_note("Start cancelled")
             return
         self._start_token += 1
         self._start_phase = None
@@ -976,14 +999,14 @@ class HermesControllerApp(ctk.CTk):
         if result.get("cancelled_start"):
             self.model_id, self.loaded = None, None
             self._set_state(IDLE)
-            self._set_preview("Start cancelled")
+            self._set_note("Start cancelled")
             self._request_preview()
         elif result.get("port_released"):
             self.model_id, self.loaded = None, None
             self._avail_at_launch = None
             self.add_freed(result.get("ram_freed_mb"))
             self._set_state(IDLE)
-            self._set_preview(f"Stopped · freed {_gb(result.get('ram_freed_mb'))}")
+            self._set_note(f"Stopped · freed {_gb(result.get('ram_freed_mb'))}")
             self._request_preview()
         else:
             self.show_error(result.get("error") or "Stop failed — port still in use")
@@ -1054,7 +1077,7 @@ class HermesControllerApp(ctk.CTk):
         self._pending_launcher = None
         log.info("launcher applied: %s -> %s on port %s", info.bat_name, info.model_name, info.port)
         if note and self.state_name == IDLE:
-            self._set_preview(f"Launcher set to {_short(info.bat_name, 30)}\n{info.summary()}")
+            self._set_note(f"Launcher set to {_short(info.bat_name, 30)}\n{info.summary()}")
         return True
 
     def open_whitelist(self) -> None:
@@ -1124,7 +1147,7 @@ class HermesControllerApp(ctk.CTk):
             self.vram.stop()
         except Exception:  # noqa: BLE001
             log.debug("vram sampler stop failed", exc_info=True)
-        for aid in (self._pump_id, self._tick_id, self._first_id, self._progress_id, self._stats_id):
+        for aid in (self._pump_id, self._tick_id, self._first_id, self._progress_id, self._stats_id, self._note_id):
             if aid:
                 try:
                     self.after_cancel(aid)
@@ -1178,20 +1201,28 @@ def _setup_logging() -> None:
 
 
 def _check_config() -> None:
-    """A corrupt config.json must not end in a raw traceback: move it aside, reseed, tell the user where."""
+    """A corrupt config.json must not end in a raw traceback: move it aside, reseed, tell the user where.
+    If it still cannot be read afterwards (locked / no permission), say so and exit instead of crashing."""
     try:
         config_store.load_config()
-    except ValueError as exc:                        # includes json.JSONDecodeError
-        bad = config_store.CONFIG_PATH.with_name("config.bad.json")
-        try:
-            os.replace(config_store.CONFIG_PATH, bad)
-        except OSError:
-            log.exception("could not move the broken config aside")
+        return
+    except (ValueError, OSError) as exc:             # ValueError includes JSONDecodeError / UnicodeDecodeError
+        first = exc
+    bad = config_store.CONFIG_PATH.with_name("config.bad.json")
+    try:
+        os.replace(config_store.CONFIG_PATH, bad)
         config_store.ensure_data_dir()
-        log.error("config.json unreadable (%s); moved to %s", exc, bad)
+        config_store.load_config()
+    except (ValueError, OSError):
+        log.exception("config.json unreadable (%s) and could not be reset", first)
         ctypes.windll.user32.MessageBoxW(
-            None, f"Your settings file could not be read and was reset.\n\nThe old file was saved as:\n{bad}",
-            APP_TITLE, 0x30)
+            None, f"Your settings file could not be read or reset:\n{config_store.CONFIG_PATH}\n\n{first}",
+            APP_TITLE, 0x10)
+        sys.exit(1)
+    log.error("config.json unreadable (%s); moved to %s", first, bad)
+    ctypes.windll.user32.MessageBoxW(
+        None, f"Your settings file could not be read and was reset.\n\nThe old file was saved as:\n{bad}",
+        APP_TITLE, 0x30)
 
 
 def main() -> None:

@@ -537,6 +537,63 @@ def t_cmd_bat_launcher():
         kill_own(cmd)
 
 
+def t_parsed_bat_launch():
+    """v1.1: the config derived from a run-*.bat by launcher_bat is what gets launched - argv without --open,
+    in the .bat's `cd /d` directory - and a double-clicked launcher .bat OUTSIDE strata_dir is still recognised."""
+    import launcher_bat
+    port = free_port()
+    work = TMP / "work dir"
+    work.mkdir(exist_ok=True)
+    ext = Path(tempfile.mkdtemp(prefix="hc-smtest-ext-"))        # a launcher kept outside the Strata folder
+    try:
+        bat = ext / "run-parsed.bat"
+        bat.write_text(f'@echo off\r\ntitle fake\r\ncd /d "{work}"\r\n"{PY}" "{SERVE}" "--port" "{port}" '
+                       f'"--model" "bat-model" "--open"\r\nif errorlevel 1 pause\r\n', encoding="utf-8", newline="")
+        info = launcher_bat.parse_bat(str(bat))
+        assert info.port == port and "--open" not in info.argv and info.cwd == str(work), info
+        assert os.path.normcase(info.strata_dir) == os.path.normcase(str(TMP)), info.strata_dir
+        cfg = make_cfg(free_port())                               # start from another port: the .bat must win
+        launcher_bat.apply_to_config(cfg, info)
+        assert cfg["port"] == port and cfg["endpoint_url"] == f"http://127.0.0.1:{port}/v1"
+        m = mgr_for(cfg)
+        cb = CB()
+        assert m.start_endpoint(cb.ready, cb.error)
+        kind, arg = cb.wait(30)
+        assert kind == "ready", (kind, arg)
+        lp = psutil.Process(listener_pid(port))
+        cmdline = lp.cmdline()
+        assert "--open" not in cmdline and "bat-model" in cmdline, cmdline
+        assert os.path.normcase(lp.cwd()) == os.path.normcase(str(work)), lp.cwd()
+        assert m.status()["model_id"] == "bat-model"
+        note(f"launched from parsed .bat: cwd={lp.cwd()!r}, argv tail={cmdline[2:]}")
+        cbs = CB()
+        assert m.stop_endpoint(cbs.stopped)
+        _, res = cbs.wait(30)
+        assert res["ok"] and res["port_released"], res
+
+        # the same .bat double-clicked by the user (cmd.exe /c) - it is not under strata_dir, but it IS the
+        # configured launcher, so its console is protected and closed together with the server
+        cmd = subprocess.Popen(["cmd.exe", "/c", str(bat)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, creationflags=NOWIN)
+        try:
+            assert wait_until(lambda: listening(port), 15)
+            tree = tree_pids(cmd.pid)
+            assert wait_until(lambda: m.status()["state"] == "active", 10)
+            assert cmd.pid in m.protected_pids()
+            other = mgr_for(dict(cfg, launcher_bat=str(ext / "run-other.bat")))
+            assert cmd.pid not in other.protected_pids(), "a foreign cmd.exe must not be treated as our launcher"
+            cbs = CB()
+            assert m.stop_endpoint(cbs.stopped)
+            _, res = cbs.wait(30)
+            assert res["ok"] and cmd.pid in res["killed_pids"], res
+            assert not alive(tree), alive(tree)
+            note(f"external launcher outside strata_dir: cmd.exe {cmd.pid} protected and closed")
+        finally:
+            kill_own(cmd)
+    finally:
+        shutil.rmtree(ext, ignore_errors=True)
+
+
 def t_callback_invariant():
     time.sleep(0.5)
     bad = [(c.expected, c.calls) for c in ALL_CBS if len(c.calls) != c.expected]
@@ -547,7 +604,7 @@ def t_callback_invariant():
 
 TESTS = [t_launcher_start_stop_toast_logs, t_early_exit, t_validation_errors, t_ready_timeout_kills_spawned,
          t_lazy_load_and_callback_exception, t_adopt, t_busy_then_force, t_cancel_during_start,
-         t_foreign_listener, t_cmd_bat_launcher, t_callback_invariant]
+         t_foreign_listener, t_cmd_bat_launcher, t_parsed_bat_launch, t_callback_invariant]
 
 
 def leaked_processes() -> list[psutil.Process]:
