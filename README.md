@@ -77,8 +77,8 @@ requests per poll, so the bars build up while the section is open; they stay aft
 
 ## Closing apps (the sweep)
 
-Nothing is closed automatically. Pressing **ON** opens a list of candidates; **only games are pre-ticked**.
-Choose *Close selected & start*, *Start without closing*, or *Cancel*. Closing sends the window a normal close
+Nothing is closed automatically. Pressing **ON** opens a list of candidates; **games are pre-ticked**, plus
+whatever the full-speed RAM check below adds. Choose *Close selected & start*, *Start without closing*, or *Cancel*. Closing sends the window a normal close
 first, waits up to 3 s, then force-closes what is left — **unsaved work in those apps is lost**.
 
 Candidates are apps that are not protected and match one of:
@@ -95,6 +95,26 @@ terminals/shells/IDEs, `python`/`node`/`claude`/`hermes`, Strata itself, FanCont
 Tailscale, this app and the program that launched it. Your editable whitelist (`config.json` →
 `user_whitelist`, default includes Brave, Discord, FanControl, OpenRGB, mVolt+, NVIDIA App/Overlay, Obsidian,
 VIA, Moonlight, Hermes) protects those apps and everything they started.
+
+### Full-speed RAM check
+
+Strata is fast only when its whole **expert arena** fits in RAM (46.84 GiB for swift-iq3_s, 39.97 GiB for
+swift-iq3_xxs). With less available it waits 20 s, then falls back to **Low-RAM mode**: experts are read from the
+SSD and decode drops from ~90–100 to ~15–20 tok/s. The arena size is learned from Strata's engine log (the `"log"`
+file named in the launcher's `--config` JSON), so the check works per model and only after that model has loaded
+once.
+
+- **Start dialog:** "Full speed needs ~50 GB free · you have 40 GB". If closing apps can close the gap, the fewest
+  apps are pre-ticked (largest first; with similar sizes, background/GPU apps before ones with a window; protected
+  apps never). A live line updates as you tick: *Ticked apps free ~X GB → full speed* or *Still ~Y GB short →
+  Low-RAM mode (slower)*. If even closing everything is not enough, nothing extra is ticked and it says so.
+- **While loading:** the engine log is read alongside the progress: *Waiting for RAM · needs 47 GB, 40 GB free*, then
+  *Low-RAM mode · reading experts from SSD · slower* in amber if it falls back.
+- **While serving:** the status reads **Serving · Low-RAM mode** with an amber LED and the shortfall, e.g.
+  *Low-RAM mode: reading from SSD (slower) · ~7.3 GB short*. Turn off, close apps, turn on again for full speed.
+
+Target = arena + 3 GiB headroom, measured against Windows *available* RAM. Freed RAM per app is its working set,
+so the numbers are estimates (shown with "~"). Code: `engine_log.py`, `ram_plan.py`.
 
 ## Configuration (`config.json`)
 

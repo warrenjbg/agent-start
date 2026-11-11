@@ -14,7 +14,8 @@ a = Analysis(
     # detector / server_manager are imported lazily in main._build_real_deps; pynvml lazily in vram_sampler.
     # The rest are plain imports PyInstaller finds itself - listed so a refactor to lazy imports cannot drop them.
     hiddenimports=["detector", "server_manager", "win32timezone", "pynvml", "version", "launcher_bat",
-                   "settings_dialog", "metrics_store", "vram_sampler", "graphs"],
+                   "settings_dialog", "metrics_store", "vram_sampler", "graphs",
+                   "engine_log", "ram_plan"],
     excludes=["PIL", "pytest", "unittest", "pydoc", "test", "lib2to3"],
     noarchive=False,
 )

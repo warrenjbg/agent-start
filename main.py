@@ -18,8 +18,10 @@ import customtkinter as ctk
 import psutil
 
 import config_store
+import engine_log
 import launcher_bat
 import load_progress
+import ram_plan
 import metrics_store
 import theme as T
 from graphs import BarGraph, LineGraph, StatRow, fmt_rate
@@ -49,6 +51,8 @@ STATUS = {
     ERROR: ("Error", T.LED["ERROR"]),
 }
 LOADING_STATUS = ("Loading", T.LED["LOADING"])
+LOW_RAM_STATUS = ("Serving · Low-RAM mode", T.AMBER)   # Strata fell back to reading experts from the SSD
+LOW_RAM_NOTE = "Not enough free RAM for full speed: will load slower"
 # Kept for tests/back-compat: the LED colour per state.
 PILL_COLORS = {k: v[1] for k, v in STATUS.items()}
 LOADING_COLOR = LOADING_STATUS[1]
@@ -174,6 +178,10 @@ class HermesControllerApp(ctk.CTk):
         self._spans: list[list[float | None]] = []   # [start, end|None] (monotonic) while Strata was running
         self._avail_at_launch: float | None = None
         self._launch_wall = 0.0                  # time.time() at launch: rejects a previous run's log
+        # Engine-log verdict for the current run (engine_log.EngineLoad): full-RAM vs slow Low-RAM (SSD) mode.
+        # Written by worker threads as one atomic attribute swap, read on the Tk thread.
+        self._engine_load: engine_log.EngineLoad | None = None
+        self._engine_checked = False
         self._strata_est: float | None = None    # latched at ready: RAM Strata took (free-RAM drop)
         self._prog_best: tuple[str, float, str | None] = ("Launching", 0.0, None)
         self._mem: tuple | None = None
@@ -317,6 +325,9 @@ class HermesControllerApp(ctk.CTk):
         title, led = STATUS[st]
         if st == ACTIVE and self.loaded is False:
             title, led = LOADING_STATUS
+        low = st == ACTIVE and self._engine_load is not None and self._engine_load.mode == "low_ram"
+        if low and self.loaded is not False:
+            title, led = LOW_RAM_STATUS
         self.pill.configure(text=title)
         self.led.configure(fg_color=led)
         if st in (IDLE, ERROR):
@@ -338,9 +349,15 @@ class HermesControllerApp(ctk.CTk):
             model = self.model_id or self.cfg.get("model_name") or "model"
             url = str(self.cfg.get("endpoint_url", "")).replace("http://", "")
             extra = " · still loading" if self.loaded is False else ""
+            color = T.TEXT_2
             if self._pending_launcher is not None:       # a launcher saved while running waits for the next start
                 url = f"{_short(self._pending_launcher.bat_name, 28)} applies next start"
-            self._set_preview(f"{model}{extra}\n{url}")
+            elif low:
+                url, color = self._low_ram_line(), T.AMBER
+            self._set_preview(f"{model}{extra}\n{url}", color=color)
+            if not self._engine_checked:
+                self._engine_checked = True
+                self._run_worker("hc-engine-log", self._check_engine_log, self._start_token)
         elif st == ERROR and self.error_text:
             self._set_preview(self.error_text, color=T.RED_TEXT)
         self.preview.configure(cursor="hand2" if st == ERROR and self._error_log else "")
@@ -357,6 +374,45 @@ class HermesControllerApp(ctk.CTk):
 
     def _set_preview(self, text: str, color: str = T.TEXT_2) -> None:
         self.preview.configure(text=text, text_color=color)
+
+    def _strata_config_path(self) -> str | None:
+        """The Strata config JSON from launch_cmd's --config (its "log" field names the engine log)."""
+        cmd = list(self.cfg.get("launch_cmd") or [])
+        for i, a in enumerate(cmd[:-1]):
+            if str(a) == "--config":
+                return str(cmd[i + 1])
+        return None
+
+    def _low_ram_line(self) -> str:
+        ld = self._engine_load
+        short = f" · ~{ld.short_gib:.1f} GB short" if ld and ld.short_gib else ""
+        return f"Low-RAM mode: reading from SSD (slower){short}"
+
+    def _check_engine_log(self, token: int) -> None:
+        """Worker: one engine-log verdict once serving. Our own start: the run since launch; adopted: the latest run."""
+        cfg_path = self._strata_config_path()
+        if not cfg_path:
+            return
+        since = self._launch_wall if self._launch_wall and token == self._start_token else None
+        try:
+            load = engine_log.current(cfg_path, since)
+        except Exception:  # noqa: BLE001
+            log.debug("engine log check failed", exc_info=True)
+            return
+        if load.mode != "unknown":
+            self.post(self._set_engine_load, load)
+
+    def _set_engine_load(self, load) -> None:
+        if self.state_name not in (STARTING, ACTIVE):
+            return
+        changed = (self._engine_load is None) or (self._engine_load.mode != load.mode)
+        self._engine_load = load
+        if changed:
+            log.info("engine load mode: %s (arena %s GiB, available %s GiB, short %s GiB, GPU slots %s%s)",
+                     load.mode, load.arena_gib, load.available_gib, load.short_gib, load.gpu_slots,
+                     ", GPU cache shrunk" if load.gpu_shrunk else "")
+            if self.state_name == ACTIVE:
+                self._apply_state()
 
     def _set_note(self, text: str) -> None:
         """A one-off result line ("Stopped · freed 13.5 GB", "Start cancelled") that stays readable for a few
@@ -384,6 +440,8 @@ class HermesControllerApp(ctk.CTk):
         if st in (IDLE, ERROR):                  # no Strata of ours any more: drop memory baselines
             self._avail_at_launch = None
             self._strata_est = None
+            self._engine_load = None
+            self._engine_checked = False
             self._apply_pending_launcher()
         log.info("state -> %s", st)
         self._apply_state()
@@ -568,11 +626,23 @@ class HermesControllerApp(ctk.CTk):
         if frac < self._prog_best[1]:            # a phase line scrolled out of the tail: never go backwards
             label, frac, detail = self._prog_best
         self._prog_best = (label, frac, detail)
+        ld = self._engine_load                   # the engine log knows what stdout does not
+        warn = False
+        if ld is not None and ld.mode == "waiting_for_ram":
+            label, warn = "Waiting for RAM", True
+            if ld.arena_gib and ld.available_gib:
+                detail = f"needs {ld.arena_gib:.0f} GB, {ld.available_gib:.0f} GB free"
+        elif ld is not None and ld.mode == "low_ram":
+            label, detail, warn = "Low-RAM mode", "reading experts from SSD · slower", True
         self.progress.set(frac)
         self.elapsed.configure(text=load_progress.fmt_elapsed(elapsed))
-        line2 = self._start_note or (
+        note = self._start_note
+        if note == LOW_RAM_NOTE and ld is not None and ld.mode in ("low_ram", "waiting_for_ram"):
+            note = ""                            # the first line already says it, with the engine's numbers
+        line2 = note or (
             f"usually about {load_progress.fmt_elapsed(self._expected_s)}" if self._expected_s else "")
-        self._set_preview(f"{label}{' · ' + detail if detail else ''}" + (f"\n{line2}" if line2 else ""))
+        self._set_preview(f"{label}{' · ' + detail if detail else ''}" + (f"\n{line2}" if line2 else ""),
+                          color=T.AMBER if warn else T.TEXT_2)
         self._progress_id = self.after(PROGRESS_MS, self._progress_tick)
 
     def _log_reader(self, token: int) -> None:
@@ -588,6 +658,14 @@ class HermesControllerApp(ctk.CTk):
                 path = None
             if path:
                 self._log_text = load_progress.read_tail(path)
+            cfg_path = self._strata_config_path()
+            if cfg_path:
+                try:
+                    load = engine_log.current(cfg_path, self._launch_wall)
+                    if load.mode != "unknown":
+                        self._engine_load = load     # atomic swap; the progress tick reads it on the Tk thread
+                except Exception:  # noqa: BLE001
+                    log.debug("engine log read failed", exc_info=True)
             self._stop_evt.wait(1.0)
 
     def strata_estimate(self, avail: float, rss: float | None) -> float | None:
@@ -813,22 +891,42 @@ class HermesControllerApp(ctk.CTk):
             except Exception:
                 log.exception("scan_killable_processes failed; starting without a sweep")
                 cands = []
-            self.post(self._after_scan, token, cands)
+            self.post(self._after_scan, token, cands, self._ram_plan(cands))
 
         self._run_worker("hc-scan", work)
 
     def _token_live(self, token: int) -> bool:
         return token == self._start_token and self.state_name == STARTING
 
-    def _after_scan(self, token: int, cands: list[dict]) -> None:
+    def _ram_plan(self, cands: list[dict]):
+        """Worker: does Strata get its fast full-RAM mode, and which apps would get it there? None if unknown."""
+        try:
+            cfg_path = self._strata_config_path()
+            log_path = engine_log.config_log_path(cfg_path) if cfg_path else None
+            arena = engine_log.learned_arena_gib(log_path) if log_path else None
+            if not arena:
+                return None
+            avail = psutil.virtual_memory().available / 1048576.0
+            protected = {str(n) for n in (self.cfg.get("user_whitelist") or [])}
+            plan = ram_plan.plan(cands, avail, arena, protected_names=protected)
+            log.info("RAM plan: need %.0f MB, available %.0f MB, short %.0f MB, pre-tick %s, reachable %s",
+                     plan.need_mb, plan.available_mb, plan.short_mb, plan.preticked_pids, plan.reachable)
+            return plan
+        except Exception:  # noqa: BLE001
+            log.exception("RAM plan failed; using the detector's pre-ticks")
+            return None
+
+    def _after_scan(self, token: int, cands: list[dict], plan=None) -> None:
         if not self._token_live(token):
             return
         if not cands:
+            if plan is not None and not plan.enough_now:
+                self._sweep_note = LOW_RAM_NOTE
             self._begin_server_start(token)
             return
         self._start_phase = "dialog"
         self._set_preview(f"{len(cands)} app(s) could be closed — choose in the dialog")
-        self.dialog = SweepDialog(self, cands, lambda d, t: self._on_sweep_decision(token, d, t))
+        self.dialog = SweepDialog(self, cands, lambda d, t: self._on_sweep_decision(token, d, t), ram=plan)
 
     def _on_sweep_decision(self, token: int, decision: str, targets: list[tuple[int, float]]) -> None:
         self.dialog = None
@@ -885,6 +983,8 @@ class HermesControllerApp(ctk.CTk):
         self._launch_wall = time.time()
         self._log_text = ""
         self._prog_best = ("Launching", 0.0, None)
+        self._engine_load = None
+        self._engine_checked = False
         self._metrics_epoch += 1                 # a new server: its request history starts empty
         self._metrics_fails = 0
         self.metrics.reset()

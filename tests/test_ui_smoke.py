@@ -772,6 +772,134 @@ def test_load_progress_view(app, det, ep) -> None:
         det.cands = [dict(c) for c in CANDS]
 
 
+def test_low_ram(app, det, ep) -> None:
+    """Full-speed RAM check in the start dialog + Low-RAM (SSD) warnings while loading and serving."""
+    import shutil
+    import tempfile
+    import ram_plan
+    import theme as TH
+    from main import LOW_RAM_NOTE as LOW_RAM_NOTE_TXT
+    d = Path(tempfile.mkdtemp(prefix="hc-lowram-"))
+    eng = d / "strata-test.log"
+    shutil.copy(Path(__file__).parent / "fixtures" / "engine_logs" / "low_ram_iq3_s.log", eng)  # learned arena 46.84
+    cfg_json = d / "strata-test.json"
+    cfg_json.write_text('{"log": "%s"}' % str(eng).replace("\\", "\\\\"), encoding="utf-8")
+    old_cmd = app.cfg.get("launch_cmd")
+    app.cfg["launch_cmd"] = ["python.exe", "server.py", "--config", str(cfg_json), "--port", str(TEST_PORT)]
+    try:
+        check(app._strata_config_path() == str(cfg_json), "config path from launch_cmd --config")
+        plan = app._ram_plan([dict(c) for c in CANDS])
+        check(plan is not None and abs(plan.need_mb - (46.84 + 3.0) * 1024) < 1, f"plan uses the learned arena ({plan})")
+
+        cands = [dict(c) for c in CANDS]
+        total = sum(c["ram_mb"] for c in cands)
+        need = (46.84 + 3.0) * 1024
+        # 1) short but reachable: the plan's pre-ticks replace the detector's, the line confirms full speed
+        pl = ram_plan.plan(cands, need - total + 100, 46.84)
+        rec = []
+        dlg = SweepDialog(app, cands, lambda dd, t: rec.append((dd, t)), ram=pl)
+        pump(app, 0.3)
+        ticked = {int(c["pid"]) for v, c in dlg._rows if v.get()}
+        check(ticked == set(pl.preticked_pids), f"dialog pre-ticks follow the RAM plan ({ticked} vs {pl.preticked_pids})")
+        check(dlg._ram_head.cget("text").startswith("Full speed needs ~"), f"RAM summary ({dlg._ram_head.cget('text')!r})")
+        check(dlg._ram_live.cget("text").startswith("Ticked apps free ~"), f"enough once closed ({dlg._ram_live.cget('text')!r})")
+        shot(dlg, "sweep_ram_check")
+        for v, c in dlg._rows:
+            if v.get():
+                v.set(False)
+                break
+        dlg._update_buttons()
+        check(dlg._ram_live.cget("text").startswith("Still ~") and "Low-RAM mode" in dlg._ram_live.cget("text"),
+              f"unticking shows the gap ({dlg._ram_live.cget('text')!r})")
+        dlg._decide("cancel")
+        # 2) enough already
+        dlg = SweepDialog(app, cands, lambda dd, t: None, ram=ram_plan.plan(cands, 60 * 1024, 46.84))
+        pump(app, 0.2)
+        check(dlg._ram_head.cget("text") == "Enough RAM for full speed" and "full-RAM mode" in dlg._ram_live.cget("text"),
+              "enough RAM wording")
+        check({int(c["pid"]) for v, c in dlg._rows if v.get()} == {41001, 41002}, "enough: detector pre-ticks kept")
+        dlg._decide("cancel")
+        # 3) unreachable
+        dlg = SweepDialog(app, cands, lambda dd, t: None, ram=ram_plan.plan(cands, 10 * 1024, 46.84))
+        pump(app, 0.2)
+        check("will load slower" in dlg._ram_live.cget("text"), f"unreachable wording ({dlg._ram_live.cget('text')!r})")
+        dlg._decide("cancel")
+        # 4) no plan (requirement unknown) = v1.0 dialog, no extra rows
+        dlg = SweepDialog(app, cands, lambda dd, t: None, ram=None)
+        pump(app, 0.2)
+        check(dlg._ram_head is None, "no RAM line without a plan")
+        dlg._decide("cancel")
+
+        # 5) live load: waiting for RAM -> Low-RAM fallback -> serving with the amber indicator
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        eng.write_text(f"[strata] {stamp} engine started: C:\\x\\strata.exe --serve\n"
+                       "strata generate: the expert arena needs 46.84 GiB of RAM and 39.53 GiB is available; waiting "
+                       "up to 20 s for it (another engine still exiting?) - 0 s so far (X)\n", encoding="utf-8")
+        logf = d / "server-stdout.log"
+        logf.write_text("[strata] loading the experts into RAM (about 45 GB) and locking part of them for the GPU.\n",
+                        encoding="utf-8")
+        det.cands = []
+        ep.status_value = dict(IDLE_STATUS)
+        app._set_state("IDLE")
+        real_status = ep.status
+        ep.status = lambda: {**real_status(), "log_path": str(logf)}
+        try:
+            app.on_toggle()
+            ok = pump_until(app, lambda: "Waiting for RAM" in app.preview.cget("text"), 6)
+            txt = app.preview.cget("text")
+            check(ok and "needs 47 GB, 40 GB free" in txt, f"waiting phase from the engine log ({txt!r})")
+            check(app.preview.cget("text_color") == TH.AMBER, "waiting shown in amber")
+            with open(eng, "a", encoding="utf-8") as fh:
+                fh.write("strata generate: not enough RAM for the expert arena (it needs 46.84 GiB and 39.52 GiB is "
+                         "available (7.32 GiB short, after waiting)): this run reads the experts from the file\n"
+                         "strata generate: experts via mmap (not enough RAM for the expert arena)\n")
+            ok = pump_until(app, lambda: app.preview.cget("text").startswith(
+                "Low-RAM mode · reading experts from SSD · slower"), 6)
+            check(LOW_RAM_NOTE_TXT not in app.preview.cget("text"), "no duplicate RAM note under the fallback line")
+            check(ok, f"fallback shown while loading ({app.preview.cget('text')!r})")
+            shot(app, "loading_low_ram")
+            ep.status_value = active_status()
+            fire(ep.start_calls[-1][0])                  # on_ready
+            check(pump_until(app, lambda: app.state_name == "ACTIVE"), "ready -> ACTIVE")
+            ok = pump_until(app, lambda: pill(app)[0] == "Serving · Low-RAM mode", 4)
+            check(ok and pill(app)[1] == TH.AMBER, f"serving shows Low-RAM in amber ({pill(app)})")
+            txt = app.preview.cget("text")
+            check("Low-RAM mode: reading from SSD (slower) · ~7.3 GB short" in txt, f"serving detail ({txt!r})")
+            shot(app, "serving_low_ram")
+        finally:
+            ep.status = real_status
+            ep.status_value = dict(IDLE_STATUS)
+            app.on_status(ep.status()); app.on_status(ep.status())
+            pump(app, 0.2)
+        check(app.state_name == "IDLE" and app._engine_load is None and pill(app)[0] != "Serving · Low-RAM mode",
+              "IDLE clears the Low-RAM verdict")
+
+        # 6) a full-RAM run never shows the warning
+        eng.write_text(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} engine started: C:\\x\\strata.exe --serve\n"
+                       "strata generate: loaded 46.84 GiB at 6.68 GiB/s\n", encoding="utf-8")
+        ep.status = lambda: {**real_status(), "log_path": str(logf)}
+        try:
+            app.on_toggle()
+            pump_until(app, lambda: len(ep.start_calls) > 0 and app._start_phase == "server", 4)
+            ep.status_value = active_status()            # the stub server now reports it is up
+            fire(ep.start_calls[-1][0])
+            check(pump_until(app, lambda: app.state_name == "ACTIVE"), "full run -> ACTIVE")
+            pump(app, 1.5)
+            check(pill(app)[0] == "Serving" and "Low-RAM" not in app.preview.cget("text"),
+                  f"full-RAM run: plain Serving ({pill(app)}, {app.preview.cget('text')!r})")
+        finally:
+            ep.status = real_status
+            ep.status_value = dict(IDLE_STATUS)
+            app.on_status(ep.status()); app.on_status(ep.status())
+            pump(app, 0.2)
+    finally:
+        if old_cmd is None:
+            app.cfg.pop("launch_cmd", None)
+        else:
+            app.cfg["launch_cmd"] = old_cmd
+        det.cands = [dict(c) for c in CANDS]
+
+
 def test_strata_estimate(app, det, ep) -> None:
     """Memory bar attribution (Fable final #3-#5): live while loading, latched when serving, shrinks on stop."""
     keep = (app.state_name, app._avail_at_launch, app._strata_est)
@@ -1286,7 +1414,8 @@ def run() -> int:
                              (test_off_flow, (app, det, ep, dialogs)), (test_error_and_cancel, (app, det, ep)),
                              (test_sweep_dialog_close_x, (app, det, ep)), (test_whitelist_modal, (app, det, ep)),
                              (test_load_progress_view, (app, det, ep)), (test_strata_estimate, (app, det, ep)),
-                             (test_stats_section, (app, det, ep)), (test_notes_and_stale_status, (app, det, ep))):
+                             (test_stats_section, (app, det, ep)), (test_notes_and_stale_status, (app, det, ep)),
+                             (test_low_ram, (app, det, ep))):
                 print(f"-- {fn.__name__}")
                 try:
                     fn(*args)

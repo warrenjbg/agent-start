@@ -127,23 +127,38 @@ def release_modal(win) -> None:
 class SweepDialog(ctk.CTkToplevel):
     WIDTH = 372
     HEIGHT = 320
+    RAM_LINE_H = 34                              # extra height when the full-speed RAM check is shown
 
     def __init__(self, master, candidates: list[dict],
-                 on_decision: Callable[[str, list[tuple[int, float]]], None]) -> None:
+                 on_decision: Callable[[str, list[tuple[int, float]]], None], ram=None) -> None:
+        """ram: an optional ram_plan.RamPlan. When it knows Strata's full-RAM requirement, its pre-ticks replace the
+        detector's and a live line says whether the ticked apps free enough for the fast full-RAM mode."""
         super().__init__(master, fg_color=_BG)
         style_dialog(self)
         self._on_decision = on_decision
         self._decided = False
         self._rows: list[tuple[ctk.BooleanVar, dict]] = []
+        self._ram = ram if ram is not None and getattr(ram, "need_mb", 0) > 0 else None
+        pre = set(self._ram.preticked_pids) if self._ram else None
 
         self.title("Close apps before start")
         self.resizable(False, False)
-        center_over(self, master, self.WIDTH, self.HEIGHT)
+        center_over(self, master, self.WIDTH, self.HEIGHT + (self.RAM_LINE_H if self._ram else 0))
         self.protocol("WM_DELETE_WINDOW", lambda: self._decide("cancel"))
         self.bind("<Escape>", lambda _e: self._decide("cancel"))
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1)       # rows: title, warning, RAM check (optional), list, buttons
+        self._ram_head = self._ram_live = None
+        if self._ram:
+            ram_box = ctk.CTkFrame(self, fg_color="transparent")
+            ram_box.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
+            self._ram_head = ctk.CTkLabel(ram_box, text=self._ram.summary, anchor="w", height=15,
+                                          font=ctk.CTkFont(family=T.ui_family(), size=11, weight="bold"))
+            self._ram_head.pack(fill="x")
+            self._ram_live = ctk.CTkLabel(ram_box, text="", anchor="w", height=15, text_color=_MUTED,
+                                          font=ctk.CTkFont(family=T.ui_family(), size=11))
+            self._ram_live.pack(fill="x")
 
         ctk.CTkLabel(self, text="Close apps to free RAM?", anchor="w",
                      font=ctk.CTkFont(family=T.ui_family(), size=14, weight="bold")).grid(
@@ -153,12 +168,13 @@ class SweepDialog(ctk.CTkToplevel):
             row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
 
         self._list = ctk.CTkScrollableFrame(self, fg_color=_ROW_BG, corner_radius=8)
-        self._list.grid(row=2, column=0, sticky="nsew", padx=12)
+        self._list.grid(row=3, column=0, sticky="nsew", padx=12)
         self._list.grid_columnconfigure(1, weight=1)
         small = ctk.CTkFont(family=T.ui_family(), size=11)
         name_font = ctk.CTkFont(family=T.ui_family(), size=12, weight="bold")
         for i, cand in enumerate(candidates):
-            var = ctk.BooleanVar(value=bool(cand.get("preselect")))
+            ticked = int(cand.get("pid", -1)) in pre if pre is not None else bool(cand.get("preselect"))
+            var = ctk.BooleanVar(value=ticked)
             cb = ctk.CTkCheckBox(self._list, fg_color=T.TEXT, hover_color=T.PRIMARY_HOVER, checkmark_color=T.BG, border_color=T.TEXT_3, corner_radius=4, text="", width=22, checkbox_width=18, checkbox_height=18,
                                  variable=var, command=self._update_buttons)
             cb.grid(row=i, column=0, sticky="nw", padx=(6, 4), pady=4)
@@ -177,7 +193,7 @@ class SweepDialog(ctk.CTkToplevel):
             self._rows.append((var, cand))
 
         btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=3, column=0, sticky="ew", padx=12, pady=(8, 12))
+        btns.grid(row=4, column=0, sticky="ew", padx=12, pady=(8, 12))
         btns.grid_columnconfigure((0, 1), weight=1, uniform="b")
         self._close_btn = ctk.CTkButton(btns, text="Close selected & start", height=32,
                                         fg_color=_DANGER, hover_color=_DANGER_HOVER,
@@ -202,11 +218,30 @@ class SweepDialog(ctk.CTkToplevel):
     def _update_buttons(self) -> None:
         """The destructive button states its cost: how many apps and how much RAM."""
         picked = [c for v, c in self._rows if v.get()]
+        ram = sum(float(c.get("ram_mb") or 0.0) for c in picked)
         if picked:
-            ram = sum(float(c.get("ram_mb") or 0.0) for c in picked)
             self._close_btn.configure(state="normal", text=f"Close {len(picked)} & start · {_gb(ram)}")
         else:
             self._close_btn.configure(state="disabled", text="Close selected & start")
+        self._update_ram_line(ram)
+
+    def _update_ram_line(self, freed_mb: float) -> None:
+        """Live: would closing the ticked apps reach Strata's fast full-RAM mode?"""
+        if not self._ram or self._ram_live is None:
+            return
+        r = self._ram
+        if r.enough_now:
+            self._ram_head.configure(text_color=T.ACCENT)
+            self._ram_live.configure(text="Strata will load in full-RAM mode (fast)", text_color=_MUTED)
+            return
+        self._ram_head.configure(text_color=_WARN)
+        gap = r.need_mb - r.available_mb - freed_mb
+        if gap <= 0:
+            self._ram_live.configure(text=f"Ticked apps free ~{_gb(freed_mb)} → full speed", text_color=_MUTED)
+        elif not r.reachable:
+            self._ram_live.configure(text=r.detail + " · will load slower", text_color=_WARN)
+        else:
+            self._ram_live.configure(text=f"Still ~{_gb(gap)} short → Low-RAM mode (slower)", text_color=_WARN)
 
     def _decide(self, decision: str) -> None:
         if self._decided:
