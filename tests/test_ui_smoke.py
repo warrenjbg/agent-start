@@ -5,8 +5,14 @@ Exit code 0 = all checks passed. Screenshots land in tests\\ui_<state>.png.
 """
 from __future__ import annotations
 
+import ctypes
+import json
+import math
 import os
+import shutil
+import socket
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -16,15 +22,27 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
+# Settings/state written by the UI under test go to a throwaway folder - never the project's config.json /
+# state.json and never %APPDATA%\HermesController. Must be set before config_store is imported.
+HOME = Path(tempfile.mkdtemp(prefix="hc-ui-home-"))
+os.environ["HERMES_CONTROLLER_HOME"] = str(HOME)
+
 import tkinter.messagebox as tk_messagebox  # noqa: E402
 
 import customtkinter as ctk  # noqa: E402
 from PIL import ImageGrab  # noqa: E402
 
 import main  # noqa: E402  (must import without detector.py / server_manager.py)
+import config_store  # noqa: E402
+import settings_dialog  # noqa: E402
+import theme as T  # noqa: E402
 from main import HermesControllerApp, PILL_COLORS, LOADING_COLOR  # noqa: E402
+from settings_dialog import SettingsDialog  # noqa: E402
 from sweep_dialog import SweepDialog  # noqa: E402
+from vram_sampler import VramSnapshot  # noqa: E402
 from whitelist_modal import WhitelistModal  # noqa: E402
+
+assert config_store.DATA_DIR == HOME, "tests must not write to the real data dir"
 
 FAILS: list[str] = []
 PASSES = 0
@@ -218,13 +236,100 @@ class Dialogs:
         tk_messagebox.askyesno, tk_messagebox.askyesnocancel = self._orig
 
 
-CFG = {"endpoint_url": "http://127.0.0.1:8080/v1", "port": 8080, "model_name": "swift-1.5-iq3_s",
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+    assert p != 8080
+    return p
+
+
+# Never 8080: even though the metrics fetcher below is a stub, nothing in this test may be ABLE to reach the real
+# Strata port. The port is free (nothing listens), and the URL is only ever displayed.
+TEST_PORT = _free_port()
+CFG = {"endpoint_url": f"http://127.0.0.1:{TEST_PORT}/v1", "port": TEST_PORT, "model_name": "swift-1.5-iq3_s",
        "user_whitelist": [], "game_dirs": ["steamapps"]}
 
 
-def new_app():
+class FakeVram:
+    """Stands in for VramSampler: no thread, no NVML; the test sets what the GPU 'reports'."""
+    window_s = 300.0
+
+    def __init__(self) -> None:
+        self.available: bool | None = False
+        self.total_mb = 16384.0
+        self.samples: list[tuple[float, float]] = []
+        self.pushed: list[tuple[float, float]] = []
+        self.started = self.stopped = 0
+
+    def start(self) -> None:
+        self.started += 1
+
+    def stop(self) -> None:
+        self.stopped += 1
+
+    def push_external(self, used_mb: float, total_mb: float) -> bool:
+        self.pushed.append((used_mb, total_mb))
+        return False
+
+    def snapshot(self) -> VramSnapshot:
+        return VramSnapshot(tuple(self.samples), self.total_mb if self.available else None, self.available,
+                            "nvml" if self.available else "", time.monotonic())
+
+    def fill(self, strata_since_s: float = 150.0) -> None:
+        """5 minutes of plausible data: ~3 GB of desktop use, then Strata's cache fills to ~12 GB."""
+        now = time.monotonic()
+        self.samples = []
+        for i in range(150):
+            age = (149 - i) * 2.0
+            base = 3000 + 260 * math.sin(i / 9.0) + 90 * math.sin(i / 2.3)
+            ramp = min(1.0, max(0.0, (strata_since_s - age) / 40.0))
+            self.samples.append((now - age, base + ramp * 9100 + (120 * math.sin(i / 4.0) if ramp >= 1 else 0)))
+        self.available = True
+
+
+class FakeMetrics:
+    """Stands in for metrics_store.fetch_metrics: returns a Strata-shaped /metrics document, counts the polls."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.requests: list[dict] = []          # oldest first
+        self.live = "idle"
+        self.fail = False
+
+    def add(self, n: int) -> None:
+        for _ in range(n):
+            i = len(self.requests)
+            hit = i % 4 == 3
+            total = 1800 + 350 * (i % 7)
+            read = 12 if hit else total - 200 * (i % 3)
+            gen = 0 if i % 9 == 8 else 120 + 40 * (i % 6)
+            tok_s = round(88.0 + 4.1 * ((i * 7) % 6) + (i % 3), 1) if gen >= 2 else None
+            self.requests.append({
+                "id": f"req{i:09d}", "time": 1000.0 + i, "duration_s": 2.4, "finish": "stop", "prompt_tokens": total,
+                "reused": total - read, "output_tokens": gen, "prompt_total": total, "prompt_read": read,
+                "prompt_ms": 9.0 if hit else round(read / (3150.0 + 130 * (i % 5)) * 1000, 1),
+                "decode_ms": round(gen / tok_s * 1000, 1) if tok_s else None, "decode_tok_s": tok_s, "hit_rate": 0.93})
+
+    def __call__(self, root_url: str) -> dict | None:
+        self.calls.append(root_url)
+        if self.fail:
+            return None
+        st = self.live
+        busy = st in ("generating", "reading")
+        live = {"state": st, "queued": 0, "tok_s": 101.3 if st == "generating" else None,
+                "tok_s_mean": 99.8 if st == "generating" else None,
+                "prefill_tok_s_mean": 3650.0 if busy else None, "prompt_read": 900 if st == "reading" else None,
+                "prompt_total": 2400 if st == "reading" else None}
+        return {"engine": {"model": "swift-test-1"}, "live": live, "requests": self.requests[::-1][:12],
+                "requests_kept": len(self.requests), "totals": {},
+                "hardware": {"gpu_mem_used": 11 * 1024 ** 3, "gpu_mem_total": 16 * 1024 ** 3}, "time": time.time()}
+
+
+def new_app(cfg: dict | None = None):
     det, ep = StubDetector(), StubEndpoint()
-    app = HermesControllerApp(detector=det, endpoint=ep, config=dict(CFG))
+    app = HermesControllerApp(detector=det, endpoint=ep, config=dict(cfg or CFG), metrics_fetcher=FakeMetrics(),
+                              vram_sampler=FakeVram())
     app.attributes("-topmost", True)
     pump(app, 0.4)
     return app, det, ep
@@ -687,6 +792,460 @@ def test_strata_estimate(app, det, ep) -> None:
         app.state_name, app._avail_at_launch, app._strata_est = keep
         app._set_state("IDLE")
 
+# ---------------------------------------------------------------- v1.1: stats section
+def load_state_file() -> dict:
+    try:
+        return json.loads((HOME / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def canvas_text_clipped(canvas) -> list[str]:
+    """Texts of canvas items whose bounding box leaves the canvas (i.e. would be cut off)."""
+    canvas.update_idletasks()
+    w, h = canvas.winfo_width(), canvas.winfo_height()
+    bad = []
+    for item in canvas.find_all():
+        if canvas.type(item) != "text":
+            continue
+        x0, y0, x1, y1 = canvas.bbox(item)
+        if x0 < -1 or y0 < -1 or x1 > w + 1 or y1 > h + 1:
+            bad.append(f"{canvas.itemcget(item, 'text')!r} bbox {(x0, y0, x1, y1)} in {w}x{h}")
+    return bad
+
+
+def check_stats_fit(app, label: str) -> None:
+    """Nothing in the expanded section is clipped: graph texts inside their canvas, header labels inside the row,
+    the card inside the window with the same 16 px margin as everywhere else."""
+    app.update_idletasks()
+    scale = ctk.ScalingTracker.get_window_scaling(app)
+    wscale = ctk.ScalingTracker.get_widget_scaling(app)
+    w, h = app.winfo_width(), app.winfo_height()
+    check(abs(w - 360 * scale) <= 2 and abs(h - main.HEIGHT_EXPANDED * scale) <= 2,
+          f"{label}: expanded window {w}x{h} != 360x{main.HEIGHT_EXPANDED}*{scale}")
+    bottom = app.winfo_rooty() + h
+    card_bottom = app.stats.winfo_rooty() + app.stats.winfo_height()
+    # same bottom margin as the collapsed v1.0 layout (16 px; its fixed-height rows round up to 3 px slack at 150 %)
+    check(-2 <= (bottom - card_bottom) - 16 * wscale <= 4, f"{label}: stats card ends 16 px above the window edge "
+          f"({bottom - card_bottom})")
+    gap = app.stats.winfo_rooty() - (app.mem_card.winfo_rooty() + app.mem_card.winfo_height())
+    check(abs(gap - 8 * wscale) <= 2, f"{label}: 8 px between memory card and stats card ({gap})")
+    for name, row in (("vram", app.row_vram), ("decode", app.row_decode), ("prompt", app.row_prompt)):
+        clipped = canvas_text_clipped(row.graph)
+        check(not clipped, f"{label}: {name} graph text clipped: {clipped}")
+        check(row.winfo_rooty() + row.winfo_height() <= card_bottom + 1, f"{label}: {name} row inside the card")
+        right = row.winfo_rootx() + row.winfo_width()
+        card_right = app.stats.winfo_rootx() + app.stats.winfo_width()
+        check(row.value.winfo_rootx() + row.value.winfo_width() <= card_right - 10 * wscale
+              and right <= card_right - 10 * wscale and row.title.winfo_rootx() + row.title.winfo_reqwidth() <= row.tag.winfo_rootx() + 1,
+              f"{label}: {name} header (title / value) does not overlap or clip")
+        ch = row.graph.winfo_height()
+        check(abs(ch - 40 * wscale) <= 2, f"{label}: {name} canvas is 40 px * scale ({ch})")
+
+
+def graph_texts(row) -> list[str]:
+    g = row.graph
+    return [g.itemcget(i, "text") for i in g.find_all() if g.type(i) == "text"]
+
+
+def test_stats_section(app, det, ep) -> None:
+    vram, fetch = app.vram, app._fetch_metrics
+    scale = ctk.ScalingTracker.get_window_scaling(app)
+    ep.status_value = dict(IDLE_STATUS)
+    app._set_state("IDLE")
+    check(not app.expanded and not app.stats.winfo_ismapped(), "starts collapsed (no state.json)")
+    check(app.chevron.cget("text") == T.CHEVRON_DOWN, "collapsed chevron points down")
+    check(abs(app.winfo_height() - 268 * scale) <= 2, "collapsed height is v1.0's 268")
+    check(vram.started == 1, "VRAM sampler started with the app")
+    cx = app.chevron.winfo_rootx() + app.chevron.winfo_width()
+    check(cx <= app.mem_card.winfo_rootx() + app.mem_card.winfo_width() - 8 * scale
+          and app.chevron.winfo_height() <= app.mem_title.winfo_height() + 1,
+          "chevron sits inside the memory card header without growing it")
+    pump(app, 2.6)
+    check(fetch.calls == [], f"collapsed: /metrics is never polled ({len(fetch.calls)})")
+
+    # ---- expand: IDLE, no NVML -> every graph shows its empty state
+    app.chevron.invoke()
+    pump(app, 0.3)
+    check(app.expanded and app.stats.winfo_ismapped() and app.chevron.cget("text") == T.CHEVRON_UP,
+          "chevron expands the window downward")
+    check(load_state_file().get("stats_expanded") is True, "expanded state persisted in state.json")
+    check_stats_fit(app, "empty")
+    check(graph_texts(app.row_vram) == ["VRAM unavailable"], f"NVML missing -> 'VRAM unavailable' "
+          f"({graph_texts(app.row_vram)})")
+    check(graph_texts(app.row_decode) == ["Strata is off"] and graph_texts(app.row_prompt) == ["Strata is off"],
+          f"IDLE empty states ({graph_texts(app.row_decode)}, {graph_texts(app.row_prompt)})")
+    check(app.row_decode.value.cget("text") == "–" and app.row_vram.value.cget("text") == "–", "no values yet -> –")
+    check(app.toggle.winfo_rooty() == app.toggle.winfo_rooty() and app.gauge.winfo_ismapped(), "v1.0 part untouched")
+    shot(app, "stats_empty_idle")
+    pump(app, 2.4)
+    check(fetch.calls == [], "expanded but IDLE: /metrics is not polled")
+
+    # ---- ACTIVE, server has no finished requests yet
+    vram.fill(strata_since_s=6.0)
+    to_active(app, ep)
+    check(pump_until(app, lambda: app.metrics.polls >= 1, 6), "ACTIVE + expanded -> /metrics polled off the Tk thread")
+    check(fetch.calls and fetch.calls[0] == f"http://127.0.0.1:{TEST_PORT}", f"polls the server root ({fetch.calls[:1]})")
+    check(graph_texts(app.row_decode) == ["No requests yet"] and graph_texts(app.row_prompt) == ["No prompt reads yet"],
+          f"ACTIVE empty states ({graph_texts(app.row_decode)}, {graph_texts(app.row_prompt)})")
+    check(app.row_vram.value.cget("text").endswith("/ 16.0 GB") and "16 GB" in graph_texts(app.row_vram),
+          f"VRAM current value + max-scale label ({app.row_vram.value.cget('text')}, {graph_texts(app.row_vram)})")
+    check(vram.pushed and abs(vram.pushed[-1][1] - 16384.0) < 1, "Strata's hardware block offered as VRAM fallback")
+    check_stats_fit(app, "no-requests")
+    shot(app, "stats_empty_active")
+
+    # ---- ACTIVE with data: 12 per poll are accumulated to 30; live decode while generating
+    vram.fill(strata_since_s=170.0)
+    app._spans = [[time.monotonic() - 170.0, None]]           # as if Strata had been started 170 s ago
+    fetch.add(12)
+    fetch.live = "generating"
+    for _ in range(4):
+        n = len(app.metrics)
+        check(pump_until(app, lambda: len(app.metrics) > n or len(app.metrics) == 30, 6), "poll picked up new requests")
+        fetch.add(10)
+    check(pump_until(app, lambda: len(app.metrics) == 30, 8), f"accumulated to the last 30 requests ({len(app.metrics)})")
+    dec, pr = app.metrics.decode_series(), app.metrics.prompt_series()
+    check(0 < len(pr) < len(dec) <= 30, f"cache hits / empty answers skipped per series ({len(dec)} decode, {len(pr)} prompt)")
+    check(app.row_decode.value.cget("text") == "101.3 tok/s" and app.row_decode.tag.cget("text") == "live"
+          and app.row_decode.value.cget("text_color") == T.ACCENT, f"live decode value in the accent "
+          f"({app.row_decode.tag.cget('text')} {app.row_decode.value.cget('text')})")
+    check(app.row_prompt.tag.cget("text") == "last" and app.row_prompt.value.cget("text").endswith(" tok/s")
+          and "," in app.row_prompt.value.cget("text"), f"prompt value = last finished request "
+          f"({app.row_prompt.value.cget('text')})")
+    check(app.row_decode.graph.scale_max == 120.0 and graph_texts(app.row_decode) == ["120"],
+          f"decode scale label ({app.row_decode.graph.scale_max}, {graph_texts(app.row_decode)})")
+    check(max(pr) < 4000 and graph_texts(app.row_prompt) == ["4k"], f"prompt scale not blown up by cache hits "
+          f"({max(pr):.0f}, {graph_texts(app.row_prompt)})")
+    bars = [i for i in app.row_decode.graph.find_all() if app.row_decode.graph.type(i) == "rectangle"
+            and app.row_decode.graph.itemcget(i, "fill") in (T.APPS_SEG, T.TEXT_2, T.ACCENT)]
+    check(len(bars) == min(30, len(dec) + 1) and app.row_decode.graph.itemcget(bars[-1], "fill") == T.ACCENT,
+          f"one bar per request + an accent live bar ({len(bars)} bars for {len(dec)} requests)")
+    check_stats_fit(app, "active")
+    shot(app, "stats_active")
+
+    fetch.live = "reading"
+    check(pump_until(app, lambda: app.row_prompt.tag.cget("text") == "live", 6)
+          and app.row_prompt.value.cget("text") == "3,650 tok/s" and app.row_decode.tag.cget("text") == "last",
+          f"reading: live prompt speed, decode back to 'last' ({app.row_prompt.value.cget('text')})")
+    shot(app, "stats_reading")
+    fetch.live = "idle"
+    pump_until(app, lambda: app.row_prompt.tag.cget("text") == "last", 6)
+
+    # ---- metrics endpoint failing: data stays, live value goes
+    fetch.fail = True
+    check(pump_until(app, lambda: app._metrics_fails >= 3, 12), "failed polls counted")
+    check(len(app.metrics) == 30 and "Metrics unavailable" not in graph_texts(app.row_decode),
+          "failures keep the bars already collected")
+    fetch.fail = False
+    pump_until(app, lambda: app._metrics_fails == 0, 6)
+
+    # ---- collapse: exact v1.0 size again, polling stops, state persisted
+    app.chevron.invoke()
+    pump(app, 0.3)
+    check(not app.expanded and not app.stats.winfo_ismapped() and abs(app.winfo_height() - 268 * scale) <= 2
+          and abs(app.winfo_width() - 360 * scale) <= 2, f"collapse -> 360x268 ({app.winfo_width()}x{app.winfo_height()})")
+    check(load_state_file().get("stats_expanded") is False, "collapsed state persisted")
+    card_bottom = app.mem_card.winfo_rooty() + app.mem_card.winfo_height()
+    check(abs((app.winfo_rooty() + app.winfo_height() - card_bottom) - 16 * scale) <= 2, "memory card margin restored")
+    pump(app, 0.3)
+    n = len(fetch.calls)
+    pump(app, 2.6)
+    check(len(fetch.calls) <= n + 1, f"collapsed: polling stops ({len(fetch.calls) - n} more calls)")
+    shot(app, "collapsed_active")
+
+    # ---- Strata stops: bars of the finished session stay, live values clear, a new start resets them
+    app.chevron.invoke()
+    pump(app, 0.2)
+    ep.status_value = dict(IDLE_STATUS)
+    app.on_status(ep.status()); app.on_status(ep.status())
+    pump(app, 0.2)
+    check(app.state_name == "IDLE" and len(app.metrics) == 30 and app.row_decode.tag.cget("text") == "last",
+          "after OFF the last session's speeds stay readable")
+    check(app._spans and app._spans[-1][1] is not None, "Strata-running span closed on IDLE")
+    det.cands = []
+    n_start = len(ep.start_calls)
+    app.on_toggle()
+    check(pump_until(app, lambda: len(ep.start_calls) == n_start + 1), "start for the reset check")
+    check(len(app.metrics) == 0 and app._spans[-1][1] is None, "a new start clears the old server's requests")
+    fire(ep.start_calls[-1][1], "x")
+    pump_until(app, lambda: app.state_name == "ERROR")
+    app._set_state("IDLE")
+    det.cands = [dict(c) for c in CANDS]
+    app.chevron.invoke()                                       # leave collapsed for the following tests
+    pump(app, 0.2)
+    check(not app.expanded, "collapsed again")
+
+
+def test_stats_persist_and_scaling() -> None:
+    """A saved 'expanded' flag is honoured at startup; the section fits at 100 % and at 150 % scaling."""
+    config_store.save_state({"stats_expanded": True})
+    base = ctk.ScalingTracker.get_window_scaling
+    for factor, name in ((1.0, "100"), (1.5, "150")):
+        ctk.set_widget_scaling(factor)
+        ctk.set_window_scaling(factor)
+        app, det, ep = new_app()
+        try:
+            check(app.expanded and app.stats.winfo_ismapped(), f"{name} %: starts expanded from state.json")
+            app.vram.fill(strata_since_s=200.0)
+            app._spans = [[time.monotonic() - 200.0, None]]
+            app._fetch_metrics.add(30)
+            app._fetch_metrics.live = "generating"
+            to_active(app, ep)
+            pump_until(app, lambda: len(app.metrics) >= 12, 6)
+            app._fetch_metrics.add(30)
+            pump_until(app, lambda: len(app.metrics) == 30, 8)
+            pump(app, 0.3)
+            print(f"scaling x{factor}: window {app.winfo_width()}x{app.winfo_height()}, "
+                  f"effective {base(app)}")
+            check_stats_fit(app, f"{name} %")
+            f_small = app.row_decode.graph._font(T.mono_family(), 9, base(app))
+            check(f_small[1] == -max(8, round(9 * base(app))), f"{name} %: canvas fonts scale with DPI ({f_small})")
+            shot(app, f"stats_active_{name}")
+            # empty states at this scaling too
+            app._fetch_metrics.requests.clear()
+            app._fetch_metrics.live = "idle"
+            app.metrics.reset()
+            app.vram.available, app.vram.samples = False, []
+            pump_until(app, lambda: graph_texts(app.row_decode) == ["No requests yet"], 6)
+            app._refresh_stats()
+            check(graph_texts(app.row_vram) == ["VRAM unavailable"]
+                  and graph_texts(app.row_prompt) == ["No prompt reads yet"], f"{name} %: empty states")
+            check_stats_fit(app, f"{name} % empty")
+            shot(app, f"stats_empty_{name}")
+            ep.status_value = dict(IDLE_STATUS)
+            app.on_status(ep.status()); app.on_status(ep.status())
+            pump(app, 0.1)
+            app.on_close_request()
+            check(app._destroyed and app.vram.stopped == 1, f"{name} %: exit stops the VRAM sampler")
+        finally:
+            if not app._destroyed:
+                app.destroy()
+    ctk.set_widget_scaling(1.0)
+    ctk.set_window_scaling(1.0)
+    config_store.save_state({"stats_expanded": False})
+
+
+# ---------------------------------------------------------------- v1.1: settings dialog / launcher
+def make_strata(root: Path, name: str, ports: dict[str, int]) -> Path:
+    """A fake Strata install: serve\\server.py, a python.exe placeholder, run-<n>.bat + strata-<n>.json per model."""
+    sdir = root / name
+    (sdir / "serve").mkdir(parents=True)
+    (sdir / ".venv" / "Scripts").mkdir(parents=True)
+    (sdir / "serve" / "server.py").write_text("", encoding="utf-8")
+    (sdir / ".venv" / "Scripts" / "python.exe").write_text("", encoding="utf-8")
+    for n, port in ports.items():
+        (sdir / f"strata-{n}.json").write_text(json.dumps({"model_name": f"model-{n}"}), encoding="utf-8")
+        (sdir / f"run-{n}.bat").write_text(
+            f'@echo off\r\ntitle Strata {n}\r\ncd /d "{sdir}"\r\n"{sdir}\\.venv\\Scripts\\python.exe" '
+            f'"{sdir}\\serve\\server.py" "--engine" "strata" "--config" "{sdir}\\strata-{n}.json" "--port" "{port}" '
+            f'"--open"\r\nif errorlevel 1 pause\r\n', encoding="utf-8", newline="")
+    (sdir / "run-broken.bat").write_text("@echo off\r\necho nothing to see\r\npause\r\n", encoding="utf-8", newline="")
+    for other in ("BENCH.bat", "SETUP.bat", "START-HERE.bat", "UPDATE.bat"):
+        (sdir / other).write_text("@echo off\r\n", encoding="utf-8", newline="")
+    return sdir
+
+
+def disk_config() -> dict:
+    return json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+
+
+def test_settings_dialog(dialogs: Dialogs) -> None:
+    tmp = Path(tempfile.mkdtemp(prefix="hc-ui-strata-"))
+    pa, pb, pz = _free_port(), _free_port(), _free_port()
+    sdir = make_strata(tmp, "Strata-A", {"a": pa, "b": pb})
+    other = make_strata(tmp, "Strata-Z", {"z": pz})
+    # a v1.0-style config: relative launcher_bat + hand-written launch_cmd, no launch_cwd
+    cfg = dict(CFG, strata_dir=str(sdir), launcher_bat="run-a.bat", port=pa, endpoint_url=f"http://127.0.0.1:{pa}/v1",
+               model_name="model-a",
+               launch_cmd=[str(sdir / ".venv" / "Scripts" / "python.exe"), str(sdir / "serve" / "server.py"),
+                           "--engine", "strata", "--config", str(sdir / "strata-a.json"), "--port", str(pa)])
+    (HOME / "config.json").write_text(json.dumps(dict(cfg, user_whitelist=["keep.exe"])), encoding="utf-8")
+    app, det, ep = new_app(cfg)
+    orig_ask = settings_dialog.filedialog.askopenfilename
+    try:
+        hwnd = ctypes.windll.user32.FindWindowW("TkTopLevel", main.APP_TITLE)
+        check(hwnd and hwnd == ctypes.windll.user32.GetParent(app.winfo_id()),
+              "second-instance lookup (class TkTopLevel + title) finds this window")
+
+        # ---- open from the gear
+        app.gear.invoke()
+        dlg = app.dialog
+        check(isinstance(dlg, SettingsDialog), "gear opens the Settings dialog")
+        pump(app, 0.4)
+        values = list(dlg._menu.cget("values"))
+        check(values == ["run-a.bat", "run-b.bat", "run-broken.bat"], f"dropdown lists exactly the run-*.bat ({values})")
+        check(dlg._choice.get() == "run-a.bat", f"v1.0 relative launcher_bat preselected ({dlg._choice.get()})")
+        check(dlg._detail.cget("text") == f"model-a · strata-a.json · port {pa}"
+              and dlg._detail.cget("text_color") == T.TEXT_2, f"read-only parsed line ({dlg._detail.cget('text')!r})")
+        check(str(dlg._save_btn.cget("state")) == "normal", "Save enabled for a valid launcher")
+        w, h = dlg.winfo_width(), dlg.winfo_height()
+        scale = ctk.ScalingTracker.get_window_scaling(dlg)
+        check(abs(w - 340 * scale) <= 2 and abs(h - 252 * scale) <= 2, f"SettingsDialog size {w}x{h}")
+        check(dlg.grab_status() == "local", f"SettingsDialog grab {dlg.grab_status()}")
+        bottom = dlg.winfo_rooty() + h
+        check(dlg._save_btn.winfo_rooty() + dlg._save_btn.winfo_height() <= bottom - 10 * scale
+              and dlg._detail.winfo_rooty() + dlg._detail.winfo_height() <= dlg._protected_btn.winfo_rooty(),
+              "settings layout: nothing clipped or overlapping")
+        shot(dlg, "settings")
+
+        # ---- a .bat that does not run serve\\server.py: inline error, cannot be saved
+        dlg._menu.set("run-broken.bat")
+        dlg._on_pick("run-broken.bat")
+        check("does not start Strata" in dlg._detail.cget("text") and dlg._detail.cget("text_color") == T.RED_TEXT
+              and str(dlg._save_btn.cget("state")) == "disabled", f"broken launcher rejected inline "
+              f"({dlg._detail.cget('text')!r})")
+        dlg.save()
+        pump(app, 0.2)
+        check(app._dialog_open() and app.cfg["launcher_bat"] == "run-a.bat", "Save does nothing for a rejected launcher")
+        shot(dlg, "settings_error")
+
+        # ---- Cancel keeps everything
+        dlg._on_pick("run-b.bat")
+        check(dlg._detail.cget("text") == f"model-b · strata-b.json · port {pb}", "switching shows the other model")
+        dlg._cancel_btn.invoke()
+        pump(app, 0.2)
+        check(not app._dialog_open() and app.cfg["port"] == pa and disk_config()["launcher_bat"] == "run-a.bat",
+              "Cancel closes without saving")
+
+        # ---- Save while IDLE: written to config.json and applied immediately
+        app.gear.invoke()
+        dlg = app.dialog
+        pump(app, 0.3)
+        dlg._choice.set("run-b.bat")
+        dlg._on_pick("run-b.bat")
+        check(dlg._msg.cget("text") == "", "no 'applies next start' hint while idle")
+        dlg._save_btn.invoke()
+        check(pump_until(app, lambda: not app._dialog_open()), "Save closes the dialog")
+        disk = disk_config()
+        bat_b = str(sdir / "run-b.bat")
+        check(disk["launcher_bat"] == bat_b and disk["port"] == pb and disk["model_name"] == "model-b"
+              and disk["endpoint_url"] == f"http://127.0.0.1:{pb}/v1" and disk["launch_cwd"] == str(sdir)
+              and disk["launch_cmd"][-4:] == ["--config", str(sdir / "strata-b.json"), "--port", str(pb)]
+              and "--open" not in disk["launch_cmd"], f"config.json holds the full .bat path + derived launch ({disk['launch_cmd'][-4:]})")
+        check(disk["user_whitelist"] == ["keep.exe"], "saving the launcher keeps the rest of config.json")
+        check(app.cfg["launcher_bat"] == bat_b and app.cfg["port"] == pb and app.cfg["model_name"] == "model-b"
+              and app._pending_launcher is None, "IDLE: the shared config switches immediately")
+        check("run-b.bat" in app.preview.cget("text"), f"idle note names the new launcher ({app.preview.cget('text')!r})")
+
+        # ---- Browse… to a .bat in another Strata folder
+        app.gear.invoke()
+        dlg = app.dialog
+        pump(app, 0.3)
+        check(dlg._choice.get() == "run-b.bat", "reopened dialog shows the saved launcher")
+        asked = []
+        settings_dialog.filedialog.askopenfilename = lambda **k: (asked.append(k), str(other / "run-z.bat"))[1]
+        dlg._browse_btn.invoke()
+        pump(app, 0.2)
+        check(asked and asked[0].get("initialdir") == str(sdir) and dlg._choice.get() == "run-z.bat"
+              and "run-z.bat" in dlg._menu.cget("values"), f"Browse adds + selects the chosen .bat ({dlg._choice.get()})")
+        check(dlg._detail.cget("text") == f"model-z · strata-z.json · port {pz}", "browsed launcher parsed")
+        settings_dialog.filedialog.askopenfilename = lambda **k: ""
+        dlg._browse_btn.invoke()
+        check(dlg._choice.get() == "run-z.bat", "cancelled Browse changes nothing")
+        settings_dialog.filedialog.askopenfilename = lambda **k: str(sdir / "SETUP.bat")
+        dlg._browse_btn.invoke()
+        check("does not start Strata" in dlg._detail.cget("text") and str(dlg._save_btn.cget("state")) == "disabled",
+              "browsed non-launcher .bat rejected inline")
+
+        # ---- Protected apps… opens the existing whitelist modal on top; closing it returns to Settings
+        dlg._protected_btn.invoke()
+        child = dlg._child
+        check(isinstance(child, WhitelistModal) and app.dialog is dlg, "Protected apps… opens the whitelist modal")
+        pump_until(app, lambda: child._loaded)
+        pump(app, 0.3)
+        check(child.grab_status() == "local", "whitelist modal holds the grab")
+        child._rows[0][1].set(True)
+        child._save_btn.invoke()
+        check(pump_until(app, lambda: det.whitelist_saves and dlg._child is None), "whitelist saved from Settings")
+        pump(app, 0.4)
+        check(app._dialog_open() and dlg.winfo_exists() and dlg.grab_status() == "local",
+              "Settings stays open and takes the grab back")
+        dlg._protected_btn.invoke()
+        pump(app, 0.3)
+        dlg.close()                                             # closing Settings closes a nested modal too
+        pump(app, 0.3)
+        check(not app._dialog_open() and app.cfg["port"] == pb, "Settings closed (nested modal with it); nothing saved")
+
+        # ---- launcher change while ACTIVE: saved, "applies next start", no restart
+        to_active(app, ep)
+        check(app.state_name == "ACTIVE", "ACTIVE for the running-change test")
+        app.gear.invoke()
+        dlg = app.dialog
+        check(isinstance(dlg, SettingsDialog), "Settings opens while ACTIVE")
+        pump(app, 0.3)
+        dlg._choice.set("run-a.bat")
+        dlg._on_pick("run-a.bat")
+        check(dlg._msg.cget("text") == "Applies next start — Strata keeps running", f"hint ({dlg._msg.cget('text')!r})")
+        shot(dlg, "settings_running")
+        n_stop, n_start = len(ep.stop_calls), len(ep.start_calls)
+        dlg._save_btn.invoke()
+        check(pump_until(app, lambda: not app._dialog_open()), "Save while ACTIVE closes the dialog")
+        check(disk_config()["launcher_bat"] == str(sdir / "run-a.bat") and disk_config()["port"] == pa,
+              "saved to config.json right away")
+        check(app.cfg["port"] == pb and app.cfg["launcher_bat"] == bat_b and app._pending_launcher is not None,
+              "the running endpoint keeps its port/config (OFF must still find it)")
+        check(len(ep.stop_calls) == n_stop and len(ep.start_calls) == n_start and app.state_name == "ACTIVE",
+              "no restart")
+        check("run-a.bat applies next start" in app.preview.cget("text"), f"main window says so "
+              f"({app.preview.cget('text')!r})")
+        shot(app, "active_pending_launcher")
+        app.gear.invoke()
+        dlg = app.dialog
+        pump(app, 0.3)
+        check(dlg._choice.get() == "run-a.bat", "reopened dialog shows the pending launcher")
+        dlg.close()
+        pump(app, 0.2)
+
+        # ---- OFF, then the pending launcher becomes the live config
+        app.on_toggle()
+        ep.status_value = dict(IDLE_STATUS)
+        fire(ep.stop_calls[-1][0], stop_result())
+        check(pump_until(app, lambda: app.state_name == "IDLE"), "OFF -> IDLE")
+        check(app.cfg["port"] == pa and app.cfg["launcher_bat"] == str(sdir / "run-a.bat")
+              and app.cfg["model_name"] == "model-a" and app._pending_launcher is None,
+              "pending launcher applied once Strata stopped")
+        check(app.cfg["launch_cmd"][0] == str(sdir / ".venv" / "Scripts" / "python.exe"), "launch_cmd from the .bat")
+
+        # ---- picking the launcher that is already loaded while ACTIVE -> nothing pending
+        to_active(app, ep)
+        app.gear.invoke()
+        dlg = app.dialog
+        pump(app, 0.3)
+        check(dlg._msg.cget("text") == "", "unchanged selection: no hint")
+        dlg._save_btn.invoke()
+        check(pump_until(app, lambda: not app._dialog_open()) and app._pending_launcher is None
+              and "applies next start" not in app.preview.cget("text"), "re-saving the active launcher is not 'pending'")
+
+        # ---- gear is inert while STARTING / STOPPING
+        app.state_name = "STARTING"
+        app.open_settings()
+        check(app.dialog is None, "Settings ignored while STARTING")
+        app.state_name = "IDLE"
+        ep.status_value = dict(IDLE_STATUS)
+        app._apply_state()
+    finally:
+        settings_dialog.filedialog.askopenfilename = orig_ask
+        if not app._destroyed:
+            app.destroy()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- no strata_dir / nothing configured: usable empty state
+    app, det, ep = new_app(dict(CFG, strata_dir="", launcher_bat="", launch_cmd=[]))
+    try:
+        app.gear.invoke()
+        dlg = app.dialog
+        pump(app, 0.3)
+        check(dlg._choice.get() == settings_dialog.NO_LAUNCHERS and str(dlg._menu.cget("state")) == "disabled"
+              and str(dlg._save_btn.cget("state")) == "disabled" and "Browse" in dlg._detail.cget("text"),
+              f"empty state: disabled dropdown + hint ({dlg._detail.cget('text')!r})")
+        shot(dlg, "settings_empty")
+        dlg.tk.call(dlg.protocol("WM_DELETE_WINDOW"))
+        pump(app, 0.2)
+        check(not app._dialog_open(), "close-X closes Settings")
+    finally:
+        if not app._destroyed:
+            app.destroy()
+
 
 def run() -> int:
     dialogs = Dialogs()
@@ -698,7 +1257,8 @@ def run() -> int:
             for fn, args in ((test_layout_idle_preview, (app, det, ep)), (test_on_flow, (app, det, ep)),
                              (test_off_flow, (app, det, ep, dialogs)), (test_error_and_cancel, (app, det, ep)),
                              (test_sweep_dialog_close_x, (app, det, ep)), (test_whitelist_modal, (app, det, ep)),
-                             (test_load_progress_view, (app, det, ep)), (test_strata_estimate, (app, det, ep))):
+                             (test_load_progress_view, (app, det, ep)), (test_strata_estimate, (app, det, ep)),
+                             (test_stats_section, (app, det, ep))):
                 print(f"-- {fn.__name__}")
                 try:
                     fn(*args)
@@ -708,14 +1268,17 @@ def run() -> int:
         finally:
             if not app._destroyed:
                 app.destroy()
-        print("-- test_delete_window")
-        try:
-            test_delete_window(dialogs)
-        except Exception:
-            FAILS.append(f"test_delete_window raised:\n{traceback.format_exc()}")
-            print(FAILS[-1])
+        for fn, args in ((test_delete_window, (dialogs,)), (test_settings_dialog, (dialogs,)),
+                         (test_stats_persist_and_scaling, ())):
+            print(f"-- {fn.__name__}")
+            try:
+                fn(*args)
+            except Exception:
+                FAILS.append(f"{fn.__name__} raised:\n{traceback.format_exc()}")
+                print(FAILS[-1])
     finally:
         dialogs.restore()
+        shutil.rmtree(HOME, ignore_errors=True)
     print(f"\n{PASSES} checks passed, {len(FAILS)} failed")
     return 1 if FAILS else 0
 

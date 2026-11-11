@@ -9,6 +9,7 @@ import queue
 import sys
 import threading
 import time
+import tkinter
 from logging.handlers import RotatingFileHandler
 from tkinter import messagebox
 from typing import Any, Callable
@@ -17,15 +18,25 @@ import customtkinter as ctk
 import psutil
 
 import config_store
+import launcher_bat
 import load_progress
+import metrics_store
 import theme as T
+from graphs import BarGraph, LineGraph, StatRow, fmt_rate
+from metrics_store import MetricsStore
+from settings_dialog import SettingsDialog
 from sweep_dialog import SweepDialog
+from version import __version__
+from vram_sampler import VramSampler
 from whitelist_modal import WhitelistModal
 
 log = logging.getLogger("hermes_controller")
 
 APP_TITLE = "Hermes Controller"
 WIDTH, HEIGHT = 360, 268
+STATS_H = 3 * 82 + 2                     # three StatRows + two hairlines (logical px)
+STATS_GAP = 8                            # between the memory card and the stats card when expanded
+HEIGHT_EXPANDED = HEIGHT + STATS_GAP + STATS_H
 
 IDLE, STARTING, ACTIVE, STOPPING, ERROR = "IDLE", "STARTING", "ACTIVE", "STOPPING", "ERROR"
 
@@ -43,9 +54,9 @@ PILL_COLORS = {k: v[1] for k, v in STATUS.items()}
 LOADING_COLOR = LOADING_STATUS[1]
 
 # Toggle styles: (fg, hover, text colour). Primary = off-white; everything else is a quiet raised surface.
-TOGGLE_ON = (T.TEXT, "#D9D9D6", T.ON_PRIMARY)
-TOGGLE_OFF = (T.RAISED, "#303035", T.TEXT)
-TOGGLE_CANCEL = (T.RAISED, "#303035", T.TEXT)
+TOGGLE_ON = (T.TEXT, T.PRIMARY_HOVER, T.ON_PRIMARY)
+TOGGLE_OFF = (T.RAISED, T.RAISED_HOVER, T.TEXT)
+TOGGLE_CANCEL = (T.RAISED, T.RAISED_HOVER, T.TEXT)
 TOGGLE_WAIT = (T.SURFACE, T.SURFACE, T.TEXT_3)
 
 BG = T.BG
@@ -56,6 +67,8 @@ PUMP_MS = 50
 TICK_MS = 5000
 PROGRESS_MS = 500
 MEMORY_S = 2.0
+STATS_MS = 2000                          # stats redraw + /metrics poll period
+METRICS_FAILS_SHOWN = 3                  # consecutive failed polls before "Metrics unavailable"
 ERROR_HOLD_S = 15.0
 
 _SINGLETON_MUTEX = None  # kept referenced for process life (see main())
@@ -107,7 +120,9 @@ def _build_real_deps(cfg: dict) -> tuple[Any, Any]:
 
 
 class HermesControllerApp(ctk.CTk):
-    def __init__(self, detector=None, endpoint=None, config: dict | None = None) -> None:
+    def __init__(self, detector=None, endpoint=None, config: dict | None = None,
+                 metrics_fetcher: Callable[[str], dict | None] | None = None, vram_sampler=None) -> None:
+        """metrics_fetcher(root_url) and vram_sampler are test seams (defaults: Strata /metrics over HTTP, NVML)."""
         cfg = config if config is not None else config_store.load_config()
         if detector is None and endpoint is None:
             detector, endpoint = _build_real_deps(cfg)
@@ -124,6 +139,7 @@ class HermesControllerApp(ctk.CTk):
         self._pump_id: str | None = None
         self._tick_id: str | None = None
         self._first_id: str | None = None
+        self._stats_id: str | None = None
         self._stop_evt = threading.Event()
 
         self.state_name = IDLE
@@ -140,7 +156,19 @@ class HermesControllerApp(ctk.CTk):
         self._progress_id: str | None = None
         self._server_t0 = 0.0
         self._log_text = ""
-        self._expected_s = float(config_store.load_state().get("last_cold_load_s") or 0.0)
+        saved = config_store.load_state()
+        try:
+            self._expected_s = float(saved.get("last_cold_load_s") or 0.0)
+        except (TypeError, ValueError):           # a hand-edited state.json must not stop the app
+            self._expected_s = 0.0
+        self.expanded = bool(saved.get("stats_expanded"))
+        self._pending_launcher: launcher_bat.LauncherInfo | None = None   # saved while Strata runs
+        self._fetch_metrics = metrics_fetcher or metrics_store.fetch_metrics
+        self.metrics = MetricsStore()
+        self._metrics_fails = 0
+        self._metrics_epoch = 0                  # bumped per start: a late poll of the old server is dropped
+        self.vram = vram_sampler if vram_sampler is not None else VramSampler()
+        self._spans: list[list[float | None]] = []   # [start, end|None] (monotonic) while Strata was running
         self._avail_at_launch: float | None = None
         self._launch_wall = 0.0                  # time.time() at launch: rejects a previous run's log
         self._strata_est: float | None = None    # latched at ready: RAM Strata took (free-RAM drop)
@@ -152,6 +180,7 @@ class HermesControllerApp(ctk.CTk):
         self._error_log: str | None = None
 
         self._idle_streak = 0                   # consecutive "idle" status readings while ACTIVE
+        self._state_seq = 0                     # bumped on every state change: stale monitor readings are dropped
         self.report_callback_exception = (
             lambda exc, val, tb: log.error("Tk callback failed", exc_info=(exc, val, tb)))
         self.title(APP_TITLE)
@@ -161,19 +190,22 @@ class HermesControllerApp(ctk.CTk):
                 self.iconbitmap(default=str(icon))   # default= also applies to the dialogs
             except Exception:  # noqa: BLE001
                 log.debug("iconbitmap failed", exc_info=True)
-        self.geometry(f"{WIDTH}x{HEIGHT}")
+        self.geometry(f"{WIDTH}x{HEIGHT_EXPANDED if self.expanded else HEIGHT}")
         self.after(50, self._dark_caption)
         self.resizable(False, False)
         self.protocol("WM_DELETE_WINDOW", self.on_close_request)
         self._build_ui()
         self._apply_state()
         self._update_telemetry()
+        self._apply_expanded()
 
         self._pump_id = self.after(PUMP_MS, self._pump)
         self._tick_id = self.after(TICK_MS, self._tick)
         self._first_id = self.after(300, self._first_refresh)
         threading.Thread(target=self._monitor_loop, name="hc-monitor", daemon=True).start()
         threading.Thread(target=self._memory_loop, name="hc-memory", daemon=True).start()
+        threading.Thread(target=self._metrics_loop, name="hc-metrics", daemon=True).start()
+        self.vram.start()
 
     # ================================================================== layout
     def _font(self, size: int, weight: str = "normal") -> ctk.CTkFont:
@@ -200,7 +232,7 @@ class HermesControllerApp(ctk.CTk):
         self.gear = ctk.CTkButton(top, text=T.GEAR_GLYPH, width=28, height=28, corner_radius=8,
                                   font=ctk.CTkFont(family=T.icon_family(), size=14),
                                   fg_color="transparent", hover_color=T.RAISED, text_color=T.TEXT_2,
-                                  text_color_disabled=T.HAIRLINE, command=self.open_whitelist)
+                                  text_color_disabled=T.HAIRLINE, command=self.open_settings)
         self.gear.grid(row=0, column=3)
 
         self.preview = ctk.CTkLabel(self, text="Checking what is running…", font=self._font(12),
@@ -223,6 +255,7 @@ class HermesControllerApp(ctk.CTk):
         card = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=T.R_CARD)
         card.grid(row=4, column=0, sticky="ew", padx=16, pady=(16, 16))
         card.grid_columnconfigure(0, weight=1)
+        self.mem_card = card
         head = ctk.CTkFrame(card, fg_color="transparent")
         head.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
         head.grid_columnconfigure(0, weight=1)
@@ -232,6 +265,13 @@ class HermesControllerApp(ctk.CTk):
         self.telemetry = ctk.CTkLabel(head, text="", font=self._mono(11), text_color=T.TEXT_3, anchor="e",
                                       height=16)
         self.telemetry.grid(row=0, column=1, sticky="e")
+        # Chevron: expands the window downward to the stats section. Same height as the header row, so the
+        # collapsed layout is pixel-identical to v1.0.
+        self.chevron = ctk.CTkButton(head, text=T.CHEVRON_DOWN, width=20, height=16, corner_radius=4,
+                                     font=ctk.CTkFont(family=T.icon_family(), size=10),
+                                     fg_color="transparent", hover_color=T.RAISED, text_color=T.TEXT_3,
+                                     command=self.toggle_stats)
+        self.chevron.grid(row=0, column=2, padx=(6, 0))
 
         self.gauge = ctk.CTkFrame(card, height=8, corner_radius=4, fg_color=T.RAISED)
         self.gauge.grid(row=1, column=0, sticky="ew", padx=12)
@@ -251,6 +291,19 @@ class HermesControllerApp(ctk.CTk):
             lbl = ctk.CTkLabel(cell, text=f"{label} –", font=self._mono(11), text_color=T.TEXT_2, height=14)
             lbl.grid(row=0, column=1)
             self.legend[key] = (lbl, label)
+
+        # Stats section (gridded only while expanded): one card, three rows split by hairlines.
+        self.stats = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=T.R_CARD, height=STATS_H)
+        self.stats.grid_propagate(False)
+        self.stats.grid_columnconfigure(0, weight=1)
+        self.row_vram = StatRow(self.stats, "VRAM · 5 min", lambda m: LineGraph(m, window_s=self.vram.window_s))
+        self.row_decode = StatRow(self.stats, "Decode · per request", BarGraph)
+        self.row_prompt = StatRow(self.stats, "Prompt reading · per request", BarGraph)
+        for i, row in enumerate((self.row_vram, self.row_decode, self.row_prompt)):
+            if i:
+                ctk.CTkFrame(self.stats, height=1, fg_color=T.HAIRLINE, bg_color=T.HAIRLINE, corner_radius=0).grid(
+                    row=2 * i - 1, column=0, sticky="ew", padx=12)
+            row.grid(row=2 * i, column=0, sticky="ew", padx=12)
 
     def _style_toggle(self, text: str, colors: tuple[str, str, str], state: str) -> None:
         fg, hover, txt = colors
@@ -277,10 +330,13 @@ class HermesControllerApp(ctk.CTk):
         if not busy:
             self.progress.set(0)
             self.elapsed.configure(text="")
+        self._track_span()
         if st == ACTIVE:
             model = self.model_id or self.cfg.get("model_name") or "model"
             url = str(self.cfg.get("endpoint_url", "")).replace("http://", "")
             extra = " · still loading" if self.loaded is False else ""
+            if self._pending_launcher is not None:       # a launcher saved while running waits for the next start
+                url = f"{_short(self._pending_launcher.bat_name, 28)} applies next start"
             self._set_preview(f"{model}{extra}\n{url}")
         elif st == ERROR and self.error_text:
             self._set_preview(self.error_text, color=T.RED_TEXT)
@@ -301,11 +357,13 @@ class HermesControllerApp(ctk.CTk):
 
     def _set_state(self, st: str) -> None:
         self.state_name = st
+        self._state_seq += 1
         if st != ERROR:
             self._error_hold_until = 0.0
         if st in (IDLE, ERROR):                  # no Strata of ours any more: drop memory baselines
             self._avail_at_launch = None
             self._strata_est = None
+            self._apply_pending_launcher()
         log.info("state -> %s", st)
         self._apply_state()
         self._update_telemetry()
@@ -342,6 +400,141 @@ class HermesControllerApp(ctk.CTk):
         except (TypeError, ValueError):
             return
         self._update_telemetry()
+
+    # ================================================================== stats section
+    def toggle_stats(self) -> None:
+        self.expanded = not self.expanded
+        self._apply_expanded()
+        config_store.save_state({"stats_expanded": self.expanded})
+
+    def _apply_expanded(self) -> None:
+        """Grow the window downward to show the stats card, or shrink back to the exact v1.0 size."""
+        self.chevron.configure(text=T.CHEVRON_UP if self.expanded else T.CHEVRON_DOWN)
+        if self.expanded:
+            self.mem_card.grid(pady=(16, STATS_GAP))      # .grid(), not grid_configure(): only .grid() is DPI-scaled
+            self.stats.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 16))
+            self.geometry(f"{WIDTH}x{HEIGHT_EXPANDED}")
+            self._keep_on_screen()
+            self._refresh_stats()
+            if self._stats_id is None and not self._destroyed:
+                self._stats_id = self.after(STATS_MS, self._stats_tick)
+        else:
+            self.stats.grid_remove()
+            self.mem_card.grid(pady=(16, 16))
+            self.geometry(f"{WIDTH}x{HEIGHT}")
+            if self._stats_id is not None:
+                try:
+                    self.after_cancel(self._stats_id)
+                except Exception:  # noqa: BLE001
+                    log.debug("after_cancel failed", exc_info=True)
+                self._stats_id = None
+
+    def _keep_on_screen(self) -> None:
+        """Expanding near the bottom of the screen would push the graphs under the taskbar: slide the window up."""
+        try:
+            self.update_idletasks()
+            if self.state() != "normal":
+                return
+            scale = ctk.ScalingTracker.get_window_scaling(self)
+            mon = _work_area(self)
+            if mon is None:
+                return
+            _left, top, _right, bottom = mon
+            x, y = self.winfo_x(), self.winfo_y()
+            frame_h = (self.winfo_rooty() - y) + round(HEIGHT_EXPANDED * scale) + 8
+            if y + frame_h > bottom:
+                tkinter.Wm.wm_geometry(self, f"+{x}+{max(top, bottom - frame_h)}")   # position only, unscaled
+        except Exception:  # noqa: BLE001 - cosmetic
+            log.debug("keep-on-screen failed", exc_info=True)
+
+    def _track_span(self) -> None:
+        """Remember when Strata was running (server launch -> stopped) to tint that stretch of the VRAM line."""
+        st = self.state_name
+        alive = st in (ACTIVE, STOPPING) or (st == STARTING and self._start_phase == "server")
+        open_span = bool(self._spans) and self._spans[-1][1] is None
+        now = time.monotonic()
+        if alive and not open_span:
+            self._spans.append([now, None])
+        elif not alive and open_span:
+            self._spans[-1][1] = now
+        cutoff = now - self.vram.window_s
+        self._spans = [sp for sp in self._spans if sp[1] is None or sp[1] >= cutoff]
+
+    def _stats_tick(self) -> None:
+        self._stats_id = None
+        if self._destroyed or not self.expanded:
+            return
+        try:
+            if not self._iconic:
+                self._refresh_stats()
+        finally:
+            if not self._destroyed and self.expanded:
+                self._stats_id = self.after(STATS_MS, self._stats_tick)
+
+    def _refresh_stats(self) -> None:
+        """Main thread: redraw the three graphs from the sampler / metrics store."""
+        if not self.expanded:
+            return
+        polling = self.state_name in (ACTIVE, STOPPING)
+        if not polling:
+            self.metrics.clear_live()                     # nothing is generating once Strata is not serving
+        snap = self.vram.snapshot()
+        row = self.row_vram
+        if snap.available and snap.total_mb and snap.samples:
+            used = snap.samples[-1][1]
+            spans = [(a, snap.now if b is None else b) for a, b in self._spans]
+            row.graph.set_data(snap.samples, snap.total_mb, snap.now, spans=spans,
+                               max_label=f"{snap.total_mb / 1024.0:.0f} GB",
+                               empty=None if len(snap.samples) > 1 else "Collecting…")
+            row.set_value(f"{used / 1024.0:.1f} / {snap.total_mb / 1024.0:.1f} GB")
+        else:
+            row.graph.set_data((), 1.0, snap.now, empty="VRAM unavailable" if snap.available is False
+                               else "Collecting…")
+            row.set_value("–", T.TEXT_3)
+        if polling and self._metrics_fails >= METRICS_FAILS_SHOWN:
+            empty_d = empty_p = "Metrics unavailable"
+        elif polling:
+            empty_d, empty_p = "No requests yet", "No prompt reads yet"
+        else:
+            empty_d = empty_p = "Strata is off"
+        self._fill_rate_row(self.row_decode, self.metrics.decode_series(), self.metrics.live_decode, empty_d)
+        self._fill_rate_row(self.row_prompt, self.metrics.prompt_series(), self.metrics.live_prompt, empty_p)
+
+    @staticmethod
+    def _fill_rate_row(row: StatRow, series: list[float], live: float | None, empty: str) -> None:
+        row.graph.set_data(series, live=live, empty=empty)
+        if live is not None:
+            row.set_value(f"{fmt_rate(live)} tok/s", T.ACCENT, "live")
+        elif series:
+            row.set_value(f"{fmt_rate(series[-1])} tok/s", T.TEXT, "last")
+        else:
+            row.set_value("–", T.TEXT_3)
+
+    def _metrics_loop(self) -> None:
+        """Worker: poll Strata's /metrics every 2 s, only while it is serving AND the stats section is open."""
+        while not self._stop_evt.is_set():
+            try:
+                if self.expanded and not self._iconic and self.state_name in (ACTIVE, STOPPING):
+                    epoch = self._metrics_epoch
+                    root = config_store.server_root(str(self.cfg.get("endpoint_url") or ""))
+                    data = self._fetch_metrics(root) if root else None
+                    self.post(self._apply_metrics, epoch, data)
+            except Exception:  # noqa: BLE001
+                log.debug("metrics poll failed", exc_info=True)
+            self._stop_evt.wait(STATS_MS / 1000.0)
+
+    def _apply_metrics(self, epoch: int, data: dict | None) -> None:
+        if epoch != self._metrics_epoch or self.state_name not in (ACTIVE, STOPPING):
+            return                                        # answer of a previous server / arrived after the stop
+        if not isinstance(data, dict):
+            self._metrics_fails += 1
+            self.metrics.clear_live()
+        else:
+            self._metrics_fails = 0
+            self.metrics.ingest(data, now=time.monotonic())
+            if self.metrics.hw_vram is not None:          # fallback VRAM source when NVML is unavailable
+                self.vram.push_external(*self.metrics.hw_vram)
+        self._refresh_stats()
 
     # ================================================================== progress / memory
     def _progress_tick(self) -> None:
@@ -446,11 +639,18 @@ class HermesControllerApp(ctk.CTk):
     def _monitor_loop(self) -> None:
         while not self._stop_evt.is_set():
             try:
-                status = self.endpoint.status()
-                self.post(self.on_status, status)
+                seq = self._state_seq
+                status = self.endpoint.status()         # can take seconds (identity probe)
+                self.post(self._on_monitor_status, seq, status)
             except Exception:
                 log.exception("endpoint.status() failed")
             self._stop_evt.wait(TICK_MS / 1000.0)
+
+    def _on_monitor_status(self, seq: int, status: dict) -> None:
+        """A reading taken before the last state change is stale (e.g. 'active' probed just before OFF finished
+        would flip the idle UI back to Serving for ten seconds): drop it, the next tick brings a fresh one."""
+        if seq == self._state_seq:
+            self.on_status(status)
 
     def _dialog_open(self) -> bool:
         d = self.dialog
@@ -575,6 +775,7 @@ class HermesControllerApp(ctk.CTk):
             self.cancel_start()
 
     def turn_on(self) -> None:
+        self._apply_pending_launcher()
         self._start_token += 1
         token = self._start_token
         self.error_text = None
@@ -661,6 +862,9 @@ class HermesControllerApp(ctk.CTk):
         self._launch_wall = time.time()
         self._log_text = ""
         self._prog_best = ("Launching", 0.0, None)
+        self._metrics_epoch += 1                 # a new server: its request history starts empty
+        self._metrics_fails = 0
+        self.metrics.reset()
         try:
             self._avail_at_launch = psutil.virtual_memory().available / 1048576.0
         except Exception:  # noqa: BLE001
@@ -788,7 +992,73 @@ class HermesControllerApp(ctk.CTk):
             self._finish_exit()
 
     # ================================================================== dialogs / exit
+    def open_settings(self) -> None:
+        """Gear: launcher choice + protected apps. Not while STARTING/STOPPING (the launch config is in use)."""
+        if self.state_name in (STARTING, STOPPING) or self._dialog_open():
+            return
+        pending = self._pending_launcher
+        self.dialog = SettingsDialog(
+            self, self.cfg, self.detector, on_save=self.save_launcher, on_closed=self._on_settings_closed,
+            current_bat=pending.bat_path if pending is not None else None,
+            running=self.state_name == ACTIVE, on_whitelist_saved=self._request_preview)
+
+    def _on_settings_closed(self) -> None:
+        self.dialog = None
+        self._request_preview()
+
+    def save_launcher(self, info: launcher_bat.LauncherInfo, done: Callable[[str | None], None]) -> None:
+        """Persist the chosen launcher to config.json on a worker, then apply it (now, or at the next start)."""
+        def work() -> None:
+            err = None
+            try:
+                disk = config_store.load_config()         # re-read: keep whatever else changed on disk
+                launcher_bat.apply_to_config(disk, info)
+                config_store.save_config(disk)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("saving the launcher failed")
+                err = f"Save failed: {exc}"
+            self.post(self._launcher_saved, info, err, done)
+
+        self._run_worker("hc-save-launcher", work)
+
+    def _launcher_saved(self, info: launcher_bat.LauncherInfo, err: str | None,
+                        done: Callable[[str | None], None]) -> None:
+        if err is None:
+            if launcher_bat.same_launch(self.cfg, info):
+                self._pending_launcher = None             # back to what is already loaded: nothing to apply
+            else:
+                self._pending_launcher = info
+                self._apply_pending_launcher(note=True)
+            log.info("launcher saved: %s (%s)", info.bat_path,
+                     "applies next start" if self._pending_launcher is not None else "applied")
+        done(err)
+        if err is None and self.state_name == ACTIVE:
+            self._apply_state()                           # shows / clears the "applies next start" line
+
+    def _apply_pending_launcher(self, note: bool = False) -> bool:
+        """Switch the shared config to the saved launcher - only while no Strata is using the old one.
+
+        The endpoint manager reads port / endpoint_url / strata_dir live from this dict; changing them under a
+        running server would make OFF look at the wrong port. So: IDLE/ERROR and nothing listening, else wait.
+        """
+        info = self._pending_launcher
+        if info is None or self.state_name not in (IDLE, ERROR):
+            return False
+        try:
+            if self.endpoint.is_running():
+                return False
+        except Exception:  # noqa: BLE001
+            log.debug("is_running failed", exc_info=True)
+            return False
+        launcher_bat.apply_to_config(self.cfg, info)
+        self._pending_launcher = None
+        log.info("launcher applied: %s -> %s on port %s", info.bat_name, info.model_name, info.port)
+        if note and self.state_name == IDLE:
+            self._set_preview(f"Launcher set to {_short(info.bat_name, 30)}\n{info.summary()}")
+        return True
+
     def open_whitelist(self) -> None:
+        """Protected apps directly (the Settings dialog has a button for it)."""
         if self.state_name in (STARTING, STOPPING) or self._dialog_open():
             return
         self.dialog = WhitelistModal(self, self.detector, on_saved=self._on_whitelist_saved)
@@ -850,7 +1120,11 @@ class HermesControllerApp(ctk.CTk):
             return
         self._destroyed = True
         self._stop_evt.set()
-        for aid in (self._pump_id, self._tick_id, self._first_id, self._progress_id):
+        try:
+            self.vram.stop()
+        except Exception:  # noqa: BLE001
+            log.debug("vram sampler stop failed", exc_info=True)
+        for aid in (self._pump_id, self._tick_id, self._first_id, self._progress_id, self._stats_id):
             if aid:
                 try:
                     self.after_cancel(aid)
@@ -862,6 +1136,36 @@ class HermesControllerApp(ctk.CTk):
         except Exception:
             log.debug("after info cleanup failed", exc_info=True)
         super().destroy()
+
+
+def _work_area(win) -> tuple[int, int, int, int] | None:
+    """(left, top, right, bottom) work area of the monitor the window is on (physical px), or None."""
+    class _Rect(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long),
+                    ("bottom", ctypes.c_long)]
+
+    class _MonitorInfo(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", _Rect), ("rcWork", _Rect),
+                    ("dwFlags", ctypes.c_ulong)]
+
+    try:
+        user32 = ctypes.WinDLL("user32")                         # private handle: prototypes stay local
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.GetParent.restype = ctypes.c_void_p
+        user32.GetParent.argtypes = [ctypes.c_void_p]
+        hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
+        mon = user32.MonitorFromWindow(hwnd, 2)                  # MONITOR_DEFAULTTONEAREST
+        info = _MonitorInfo()
+        info.cbSize = ctypes.sizeof(_MonitorInfo)
+        if not mon or not user32.GetMonitorInfoW(mon, ctypes.byref(info)):
+            return None
+        r = info.rcWork
+        return r.left, r.top, r.right, r.bottom
+    except Exception:  # noqa: BLE001
+        log.debug("work area lookup failed", exc_info=True)
+        return None
 
 
 def _setup_logging() -> None:
@@ -899,7 +1203,8 @@ def main() -> None:
     _SINGLETON_MUTEX = win32event.CreateMutex(None, False, "HermesController.Singleton")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         user32 = ctypes.windll.user32
-        hwnd = user32.FindWindowW(None, APP_TITLE)
+        # class + title: an Explorer window of a folder called "Hermes Controller" has the same title
+        hwnd = user32.FindWindowW("TkTopLevel", APP_TITLE)
         if hwnd:                                     # bring the running window forward instead of a dialog
             user32.ShowWindow(hwnd, 9)                # SW_RESTORE
             user32.SetForegroundWindow(hwnd)
@@ -912,7 +1217,8 @@ def main() -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("warrenjbg.HermesController")
     except Exception:  # noqa: BLE001
         pass
-    log.info("Hermes Controller starting (frozen=%s, data=%s)", config_store.FROZEN, config_store.DATA_DIR)
+    log.info("Hermes Controller %s starting (frozen=%s, data=%s)", __version__, config_store.FROZEN,
+             config_store.DATA_DIR)
     try:
         app = HermesControllerApp()
     except Exception:

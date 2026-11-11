@@ -18,6 +18,10 @@ TEXT = "#EDEDEB"        # primary text, primary button fill
 TEXT_2 = "#A1A1A6"      # secondary text
 TEXT_3 = "#6E6E73"      # muted text, idle LED
 ON_PRIMARY = "#141415"  # text on the off-white primary button
+PRIMARY_HOVER = "#D9D9D6"  # hover of the off-white primary button / ticked checkbox
+RAISED_HOVER = "#303035"   # hover of RAISED controls, outline of ghost buttons
+DANGER = "#B4363B"         # destructive action (sweep dialog), toned into the palette
+DANGER_HOVER = "#9C2F33"
 
 # --- the one accent: status-LED green; semantic tones toned into the palette ---------------------------------------
 ACCENT = "#3CC77E"      # active LED, Strata segment, progress fill
@@ -33,6 +37,8 @@ R_CARD = 12
 R_CONTROL = 10
 
 GEAR_GLYPH = "\uE713"   # Segoe Fluent Icons "Settings"
+CHEVRON_DOWN = "\uE70D"  # stats section collapsed
+CHEVRON_UP = "\uE70E"    # stats section expanded
 
 _FAMILY_CACHE: dict[str, str] = {}
 
@@ -61,6 +67,17 @@ def mono_family() -> str:
 
 def icon_family() -> str:
     return _pick("Segoe Fluent Icons", "Segoe MDL2 Assets")
+
+
+def mix(fg: str, bg: str, alpha: float) -> str:
+    """`fg` at `alpha` opacity over `bg` as a solid #RRGGBB.
+
+    tk.Canvas has no alpha, so graph area fills are pre-blended tints of existing tokens (no new palette colours).
+    """
+    a = min(1.0, max(0.0, float(alpha)))
+    f = [int(fg[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(bg[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(fc * a + bc * (1 - a)):02X}" for fc, bc in zip(f, b))
 
 
 def fmt_gb(mb: float | None, digits: int = 1) -> str:

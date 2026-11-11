@@ -4,12 +4,12 @@ from __future__ import annotations
 import copy
 import json
 import os
-import tempfile
-import threading
-from pathlib import Path
-
 import shutil
 import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
 
 FROZEN = bool(getattr(sys, "frozen", False))
 # Code/bundle dir. Frozen (PyInstaller one-folder): read-only files live in sys._MEIPASS (…\_internal).
@@ -38,7 +38,7 @@ def ensure_data_dir() -> None:
 
 def load_state() -> dict:
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
+        with open(STATE_PATH, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
@@ -46,21 +46,25 @@ def load_state() -> dict:
 
 
 def save_state(update: dict) -> None:
-    """Merge `update` into state.json (best effort; never raises)."""
+    """Merge `update` into state.json (best effort; never raises). The read-modify-write is one locked step,
+    so two threads saving different keys cannot drop each other's update."""
     try:
-        state = load_state()
-        state.update(update)
-        save_config(state, STATE_PATH)
+        with _lock:
+            state = load_state()
+            state.update(update)
+            save_config(state, STATE_PATH)
     except Exception:  # noqa: BLE001
         pass
+
 
 DEFAULTS: dict = {
     "target_os": "windows",
     "backend": "strata",
     "model_name": "swift-1.5-iq3_s",
     "strata_dir": "",
-    "launcher_bat": "",
-    "launch_cmd": [],
+    "launcher_bat": "",          # full path of the chosen run-*.bat (v1.0: a name relative to strata_dir)
+    "launch_cmd": [],            # argv parsed from that .bat (launcher_bat.py); the .bat itself is never run
+    "launch_cwd": "",            # directory the .bat starts the server from ("" = strata_dir)
     "endpoint_url": "http://127.0.0.1:8080/v1",
     "port": 8080,
     "ready_timeout_s": 180,
@@ -92,6 +96,18 @@ def load_config(path: Path | str | None = None) -> dict:
         return cfg
 
 
+def _replace(src: str, dst: Path) -> None:
+    """os.replace with a few retries: on Windows a scanner/indexer holding `dst` open makes it fail briefly."""
+    for attempt in range(5):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def save_config(cfg: dict, path: Path | str | None = None) -> None:
     """Atomically write cfg to config.json (temp file in the same dir + os.replace)."""
     p = Path(path) if path else CONFIG_PATH
@@ -104,7 +120,7 @@ def save_config(cfg: dict, path: Path | str | None = None) -> None:
                 f.write("\n")
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, p)
+            _replace(tmp, p)
         except BaseException:
             try:
                 os.unlink(tmp)

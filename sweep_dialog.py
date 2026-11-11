@@ -1,11 +1,13 @@
 """SweepDialog: pick which RAM-hungry apps to force-close before starting Strata."""
 from __future__ import annotations
 
+import ctypes
 import logging
 from typing import Callable
 
 import customtkinter as ctk
 
+import config_store
 import theme as T
 
 log = logging.getLogger("hermes_controller")
@@ -16,10 +18,10 @@ _BG = T.BG
 _ROW_BG = T.SURFACE
 _MUTED = T.TEXT_2
 _WARN = T.AMBER
-_DANGER = "#B4363B"          # destructive action, toned into the palette
-_DANGER_HOVER = "#9C2F33"
+_DANGER = T.DANGER
+_DANGER_HOVER = T.DANGER_HOVER
 _NEUTRAL = T.RAISED
-_NEUTRAL_HOVER = "#303035"
+_NEUTRAL_HOVER = T.RAISED_HOVER
 
 
 def _gb(mb: float | None) -> str:
@@ -38,20 +40,59 @@ def row_text(cand: dict) -> str:
     return f"{cand.get('name', '?')} — {row_detail(cand)}"
 
 
+def _virtual_screen(win) -> tuple[int, int, int, int]:
+    """(left, top, right, bottom) of the whole desktop across monitors (physical px)."""
+    try:
+        gm = ctypes.windll.user32.GetSystemMetrics
+        x, y, w, h = gm(76), gm(77), gm(78), gm(79)          # SM_X/Y/CX/CYVIRTUALSCREEN
+        if w > 0 and h > 0:
+            return x, y, x + w, y + h
+    except Exception:  # noqa: BLE001
+        log.debug("GetSystemMetrics failed", exc_info=True)
+    return 0, 0, win.winfo_screenwidth(), win.winfo_screenheight()
+
+
 def center_over(win, master, width: int, height: int) -> None:
-    """Place a CTkToplevel of logical size width x height centred over master (positions are physical px)."""
+    """Place a CTkToplevel of logical size width x height centred over master (positions are physical px).
+
+    Clamped to the virtual desktop, not the primary monitor: a controller sitting on a second screen keeps its
+    dialogs on that screen.
+    """
     try:
         scale = ctk.ScalingTracker.get_window_scaling(win)
         master.update_idletasks()
         pw, ph = round(width * scale), round(height * scale)
         x = master.winfo_rootx() + (master.winfo_width() - pw) // 2
         y = master.winfo_rooty() + (master.winfo_height() - ph) // 2
-        x = max(0, min(x, win.winfo_screenwidth() - pw))
-        y = max(0, min(y, win.winfo_screenheight() - ph - 40))
+        left, top, right, bottom = _virtual_screen(win)
+        x = max(left, min(x, right - pw))
+        y = max(top, min(y, bottom - ph - 40))
         win.geometry(f"{width}x{height}+{x}+{y}")
     except Exception:  # geometry is cosmetic; never fail the dialog over it
         log.exception("centering dialog failed")
         win.geometry(f"{width}x{height}")
+
+
+def later(win, ms: int, fn: Callable[[], None]) -> None:
+    """win.after() whose id is remembered, so release_modal() can cancel it if the dialog closes first
+    (a fired after-script of a destroyed window is an 'invalid command name' background error)."""
+    ids = win.__dict__.setdefault("_hc_after_ids", [])
+    ids.append(win.after(ms, fn))
+
+
+def style_dialog(win) -> None:
+    """Shared dialog chrome: dark caption + the app icon.
+
+    CTkToplevel swaps in CustomTkinter's own icon 200 ms after creation unless iconbitmap() was called on that
+    window, so the root's default icon alone is not enough.
+    """
+    later(win, 50, lambda: T.dark_caption(win))
+    icon = config_store.APP_DIR / "assets" / "app.ico"
+    try:
+        if icon.exists():
+            win.iconbitmap(str(icon))
+    except Exception:  # noqa: BLE001
+        log.debug("dialog icon not applied", exc_info=True)
 
 
 def apply_modal(win, master) -> None:
@@ -67,10 +108,16 @@ def apply_modal(win, master) -> None:
         except Exception:
             log.exception("modal grab failed")
 
-    win.after(200, _grab)
+    later(win, 200, _grab)
 
 
 def release_modal(win) -> None:
+    """Call right before destroy(): drop the grab and cancel the dialog's pending after-scripts."""
+    for aid in win.__dict__.pop("_hc_after_ids", []):
+        try:
+            win.after_cancel(aid)
+        except Exception:  # noqa: BLE001
+            log.debug("after_cancel failed", exc_info=True)
     try:
         win.grab_release()
     except Exception:
@@ -84,7 +131,7 @@ class SweepDialog(ctk.CTkToplevel):
     def __init__(self, master, candidates: list[dict],
                  on_decision: Callable[[str, list[tuple[int, float]]], None]) -> None:
         super().__init__(master, fg_color=_BG)
-        self.after(50, lambda: T.dark_caption(self))
+        style_dialog(self)
         self._on_decision = on_decision
         self._decided = False
         self._rows: list[tuple[ctk.BooleanVar, dict]] = []
@@ -112,7 +159,7 @@ class SweepDialog(ctk.CTkToplevel):
         name_font = ctk.CTkFont(family=T.ui_family(), size=12, weight="bold")
         for i, cand in enumerate(candidates):
             var = ctk.BooleanVar(value=bool(cand.get("preselect")))
-            cb = ctk.CTkCheckBox(self._list, fg_color=T.TEXT, hover_color="#D9D9D6", checkmark_color=T.BG, border_color=T.TEXT_3, corner_radius=4, text="", width=22, checkbox_width=18, checkbox_height=18,
+            cb = ctk.CTkCheckBox(self._list, fg_color=T.TEXT, hover_color=T.PRIMARY_HOVER, checkmark_color=T.BG, border_color=T.TEXT_3, corner_radius=4, text="", width=22, checkbox_width=18, checkbox_height=18,
                                  variable=var, command=self._update_buttons)
             cb.grid(row=i, column=0, sticky="nw", padx=(6, 4), pady=4)
             cell = ctk.CTkFrame(self._list, fg_color="transparent")

@@ -9,7 +9,7 @@ import customtkinter as ctk
 
 import theme as T
 
-from sweep_dialog import apply_modal, center_over, release_modal
+from sweep_dialog import apply_modal, center_over, release_modal, style_dialog
 
 log = logging.getLogger("hermes_controller")
 
@@ -18,9 +18,9 @@ _ROW_BG = T.SURFACE
 _MUTED = T.TEXT_2
 _ERR = T.RED_TEXT
 _ACCENT = T.TEXT             # primary action = off-white (front-panel style)
-_ACCENT_HOVER = "#D9D9D6"
+_ACCENT_HOVER = T.PRIMARY_HOVER
 _NEUTRAL = T.RAISED
-_NEUTRAL_HOVER = "#303035"
+_NEUTRAL_HOVER = T.RAISED_HOVER
 
 
 def norm(name: str) -> str:
@@ -34,7 +34,7 @@ class WhitelistModal(ctk.CTkToplevel):
 
     def __init__(self, master, detector, on_saved: Callable[[], None] | None = None) -> None:
         super().__init__(master, fg_color=_BG)
-        self.after(50, lambda: T.dark_caption(self))
+        style_dialog(self)
         self._master = master
         self._detector = detector
         self._on_saved = on_saved
@@ -131,7 +131,7 @@ class WhitelistModal(ctk.CTkToplevel):
     def _add_row(self, name: str, checked: bool, running: bool) -> None:
         var = ctk.BooleanVar(value=checked)
         text = name if running else f"{name} (not running)"
-        cb = ctk.CTkCheckBox(self._list, fg_color=T.TEXT, hover_color="#D9D9D6", checkmark_color=T.BG, border_color=T.TEXT_3, corner_radius=4, text=text, variable=var, font=ctk.CTkFont(family=T.ui_family(), size=12),
+        cb = ctk.CTkCheckBox(self._list, fg_color=T.TEXT, hover_color=T.PRIMARY_HOVER, checkmark_color=T.BG, border_color=T.TEXT_3, corner_radius=4, text=text, variable=var, font=ctk.CTkFont(family=T.ui_family(), size=12),
                              checkbox_width=18, checkbox_height=18)
         cb.grid(row=len(self._rows), column=0, sticky="w", padx=8, pady=3)
         self._rows.append((name, var))

@@ -446,11 +446,13 @@ class EndpointManager:
         return procs
 
     def _launcher_cmd(self, root: psutil.Process) -> psutil.Process | None:
-        """cmd.exe /c "<strata_dir>\\run-*.bat" that launched `root`, else None."""
+        """cmd.exe /c "<strata_dir>\\run-*.bat" (or the configured launcher .bat) that launched `root`, else None."""
         sdir = str(self._cfg.get("strata_dir") or "").strip()
-        if not sdir:
+        bat = str(self._cfg.get("launcher_bat") or "").strip()
+        own_bat = os.path.normcase(os.path.abspath(bat)) if bat and os.path.isabs(bat) else None
+        if not sdir and own_bat is None:
             return None
-        prefix = os.path.normcase(os.path.abspath(sdir)) + os.sep
+        prefix = os.path.normcase(os.path.abspath(sdir)) + os.sep if sdir else None
         try:
             par = root.parent()
             if par is None or par.create_time() > root.create_time():
@@ -478,7 +480,7 @@ class EndpointManager:
                 full = os.path.normcase(os.path.abspath(cand.strip()))
             except (OSError, ValueError):
                 continue
-            if full.startswith(prefix):
+            if (prefix is not None and full.startswith(prefix)) or full == own_bat:
                 return par
         return None
 
@@ -608,6 +610,10 @@ class EndpointManager:
         sdir = str(self._cfg.get("strata_dir") or "")
         if not sdir or not os.path.isdir(sdir):
             return "error", f"strata_dir not found: {sdir or '(empty)'}"
+        # the directory the chosen run-*.bat starts the server from (its `cd /d`); v1.0 configs have none
+        cwd = str(self._cfg.get("launch_cwd") or "")
+        if not cwd or not os.path.isdir(cwd):
+            cwd = sdir
         log_path = self._new_log_path()
         env = dict(os.environ)
         env.update(PYTHONUTF8="1", PYTHONUNBUFFERED="1")
@@ -620,7 +626,7 @@ class EndpointManager:
             except OSError as e:
                 return "error", f"cannot create log {log_path}: {e}"
             try:
-                popen = subprocess.Popen(cmd, cwd=sdir, stdin=subprocess.DEVNULL, stdout=fh,
+                popen = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=fh,
                                          stderr=subprocess.STDOUT, creationflags=flags, env=env)
             except OSError as e:
                 return "error", f"failed to launch Strata: {e}"
@@ -773,6 +779,17 @@ class EndpointManager:
         # measure BEFORE /unload: the unload itself releases the model, so a post-unload RSS reads ~0.2 GB
         pre_unload_mb = self._rss_mb(self._tree(root)) if root is not None else 0.0
         avail_before = _avail_mb()
+        if root is None:
+            # No Strata process found for the port (listener PID hidden / not ours). Only talk to the port if
+            # /health says it IS Strata - never POST /unload at an unidentified service.
+            h = self._health()
+            if h is None or h.get("service") != "strata":
+                result["unload"] = "unavailable"
+                result["port_released"] = not self.is_running()
+                result["ok"] = result["port_released"]
+                if not result["ok"]:
+                    result["error"] = f"could not identify a Strata server on port {self._port}"
+                return
         result["unload"] = self._unload(force)
         if result["unload"] == "busy" and not force:
             result["error"] = "busy"

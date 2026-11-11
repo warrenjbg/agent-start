@@ -5,20 +5,27 @@ cd /d "%~dp0"
 set PY=.venv\Scripts\python.exe
 set ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe
 
-echo [1/4] icon
+if not exist "%PY%" (echo Project venv not found: %PY% & goto :fail)
+
+echo [1/5] version (version.py is the single source)
+set VER=
+for /f "usebackq delims=" %%v in (`"%PY%" tools\sync_version.py --print`) do set VER=%%v
+if not defined VER goto :fail
+echo       %VER%
+echo [2/5] icon
 "%PY%" tools\make_icon.py || goto :fail
-echo [2/4] default config
+echo [3/5] default config
 if not exist build mkdir build
 copy /y config.json build\config.default.json >nul || goto :fail
-echo [3/4] PyInstaller
+echo [4/5] PyInstaller
 "%PY%" -m PyInstaller --noconfirm --clean --log-level WARN HermesController.spec || goto :fail
-echo [4/4] installer
+echo [5/5] installer
 if not exist "%ISCC%" (echo Inno Setup not found at "%ISCC%" & goto :fail)
 "%ISCC%" /Q installer\HermesController.iss || goto :fail
 echo.
 echo Done:
 echo   dist\HermesController\HermesController.exe
-echo   dist\HermesController-Setup-1.0.0.exe
+echo   dist\HermesController-Setup-%VER%.exe
 exit /b 0
 :fail
 echo BUILD FAILED

@@ -1,12 +1,14 @@
 ; Inno Setup script — Hermes Controller (per-user install, no admin/UAC prompt)
+; AppVersion comes from version.iss, generated from version.py by tools\sync_version.py (build.bat runs it).
+#include "version.iss"
 #define AppName "Hermes Controller"
-#define AppVersion "1.0.0"
 #define AppExe "HermesController.exe"
 
 [Setup]
 AppId={{6E1B3C2A-4F7D-4C1E-9B8A-2D5F7A9C1E40}
 AppName={#AppName}
 AppVersion={#AppVersion}
+VersionInfoVersion={#AppVersion}
 AppPublisher=warrenjbg
 DefaultDirName={localappdata}\Programs\{#AppName}
 DefaultGroupName={#AppName}
