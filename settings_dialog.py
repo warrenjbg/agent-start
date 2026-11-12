@@ -20,12 +20,22 @@ from whitelist_modal import WhitelistModal
 log = logging.getLogger("agent_start")
 
 NO_LAUNCHERS = "No run-*.bat found"
+CHECK_LABEL = "Check for updates"
+CHECK_LABEL_SOURCE = "Check for updates (installed app only)"   # the daily switch's wording when run from source
+CHECK_TEXTS = {                                  # the manual check's result, next to the button
+    "checking": "Checking GitHub…",
+    "current": "Up to date · v{version}",
+    "newer": "Version {version} is available",
+    "error": "Could not reach GitHub",
+    "busy": "An update is being installed",
+}
 
 
 class SettingsDialog(ctk.CTkToplevel):
     WIDTH = 340
     HEIGHT = 362                                 # with one switch; each further switch adds SWITCH_STEP
     SWITCH_STEP = 34                             # switch 24 px + 10 px gap
+    UPDATE_ROW_H = 30                            # the "Check for updates" row under the title (24 px + 6 px gap)
     EXT_GLYPH = "\uE8A7"   # Segoe Fluent Icons "Open in new window"
 
     def __init__(self, master, cfg: dict, detector,
@@ -37,8 +47,15 @@ class SettingsDialog(ctk.CTkToplevel):
                  on_reopen_changed: Callable[[bool], None] | None = None,
                  update_version: str | None = None,
                  on_update: Callable[[], None] | None = None,
-                 switches: list[dict] | None = None) -> None:
-        """switches: more on/off settings under the reopen switch, applied at once (like it):
+                 switches: list[dict] | None = None,
+                 on_check_updates: Callable[[Callable[[str, str | None], bool]], str] | None = None,
+                 can_check_updates: bool = True) -> None:
+        """on_check_updates(on_result) adds the "Check for updates" row under the title (none when it is None): it
+        starts a check and returns "started" / "joined" (on_result(status, version) follows once, on the Tk thread,
+        status "current" | "newer" | "error"; it returns True when the dialog showed it) or "busy" / "unavailable".
+        can_check_updates=False (run from source): the button is greyed with the switch's "(installed app only)".
+
+        switches: more on/off settings under the reopen switch, applied at once (like it):
         {"key", "label", "value": bool, "on_change": callable(bool), "enabled": bool = True}.
 
         on_save(info, done) persists the launcher and calls done(error | None) on the Tk thread.
@@ -55,6 +72,9 @@ class SettingsDialog(ctk.CTkToplevel):
         self._on_whitelist_saved = on_whitelist_saved
         self._on_reopen_changed = on_reopen_changed
         self._on_update = on_update
+        self._on_check_updates = on_check_updates
+        self._can_check = bool(can_check_updates)
+        self._checking = False
         self._running = bool(running)
         self._closed = False
         self._saving = False
@@ -68,7 +88,9 @@ class SettingsDialog(ctk.CTkToplevel):
         self.title("Settings")
         self.resizable(False, False)
         self._extra_switches = [sw for sw in (switches or []) if isinstance(sw, dict) and sw.get("key")]
-        center_over(self, master, self.WIDTH, self.HEIGHT + self.SWITCH_STEP * len(self._extra_switches))
+        self.logical_height = (self.HEIGHT + self.SWITCH_STEP * len(self._extra_switches)
+                               + (self.UPDATE_ROW_H if on_check_updates is not None else 0))
+        center_over(self, master, self.WIDTH, self.logical_height)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<Escape>", lambda _e: self.close())
         self.grid_columnconfigure(0, weight=1)
@@ -82,17 +104,30 @@ class SettingsDialog(ctk.CTkToplevel):
         head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(head, text="Settings", anchor="w", height=20,
                      font=ctk.CTkFont(family=T.ui_family(), size=14, weight="bold")).grid(row=0, column=0, sticky="w")
+        self._head = head
+        self._update_link: ctk.CTkLabel | None = None
+        self._version_label: ctk.CTkLabel | None = None
         if update_version and on_update is not None:     # a newer release: the version label becomes the way in
-            self._update_link = ctk.CTkLabel(head, text=f"v{__version__} · Update to {update_version}", anchor="e",
-                                             height=20, font=ctk.CTkFont(family=T.ui_family(), size=12,
-                                                                         underline=True),
-                                             text_color=T.ACCENT, cursor="hand2")
-            self._update_link.grid(row=0, column=1, sticky="e")
-            self._update_link.bind("<Button-1>", lambda _e: self._update_clicked())
+            self._show_update_link(update_version)
         else:
-            self._update_link = None
-            ctk.CTkLabel(head, text=f"v{__version__}", anchor="e", height=20, font=mono,
-                         text_color=T.TEXT_3).grid(row=0, column=1, sticky="e")
+            self._version_label = ctk.CTkLabel(head, text=f"v{__version__}", anchor="e", height=20, font=mono,
+                                               text_color=T.TEXT_3)
+            self._version_label.grid(row=0, column=1, sticky="e")
+        # Check for updates: right under the version, the result next to the button (where the user clicked)
+        self._check_btn: ctk.CTkButton | None = None
+        self._check_msg: ctk.CTkLabel | None = None
+        if on_check_updates is not None:
+            crow = ctk.CTkFrame(head, fg_color="transparent")
+            crow.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+            crow.grid_columnconfigure(0, weight=1)
+            self._check_msg = ctk.CTkLabel(crow, text="", anchor="w", height=24, font=small, text_color=T.TEXT_2)
+            self._check_msg.grid(row=0, column=0, sticky="w")
+            self._check_btn = ctk.CTkButton(
+                crow, text=CHECK_LABEL if self._can_check else CHECK_LABEL_SOURCE, width=0, height=24,
+                corner_radius=6, font=small, fg_color=T.RAISED, hover_color=T.RAISED_HOVER, text_color=T.TEXT,
+                text_color_disabled=T.TEXT_3, command=self.check_updates,
+                state="normal" if self._can_check else "disabled")
+            self._check_btn.grid(row=0, column=1, sticky="e", padx=(8, 0))
 
         ctk.CTkLabel(self, text="Strata launcher", anchor="w", text_color=T.TEXT_2, font=small,
                      height=16).grid(row=1, column=0, sticky="ew", padx=12, pady=(8, 4))
@@ -349,6 +384,74 @@ class SettingsDialog(ctk.CTkToplevel):
             filetypes=[("Batch files", "*.bat *.cmd"), ("All files", "*.*")])
         if path and self._alive():
             self.choose(path)
+
+    # ------------------------------------------------------------------ updates
+    def _show_update_link(self, version: str) -> None:
+        """The version label becomes "vX · Update to Y" (click: close Settings, the app asks before installing)."""
+        if self._on_update is None:
+            return
+        text = f"v{__version__} · Update to {version}"
+        if self._update_link is not None:
+            self._update_link.configure(text=text)
+            return
+        if self._version_label is not None:
+            self._version_label.destroy()
+            self._version_label = None
+        self._update_link = ctk.CTkLabel(self._head, text=text, anchor="e", height=20,
+                                         font=ctk.CTkFont(family=T.ui_family(), size=12, underline=True),
+                                         text_color=T.ACCENT, cursor="hand2")
+        self._update_link.grid(row=0, column=1, sticky="e")
+        self._update_link.bind("<Button-1>", lambda _e: self._update_clicked())
+
+    def _show_check(self, key: str, version: str | None = None, color: str = T.TEXT_2) -> None:
+        if self._check_msg is not None:
+            self._check_msg.configure(text=CHECK_TEXTS[key].format(version=version or ""), text_color=color)
+
+    def check_updates(self) -> None:
+        """The button: one check at a time (greyed until its result is in)."""
+        cb = self._on_check_updates
+        if cb is None or not self._can_check or self._checking or self._check_btn is None or not self._alive():
+            return
+        self._checking = True
+        self._check_btn.configure(state="disabled")
+        self._show_check("checking")
+        try:
+            res = cb(self._check_result)
+        except Exception:  # noqa: BLE001
+            log.exception("update check could not start")
+            res = "error"
+        if res in ("started", "joined"):
+            return                               # _check_result() follows
+        self._checking = False
+        if res == "busy":
+            self._show_check("busy")             # stays greyed: the app exits for the installer
+        elif res == "unavailable":
+            self._can_check = False
+            self._check_btn.configure(text=CHECK_LABEL_SOURCE)
+            if self._check_msg is not None:
+                self._check_msg.configure(text="")
+        else:
+            self._check_btn.configure(state="normal")
+            self._show_check("error", color=T.RED_TEXT)
+
+    def _check_result(self, status: str, version: str | None) -> bool:
+        """The check's result (Tk thread). False when this dialog is gone: nothing was shown (the app may toast)."""
+        if not self._alive() or self._check_btn is None:
+            return False
+        self._checking = False
+        try:
+            self._check_btn.configure(state="normal")
+            if status == "current":
+                self._show_check("current", version)
+            elif status == "newer" and version:
+                self._show_check("newer", version, color=T.TEXT)
+                self._show_update_link(version)
+            else:
+                self._show_check("error", color=T.RED_TEXT)
+        except Exception:  # noqa: BLE001 - closed between the check and the configure
+            log.debug("update check result not shown", exc_info=True)
+            return False
+        return True
 
     # ------------------------------------------------------------------ protected apps (nested modal)
     def _update_clicked(self) -> None:

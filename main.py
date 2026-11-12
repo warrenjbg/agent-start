@@ -31,6 +31,7 @@ from metrics_store import MetricsStore
 from busy_dialog import BusyDialog
 from customtkinter.windows.widgets.core_widget_classes import DropdownMenu
 from settings_dialog import SettingsDialog
+from update_controller import UpdateController, UpdateHost
 from sweep_dialog import SweepDialog
 from version import __version__
 from vram_sampler import VramSampler
@@ -164,51 +165,6 @@ def format_preview(res: dict) -> str:
     if len(names) > len(shown):
         line2 += f" +{len(names) - len(shown)} more"
     return f"{line1}\n{line2}" if line2 else line1
-
-
-def _check_update_worker(current: str, post: Callable, done: Callable) -> None:
-    """Worker: one GitHub check. Posts (status, UpdateInfo as dict or None); status 'newer' | 'current' | 'error'."""
-    from dataclasses import asdict
-    status, info = "error", None
-    try:
-        import updater
-        status, info = updater.check(current)
-    except Exception:  # noqa: BLE001
-        log.debug("update check failed", exc_info=True)
-    post(done, status, asdict(info) if info is not None else None)
-
-
-def _download_update_worker(current: str, post: Callable, progress: Callable, done: Callable, stop_evt) -> None:
-    """Worker: re-check GitHub (the URL and digest used are this minute's, not a cached copy), download, verify."""
-    from dataclasses import asdict
-    try:
-        import updater
-        status, info = updater.check(current)
-        if status != "newer" or info is None:
-            post(done, None, None, "GitHub did not confirm the update" if status == "error" else "no newer version")
-            return
-        last = [0.0]
-
-        def prog(n: int, total: int) -> None:
-            now = time.monotonic()
-            if now - last[0] > 0.25 or n >= total:
-                last[0] = now
-                post(progress, n, total)
-
-        path = updater.download(info, updater.default_download_dir(), progress=prog, stop_evt=stop_evt)
-        post(done, path, asdict(info), None)
-    except Exception as exc:  # noqa: BLE001
-        post(done, None, None, str(exc) or exc.__class__.__name__)
-
-
-def _cleanup_updates_worker(current: str) -> None:
-    try:
-        import updater
-        n = updater.cleanup_old(updater.default_download_dir(), current)
-        if n:
-            log.info("removed %d old update file(s)", n)
-    except Exception:  # noqa: BLE001
-        log.debug("update cleanup failed", exc_info=True)
 
 
 def _toast_worker(title: str, msg: str, buttons: list[tuple[str, str]] | None = None) -> None:
@@ -413,7 +369,6 @@ class AgentStartApp(ctk.CTk):
         self.tray = None                         # tray.TrayIcon once started (None: X quits as before)
         self._extras = bool(extras)
         self._tray_pref = saved.get("tray_enabled", True) is not False          # Settings switches (state.json)
-        self._update_pref = saved.get("update_check", True) is not False
         ga = saved.get("game_action")
         if ga not in GAME_ACTIONS:               # v1.8.0 had an on/off switch ("game_alert")
             ga = "none" if saved.get("game_alert") is False else "off"
@@ -421,8 +376,6 @@ class AgentStartApp(ctk.CTk):
         self._game_pref = ga != "none"
         self._no_tray = not extras or not self._tray_pref
         self._no_finder = not extras
-        # the updater replaces the installed app: only offered by the packaged build, not when run from source
-        self._no_update_check = not extras or not config_store.FROZEN or not self._update_pref
         self.games = None                        # game_watch.GameWatcher (extras only)
         self._games_armed = False
         self._game_alert: tuple | None = None    # (monotonic, start token, title) of the last "Ask me" game toast
@@ -435,14 +388,23 @@ class AgentStartApp(ctk.CTk):
         self._started_hidden = False             # launched with --tray (Start with Windows)
         self._tray_hint_shown = bool(saved.get("tray_hint_shown"))
         self._tray_last: tuple | None = None
-        self._update = None                      # updater.UpdateInfo of a newer release
-        self._updating = False
-        self._update_checking = False
-        self._update_next_at = 0.0               # monotonic: no GitHub check before this
-        _uc = saved.get("update_checked_at")
-        self._update_checked_at = float(_uc) if isinstance(_uc, (int, float)) else None
         self._box_open = False                   # a native message box is up (tray input must not act under it)
-        self._installing = False                 # the update installer runs; we are exiting
+        # The update flow (daily + manual check, offer, download, install) lives in its own controller.
+        # The updater replaces the installed app: only offered by the packaged build, not when run from source.
+        self.updates = UpdateController(
+            UpdateHost(post=self.post, run_worker=self._run_worker, call_later=self.after,
+                       set_note=self._set_note, request_preview=self._request_preview,
+                       save_state_later=self._save_state_later, save_state=config_store.save_state,
+                       load_state=config_store.load_state,
+                       ask=lambda msg: self._ask(messagebox.askyesno, msg),
+                       toast=lambda title, msg: self._run_worker("hc-toast", _toast_worker, title, msg),
+                       engine_state=lambda: self.state_name, dialog_open=self._dialog_open,
+                       box_open=lambda: self._box_open, release_singleton=_release_singleton,
+                       finish_exit=self._finish_exit,
+                       available=lambda: self._extras and config_store.FROZEN,
+                       frozen=lambda: config_store.FROZEN, stop_evt=self._stop_evt),
+            __version__, daily=saved.get("update_check", True) is not False,
+            checked_at=saved.get("update_checked_at"))
         self._found_strata = None                # strata_finder.Found offered on first start
         self._finder_ran = False
         self._summary_text = ""
@@ -996,9 +958,9 @@ class AgentStartApp(ctk.CTk):
         if self.state_name == IDLE and self._detail_link and "Strata found" == self._summary_text:
             self.open_settings(found=self._found_strata)
             return
-        if self.state_name == IDLE and self._detail_link and self._update is not None and \
+        if self.state_name == IDLE and self._detail_link and self.updates.offer is not None and \
                 self._detail_text.startswith("Update to"):
-            self.install_update()
+            self.updates.install()
             return
         if self.state_name == IDLE and self._reopen_offer and self._detail_link:
             self._click_reopen_offer()
@@ -1622,10 +1584,7 @@ class AgentStartApp(ctk.CTk):
         self._start_game_watch()
         if self._extras and config_store.FROZEN:
             self._run_worker("hc-autostart", _refresh_autostart_worker, sys.executable)
-        self._report_update_result()
-        if not self._no_update_check:
-            self._run_worker("hc-update-clean", _cleanup_updates_worker, __version__)
-        self._maybe_check_update()
+        self.updates.first_tick()
         self._maybe_find_strata()
         self._refresh_launchers()
         self._request_preview()
@@ -1643,7 +1602,7 @@ class AgentStartApp(ctk.CTk):
             self._deliver_queued_game()          # a game that started while a dialog / box was open
             if self.tray is None and not self._no_tray and time.monotonic() < self._tray_retry_until:
                 self._start_tray()               # the icon failed at start: try again (every tick, ~5 s)
-            self._maybe_check_update()
+            self.updates.maybe_check()
             if self.state_name == ACTIVE and not self._detail_forced():
                 self._show_serving()             # uptime / last reply speed
             # Collect garbage HERE, on the Tk thread: closed dialogs leave Tk objects (CTkFont, images) in reference
@@ -1688,11 +1647,10 @@ class AgentStartApp(ctk.CTk):
         elif self._reopen_offer and not self._reopening:
             head = format_preview(res).partition("\n")[0]
             self._set_status(head if self._fits_summary(head) else "", self._offer_text(), color=T.TEXT_2, link=True)
-        elif self._update is not None and not self._updating:
+        elif (ver := self.updates.offer_version()) is not None:
             head = format_preview(res).partition("\n")[0]
             self._set_status(head if self._fits_summary(head) else "",
-                             f"Update to {self._update.version} available · click to install", color=T.TEXT_2,
-                             link=True)
+                             f"Update to {ver} available · click to install", color=T.TEXT_2, link=True)
         else:
             self._set_preview(format_preview(res))
 
@@ -1723,7 +1681,7 @@ class AgentStartApp(ctk.CTk):
             self.cancel_start()
 
     def turn_on(self) -> None:
-        if self._updating:
+        if self.updates.updating:
             self._set_note("Installing an update · try again after the restart")
             return
         if not self.cfg.get("launch_cmd") and self._pending_launcher is None:
@@ -2249,8 +2207,9 @@ class AgentStartApp(ctk.CTk):
             current_bat=current,
             running=self.state_name == ACTIVE, on_whitelist_saved=self._request_preview,
             reopen_after=self._reopen_pref, on_reopen_changed=self.set_reopen_pref,
-            update_version=self._update.version if self._update is not None and not self._updating else None,
-            on_update=self.install_update, switches=self._settings_switches())
+            update_version=self.updates.offer_version(),
+            on_update=self.updates.install, switches=self._settings_switches(),
+            on_check_updates=self.updates.check_now, can_check_updates=self.updates.available())
 
     # ------------------------------------------------------------------ system tray
     def _start_tray(self) -> None:
@@ -2333,115 +2292,7 @@ class AgentStartApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             log.debug("tray sync failed", exc_info=True)
 
-    # ------------------------------------------------------------------ updates (GitHub releases)
-    def _maybe_check_update(self) -> None:
-        """Once a day (and an hour after a failed check): ask GitHub for the latest release, on a worker. The time
-        is kept in memory too, so an unwritable state.json cannot turn this into a request every tick."""
-        if self._no_update_check or self._updating or self._update_checking:
-            return
-        now_m = time.monotonic()
-        if now_m < self._update_next_at:
-            return
-        import updater
-        last = self._update_checked_at
-        if not updater.due(last, time.time()):
-            self._update_next_at = now_m + 600.0          # look again in 10 min (cheap: no disk, no network)
-            return
-        self._update_checking = True
-        self._update_next_at = now_m + updater.RETRY_AFTER_ERROR_S   # until the result says otherwise
-        self._run_worker("hc-update-check", _check_update_worker, __version__, self.post, self._on_update_checked)
-
-    def _on_update_checked(self, status: str, info_dict: dict | None) -> None:
-        self._update_checking = False
-        if self._no_update_check:                # switched off while the check ran
-            return
-        import updater
-        if status == "error":                    # offline / rate limited: keep what we knew, retry in an hour
-            log.info("update check failed; retrying in %d min", updater.RETRY_AFTER_ERROR_S // 60)
-            return
-        self._update_checked_at = time.time()
-        self._update_next_at = time.monotonic() + updater.CHECK_INTERVAL_S
-        new = updater.UpdateInfo(**info_dict) if info_dict else None
-        known = self._update.version if self._update is not None else None
-        self._update = new
-        self._save_state_later("update_checked_at", self._update_checked_at)
-        if new is not None and new.version != known:
-            log.info("update available: %s", new.version)
-            self._run_worker("hc-toast", _toast_worker, APP_TITLE,
-                             f"Version {new.version} is available. Install it from Settings, or click the update "
-                             f"line while Strata is off.")
-        self._request_preview()
-
-    def install_update(self) -> None:
-        """Settings / the idle line: confirm, then re-check GitHub (fresh URL + digest), download, verify, run the
-        installer and exit. Strata keeps running."""
-        info = self._update
-        if info is None or self._updating or self._box_open:
-            return
-        if self.state_name in (STARTING, STOPPING):
-            self._set_note("Update waits until Strata has started or stopped")
-            return
-        msg = (f"Install Agent Start {info.version}?\n\nIt downloads the installer from GitHub "
-               f"(about {info.size / 1e6:.0f} MB), checks it, closes this app, upgrades it and starts it again.")
-        if self.state_name == ACTIVE:
-            msg += "\n\nStrata keeps running; the new version picks it up."
-        if not self._ask(messagebox.askyesno, msg):
-            return
-        if self.state_name in (STARTING, STOPPING) or self._updating:
-            return
-        self._updating = True
-        self._set_note(f"Downloading update {info.version}…")
-        self._run_worker("hc-update-download", _download_update_worker, __version__, self.post,
-                         self._update_progress, self._update_downloaded, self._stop_evt)
-
-    def _update_progress(self, done: int, total: int) -> None:
-        if self._updating and total:
-            self._set_note(f"Downloading update · {100 * done / total:.0f}%")
-
-    def _update_downloaded(self, path: str | None, info_dict: dict | None, err: str | None) -> None:
-        if err or not path or not info_dict:
-            self._updating = False
-            log.warning("update download failed: %s", err)
-            self._set_note(f"Update failed\n{_short(err or 'download failed', 40)}")
-            return
-        # never exit mid-start / mid-stop / with a dialog waiting for an answer: try again in a second
-        if self.state_name in (STARTING, STOPPING) or self._dialog_open() or self._box_open:
-            self.after(1000, lambda: self._update_downloaded(path, info_dict, err))
-            return
-        import updater
-        info = updater.UpdateInfo(**info_dict)
-        log_path = os.path.join(updater.default_download_dir(), "install.log")
-        install_dir = os.path.dirname(sys.executable) if config_store.FROZEN else None
-        config_store.save_state({"update_pending": {"version": info.version, "from": __version__,
-                                                    "at": time.time(), "log": log_path}})
-        _release_singleton()                     # the installer's AppMutex check must not see us; it waits for our pid
-        try:
-            updater.launch_installer(path, info.sha256, install_dir=install_dir, log_path=log_path,
-                                     wait_pid=os.getpid())
-        except Exception as exc:  # noqa: BLE001
-            self._updating = False
-            config_store.save_state({"update_pending": None})
-            log.exception("could not start the installer")
-            self._set_note(f"Update failed\n{_short(str(exc), 40)}")
-            return
-        self._installing = True
-        log.info("update installer started (%s); exiting so it can replace the app", path)
-        self._set_note("Installing update · Agent Start restarts in a moment")
-        self.after(400, self._finish_exit)       # Strata (if running) keeps running; the installer waits for us
-
-    def _report_update_result(self) -> None:
-        """First tick after a start: did the update the previous run started go in?"""
-        pend = config_store.load_state().get("update_pending")
-        if not isinstance(pend, dict):
-            return
-        config_store.save_state({"update_pending": None})
-        if pend.get("version") == __version__:
-            log.info("updated from %s to %s", pend.get("from"), __version__)
-            self._set_note(f"Updated to {__version__}")
-        elif time.time() - float(pend.get("at") or 0) < 7 * 86400:
-            log.warning("the update to %s did not install (log: %s)", pend.get("version"), pend.get("log"))
-            self._set_note(f"Update to {pend.get('version')} did not install\nDetails: updates\\install.log")
-
+    # ------------------------------------------------------------------ native message boxes
     def _ask(self, fn, msg: str):
         """A native message box. While one is open the tray must not change state under it."""
         self._box_open = True
@@ -2493,7 +2344,7 @@ class AgentStartApp(ctk.CTk):
         self._stop_for_game(alert[2])
 
     def _game_blocked(self) -> bool:
-        return self._box_open or self._updating or self._dialog_open()
+        return self._box_open or self.updates.updating or self._dialog_open()
 
     def _stop_for_game(self, title: str) -> None:
         """Safe Turn off because a game started: the current reply (or an agent's tool call) finishes first, no
@@ -2604,19 +2455,6 @@ class AgentStartApp(ctk.CTk):
         log.info("tray icon: %s", "on" if on else "off")
         return True
 
-    def set_update_pref(self, on: bool) -> bool:
-        self._update_pref = bool(on)
-        self._save_state_later("update_check", self._update_pref)
-        self._no_update_check = not self._extras or not config_store.FROZEN or not on
-        if not on:
-            self._update = None
-            self._request_preview()
-        else:
-            self._update_next_at = 0.0
-            self._maybe_check_update()
-        log.info("daily update check: %s", "on" if on else "off")
-        return True
-
     def set_game_action(self, action: str) -> bool:
         if action not in GAME_ACTIONS:
             action = {v: k for k, v in GAME_ACTION_LABELS.items()}.get(action, "off")
@@ -2664,8 +2502,8 @@ class AgentStartApp(ctk.CTk):
              "value": GAME_ACTION_LABELS[self._game_action], "on_change": self.set_game_action,
              "enabled": self._extras},
             {"key": "updates", "label": "Check for updates daily" if frozen
-             else "Check for updates daily (installed app only)", "value": self._update_pref,
-             "on_change": self.set_update_pref, "enabled": frozen and self._extras},
+             else "Check for updates daily (installed app only)", "value": self.updates.daily,
+             "on_change": self.updates.set_daily, "enabled": frozen and self._extras},
         ]
 
     def set_reopen_pref(self, on: bool) -> None:
@@ -2749,7 +2587,7 @@ class AgentStartApp(ctk.CTk):
 
     def on_close_request(self) -> None:
         """Window X: hide to the tray (Quit is in the tray menu). Without a tray icon: quit as before."""
-        if self.tray is not None and getattr(self.tray, "is_running", False) and not self._updating:
+        if self.tray is not None and getattr(self.tray, "is_running", False) and not self.updates.updating:
             self.hide_to_tray()
             return
         self.quit_app()
@@ -2782,7 +2620,7 @@ class AgentStartApp(ctk.CTk):
     def quit_app(self) -> None:
         """Quit (tray menu, or X without a tray): asks about a running Strata as before."""
         self.show_window()
-        if self._box_open or self._installing:   # a question is already up / the installer is about to replace us
+        if self._box_open or self.updates.installing:   # a question is already up / the installer is about to replace us
             return
         if self._dialog_open():
             try:
@@ -2954,6 +2792,7 @@ def _selftest() -> int:
         import toasts  # noqa: F401
         import strata_finder  # noqa: F401
         import tray
+        import update_controller  # noqa: F401
         import updater  # noqa: F401
         import win32gui  # noqa: F401
         import detector  # noqa: F401

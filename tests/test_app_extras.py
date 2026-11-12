@@ -314,30 +314,84 @@ def test_update_offer() -> None:
     asked = []
     real_ask = main.messagebox.askyesno
     try:
-        check(app._no_update_check, "not offered when run from source / with test stubs")
-        app._no_update_check = False
+        check(app.updates.no_check, "not offered when run from source / with test stubs")
+        app.updates.no_check = False
         # an error keeps nothing, retries in an hour, does not count as a check
         result["v"] = ("error", None)
-        app._maybe_check_update()
-        check(pump_until(app, lambda: calls["check"] == 1 and not app._update_checking, 3), "check ran (error)")
-        check(app._update is None and app._update_checked_at is None, "error: not recorded as checked")
-        check(app._update_next_at - time.monotonic() > updater.RETRY_AFTER_ERROR_S - 60, "error: retry in about an hour")
-        app._maybe_check_update()
+        app.updates.maybe_check()
+        check(pump_until(app, lambda: calls["check"] == 1 and not app.updates.checking, 3), "check ran (error)")
+        check(app.updates.offer is None and app.updates.checked_at is None, "error: not recorded as checked")
+        check(app.updates.next_at - time.monotonic() > updater.RETRY_AFTER_ERROR_S - 60, "error: retry in about an hour")
+        app.updates.maybe_check()
         pump(app, 0.2)
         check(calls["check"] == 1, "no retry before that (in memory, not state.json)")
-        app._update_next_at = 0.0
+        app.updates.next_at = 0.0
         result["v"] = ("newer", _info())
-        app._maybe_check_update()
-        check(pump_until(app, lambda: app._update is not None, 3) and calls["check"] == 2, "daily check found 9.9.0")
+        app.updates.maybe_check()
+        check(pump_until(app, lambda: app.updates.offer is not None, 3) and calls["check"] == 2, "daily check found 9.9.0")
         check(pump_until(app, lambda: "Update to 9.9.0 available" in status(app), 6) and app._detail_link,
               f"idle line offers the update ({status(app)!r})")
         U.shot(app, "extras_update_offer")
         check(pump_until(app, lambda: isinstance(config_store.load_state().get("update_checked_at"), float), 3),
               "check time remembered")
-        app._update_next_at = 0.0
-        app._maybe_check_update()
+        app.updates.next_at = 0.0
+        app.updates.maybe_check()
         pump(app, 0.3)
         check(calls["check"] == 2, "not checked again the same day")
+        # Settings > Check for updates (manual): from source it is greyed with the switch's wording
+        import settings_dialog as SD
+        app.open_settings()
+        pump(app, 0.4)
+        d = app.dialog
+        check(d._check_btn is not None and str(d._check_btn.cget("state")) == "disabled"
+              and d._check_btn.cget("text") == SD.CHECK_LABEL_SOURCE == "Check for updates (installed app only)",
+              "from source: the Check for updates button is greyed, '(installed app only)'")
+        n0 = calls["check"]
+        d.check_updates()
+        pump(app, 0.2)
+        check(calls["check"] == n0, "from source: clicking it sends nothing")
+        d.close()
+        pump(app, 0.2)
+        # installed app: it checks now, whatever the daily schedule says, and answers where the user clicked
+        real_frozen, real_extras = config_store.FROZEN, app._extras
+        config_store.FROZEN, app._extras = True, True
+        try:
+            app.open_settings()
+            pump(app, 0.4)
+            d = app.dialog
+            check(str(d._check_btn.cget("state")) == "normal" and d._check_btn.cget("text") == SD.CHECK_LABEL,
+                  "installed: the button is enabled")
+            before_at = app.updates.checked_at
+            result["v"] = ("current", None)
+            n0 = calls["check"]
+            d.check_updates()
+            check(str(d._check_btn.cget("state")) == "disabled" and "Checking" in d._check_msg.cget("text"),
+                  f"while checking: greyed, says so ({d._check_msg.cget('text')!r})")
+            d.check_updates()
+            d.check_updates()
+            check(pump_until(app, lambda: str(d._check_btn.cget("state")) == "normal", 3) and calls["check"] == n0 + 1,
+                  "three clicks = one request (checked minutes after the daily check: the interval is ignored)")
+            check(d._check_msg.cget("text") == f"Up to date · v{main.__version__}",
+                  f"up to date, with the current version ({d._check_msg.cget('text')!r})")
+            check(app.updates.checked_at is not None and app.updates.checked_at != before_at,
+                  "a successful manual check records the check time")
+            result["v"] = ("error", None)
+            at = app.updates.checked_at
+            d.check_updates()
+            check(pump_until(app, lambda: "Could not reach GitHub" in d._check_msg.cget("text"), 3),
+                  f"offline: says so ({d._check_msg.cget('text')!r})")
+            check(app.updates.checked_at == at, "a failed manual check is not recorded as a check")
+            result["v"] = ("newer", _info())
+            d.check_updates()
+            check(pump_until(app, lambda: "9.9.0" in d._check_msg.cget("text"), 3)
+                  and getattr(d, "_update_link", None) is not None and "Update to 9.9.0" in d._update_link.cget("text"),
+                  f"update found: named next to the button and offered as the link ({d._check_msg.cget('text')!r})")
+            check(not calls["download"] and not calls["launch"], "checking never downloads or installs")
+            U.shot(d, "extras_settings_check")
+            d.close()
+            pump(app, 0.2)
+        finally:
+            config_store.FROZEN, app._extras = real_frozen, real_extras
         # Settings shows the update as a link
         app.open_settings()
         pump(app, 0.4)
@@ -353,9 +407,10 @@ def test_update_offer() -> None:
         # the idle line
         main.messagebox.askyesno = lambda *a, **k: asked.append(a) or True
         pump_until(app, lambda: "Update to" in status(app), 6)
+        n_checks = calls["check"]
         app.preview._label.event_generate("<Button-1>")
         check(pump_until(app, lambda: calls["launch"], 5), f"Yes: re-checked, downloaded, installer started ({calls})")
-        check(calls["check"] == 3, "GitHub re-checked at install time (fresh URL + digest)")
+        check(calls["check"] == n_checks + 1, "GitHub re-checked at install time (fresh URL + digest)")
         if calls["launch"]:
             path, sha, kw = calls["launch"][0]
             check(path.endswith("AgentStart-Setup-9.9.0.exe") and sha == "ab" * 32, "the verified installer + its sha256")
@@ -370,7 +425,7 @@ def test_update_offer() -> None:
     # next start: the update did not go in
     app, det, ep = U.new_app()
     try:
-        app._report_update_result()
+        app.updates.report_result()
         check("did not install" in status(app), f"failed update reported ({status(app)!r})")
         check(config_store.load_state().get("update_pending") is None, "reported once")
     finally:
@@ -378,7 +433,7 @@ def test_update_offer() -> None:
     config_store.save_state({"update_pending": {"version": main.__version__, "from": "1.0.0", "at": time.time()}})
     app, det, ep = U.new_app()
     try:
-        app._report_update_result()
+        app.updates.report_result()
         check(f"Updated to {main.__version__}" in status(app), f"successful update reported ({status(app)!r})")
     finally:
         close(app)
@@ -390,14 +445,14 @@ def test_update_offer() -> None:
     app, det, ep = U.new_app()
     try:
         main.messagebox.askyesno = lambda *a, **k: True
-        app._update = _info()
-        app.install_update()
-        check(pump_until(app, lambda: "Update failed" in status(app), 4) and not app._updating and not app._destroyed,
+        app.updates.offer = _info()
+        app.updates.install()
+        check(pump_until(app, lambda: "Update failed" in status(app), 4) and not app.updates.updating and not app._destroyed,
               f"failed download: note, still running, retry possible ({status(app)!r})")
         updater.download = fake_download
         n = len(calls["launch"])
-        app.install_update()
-        pump_until(app, lambda: app._updating, 1)
+        app.updates.install()
+        pump_until(app, lambda: app.updates.updating, 1)
         app.state_name = main.STARTING         # Turn on raced the download: the exit must wait
         pump(app, 1.5)
         check(len(calls["launch"]) == n and not app._destroyed, "installer not started while STARTING")
@@ -730,11 +785,11 @@ def test_settings_switches() -> None:
         check(app.set_autostart_pref(True) is False and "Start with Windows failed" in status(app),
               f"a failed registry write is refused + shown ({status(app)!r})")
         upd = []
-        app._maybe_check_update = lambda: upd.append(1)
-        app.set_update_pref(False)
-        check(app._no_update_check and app._update is None, "updates off: no checks")
-        app.set_update_pref(True)
-        check(not app._no_update_check and upd, "updates on (installed): checks again")
+        app.updates.maybe_check = lambda: upd.append(1)
+        app.updates.set_daily(False)
+        check(app.updates.no_check and app.updates.offer is None, "updates off: no checks")
+        app.updates.set_daily(True)
+        check(not app.updates.no_check and upd, "updates on (installed): checks again")
     finally:
         config_store.FROZEN = real_frozen
         autostart.enable, autostart.disable, autostart.is_enabled = saved_auto
