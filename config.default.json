@@ -16,6 +16,9 @@
   "mem_watch_sustain_s": 15,
   "mem_watch_floor_baseline_pct": 50,
   "mem_watch_floor_total_pct": 6,
+  "mem_watch_evict_pct": 50,
+  "mem_watch_evict_sustain_s": 6,
+  "mem_watch_evict_app_mb": 512,
   "game_dirs": [
     "steamapps",
     "Epic Games",

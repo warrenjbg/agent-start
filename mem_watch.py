@@ -1,8 +1,13 @@
 """Memory-pressure watcher for Agent Start (observe only: never kills, closes, signals or suspends anything).
 
-While Strata is serving, a NEW app (started after Strata became ready) that holds a lot of RAM while the PC's available
-memory has fallen well below what it was when Strata became ready is competing with Strata for memory. The app
-reports it once, so the UI can offer (or do) the same safe turn-off it uses for games.
+While Strata is serving, two things are reported, each once per app, so the UI can offer (or do) the same safe
+turn-off it uses for games:
+  * EVICTED (the firm rule): Strata's own memory in RAM fell below half of its peak, the memory it lost did not
+    come back as available memory (so it was taken, not given up by an unload), and a new app is running. Measured
+    on a 64 GB PC: a game pushed a 49 GB model into the pagefile within ~10 s of starting, long before the game
+    itself looked large. This fires after the fact - it rescues the PC and the app, not the loaded model.
+  * PRESSURE: a NEW app (started after Strata became ready) holds a lot of RAM while the PC's available memory has
+    fallen well below what it was when Strata became ready.
 
 It runs inside the game watcher's 3-second pass (game_watch.GameWatcher(co_scan=MemWatcher(...))): the watcher takes
 ONE process snapshot per tick and both checks read it. The memory check adds one NtQuerySystemInformation call
@@ -52,19 +57,28 @@ PROVIDER_REFRESH_S = 30.0        # how often the protected-pids provider (Strata
 
 # ---------------------------------------------------------------------------------------------------- config
 
-# config.json keys (missing key = default; bad value = default; numbers are clamped). PROVISIONAL defaults: to be
-# calibrated by a measurement on a real 64 GB PC with Strata serving.
+# config.json keys (missing key = default; bad value = default; numbers are clamped). The evict_* defaults come
+# from two 5-7 minute measurements on a 64 GB PC serving a 49 GB model (idle, then a game starting); the pressure
+# defaults are estimates - on that PC the pressure rule did not fire, the eviction rule would have at ~+13 s.
 CONFIG_DEFAULTS: dict[str, float] = {
     "mem_watch_app_mb": 4096,                 # the new app's tree must hold at least this much RAM
     "mem_watch_sustain_s": 15,                # ... and both conditions must hold this long without a break
     "mem_watch_floor_baseline_pct": 50,       # floor = this % of the available RAM measured when Strata was ready
     "mem_watch_floor_total_pct": 6,           # ... but never above this % of physical RAM (64 GB -> ~3.9 GB)
+    "mem_watch_evict_pct": 50,                # evicted = Strata's RAM below this % of its peak since it was ready
+    "mem_watch_evict_sustain_s": 6,           # ... for this long (3 passes), with the lost memory not available
+    "mem_watch_evict_app_mb": 512,            # ... and a new app at least this large to name as the cause
 }
+EVICT_MIN_PEAK_MB = 1024.0       # an engine that never held this much is not judged (nothing worth rescuing)
+EVICT_RETURNED_SHARE = 0.5       # an unload gives its memory back: >= this share of the loss shows up as available
 _LIMITS: dict[str, tuple[float, float]] = {
     "mem_watch_app_mb": (1024, 1024 * 1024),  # >= 1 GB: build_apps only lists windowless trees above 1000 MB
     "mem_watch_sustain_s": (3, 3600),
     "mem_watch_floor_baseline_pct": (1, 100),
     "mem_watch_floor_total_pct": (0.5, 50),
+    "mem_watch_evict_pct": (5, 95),
+    "mem_watch_evict_sustain_s": (3, 3600),
+    "mem_watch_evict_app_mb": (64, 1024 * 1024),
 }
 
 
@@ -86,13 +100,19 @@ class MemConfig:
     sustain_s: float = float(CONFIG_DEFAULTS["mem_watch_sustain_s"])
     floor_baseline_pct: float = float(CONFIG_DEFAULTS["mem_watch_floor_baseline_pct"])
     floor_total_pct: float = float(CONFIG_DEFAULTS["mem_watch_floor_total_pct"])
+    evict_pct: float = float(CONFIG_DEFAULTS["mem_watch_evict_pct"])
+    evict_sustain_s: float = float(CONFIG_DEFAULTS["mem_watch_evict_sustain_s"])
+    evict_app_mb: float = float(CONFIG_DEFAULTS["mem_watch_evict_app_mb"])
 
     @classmethod
     def from_config(cls, cfg: Mapping | None) -> MemConfig:
         """Never raises: a hand-edited or old config.json falls back to the defaults key by key."""
         return cls(app_mb=_num(cfg, "mem_watch_app_mb"), sustain_s=_num(cfg, "mem_watch_sustain_s"),
                    floor_baseline_pct=_num(cfg, "mem_watch_floor_baseline_pct"),
-                   floor_total_pct=_num(cfg, "mem_watch_floor_total_pct"))
+                   floor_total_pct=_num(cfg, "mem_watch_floor_total_pct"),
+                   evict_pct=_num(cfg, "mem_watch_evict_pct"),
+                   evict_sustain_s=_num(cfg, "mem_watch_evict_sustain_s"),
+                   evict_app_mb=_num(cfg, "mem_watch_evict_app_mb"))
 
 
 def floor_mb(baseline_avail_mb: float, total_mb: float, mc: MemConfig) -> float:
@@ -141,8 +161,16 @@ class MemReport:
     baseline_avail_mb: float
     app_threshold_mb: float
     sustained_s: float
+    reason: str = "pressure"     # "pressure" | "evicted"
+    strata_mb: float | None = None       # evicted: Strata's RAM now ...
+    strata_peak_mb: float | None = None  # ... and its peak since it was ready
 
     def why(self) -> str:
+        if self.reason == "evicted":
+            return (f"Strata's memory in RAM fell to {self.strata_mb or 0:.0f} MB "
+                    f"(peak {self.strata_peak_mb or 0:.0f}) "
+                    f"with {self.avail_mb:.0f} MB available for {self.sustained_s:.0f} s; largest new app: "
+                    f"{self.title} ({self.ram_mb:.0f} MB)")
         return (f"{self.title} uses {self.ram_mb:.0f} MB (>= {self.app_threshold_mb:.0f}) and available RAM is "
                 f"{self.avail_eff_mb:.0f} MB (< floor {self.floor_mb:.0f}; {self.avail_mb:.0f} MB raw, "
                 f"{self.baseline_avail_mb:.0f} MB when Strata was ready) for {self.sustained_s:.0f} s")
@@ -154,6 +182,10 @@ class MemState:
     arm_time: float
     baseline_avail_mb: float | None = None
     baseline_strata_mb: float | None = None
+    peak_strata_mb: float | None = None      # the most RAM Strata held since the baseline
+    evict_since: float | None = None         # the eviction condition held since
+    evict_last: float | None = None
+    evict_reported: bool = False             # the eviction is reported once per arm (one cause is named)
     since: dict[AppKey, float] = field(default_factory=dict)       # both conditions held since
     last_seen: dict[AppKey, float] = field(default_factory=dict)
     reported: set[AppKey] = field(default_factory=set)              # apps reported (or claimed as games) this arm
@@ -207,20 +239,26 @@ def decide(state: MemState, apps: Iterable[AppView], now: float, avail_mb: float
     and it is not already reported / claimed as a game this arm. `apps` must already exclude protected apps
     (group_apps does that with the detector's rules). The first call after arm (baseline unknown) only records
     the baseline: available RAM and Strata's RAM now.
+
+    Independently, the largest such new app (>= cfg.evict_app_mb) is reported with reason "evicted" when, for
+    cfg.evict_sustain_s, Strata's RAM is below cfg.evict_pct of its peak AND less than half of the memory it lost
+    is available (an unload returns its memory; an eviction does not).
     """
     st = state.copy()
     apps = list(apps)
     if st.baseline_avail_mb is None:
         st.baseline_avail_mb = float(avail_mb)
         st.baseline_strata_mb = strata_mb
+        st.peak_strata_mb = strata_mb
         return [], st
     absorb_reported(st, apps, game_claimed)
+    evicted_reports = _decide_evicted(st, apps, now, float(avail_mb), cfg, strata_mb, max_gap_s)
     eff = float(avail_mb)
     if strata_mb is not None and st.baseline_strata_mb is not None:
         eff += max(0.0, float(strata_mb) - float(st.baseline_strata_mb))
     flo = floor_mb(st.baseline_avail_mb, total_mb, cfg)
     pressure = eff < flo
-    reports: list[MemReport] = []
+    reports: list[MemReport] = list(evicted_reports)
     present: set[AppKey] = set()
     for a in sorted(apps, key=lambda x: (x.create_time, x.pid)):
         present.add(a.key)
@@ -251,6 +289,44 @@ def decide(state: MemState, apps: Iterable[AppView], now: float, avail_mb: float
             st.since.pop(k, None)
             st.last_seen.pop(k, None)
     return reports, st
+
+
+def _decide_evicted(st: MemState, apps: list[AppView], now: float, avail_mb: float, cfg: MemConfig,
+                    strata_mb: float | None, max_gap_s: float) -> list[MemReport]:
+    """The eviction rule of decide(); updates `st` (decide's private copy) in place."""
+    if strata_mb is None or st.evict_reported:   # Strata's processes are not visible / already reported this arm
+        st.evict_since = st.evict_last = None
+        return []
+    cur = float(strata_mb)
+    peak = max(cur, float(st.peak_strata_mb or 0.0))
+    st.peak_strata_mb = peak
+    lost = peak - cur
+    base_avail = float(st.baseline_avail_mb or 0.0)
+    out_of_ram = (peak >= EVICT_MIN_PEAK_MB and cur < peak * cfg.evict_pct / 100.0
+                  and avail_mb < base_avail + lost * EVICT_RETURNED_SHARE)
+    if not out_of_ram:
+        st.evict_since = st.evict_last = None
+        return []
+    if st.evict_since is None or st.evict_last is None or now - st.evict_last > max_gap_s or now < st.evict_last:
+        st.evict_since = now
+    st.evict_last = now
+    held = now - st.evict_since
+    if held + 1e-6 < cfg.evict_sustain_s:
+        return []
+    new = [a for a in apps if a.key not in st.reported and a.create_time > st.arm_time and a.ram_mb >= cfg.evict_app_mb]
+    if not new:                                  # nobody to name (a protected or older app): stay quiet, keep timing
+        return []
+    a = max(new, key=lambda x: (x.ram_mb, -x.create_time, -x.pid))
+    st.evict_reported = True
+    st.reported.add(a.key)
+    st.reported_members |= a.members
+    st.since.pop(a.key, None)
+    st.last_seen.pop(a.key, None)
+    return [MemReport(
+        name=a.name, title=a.title, pid=a.pid, create_time=a.create_time, exe=a.exe, ram_mb=round(a.ram_mb, 1),
+        member_count=len(a.members), avail_mb=round(avail_mb, 1), avail_eff_mb=round(avail_mb, 1), floor_mb=0.0,
+        baseline_avail_mb=round(base_avail, 1), app_threshold_mb=cfg.evict_app_mb, sustained_s=round(held, 1),
+        reason="evicted", strata_mb=round(cur, 1), strata_peak_mb=round(peak, 1))]
 
 
 def group_apps(procs: Mapping[int, ProcInfo], ctx: GraphContext) -> list[AppView]:

@@ -11,6 +11,7 @@ Safe by construction:
 from __future__ import annotations
 
 import json
+import dataclasses
 import logging
 import os
 import shutil
@@ -290,6 +291,59 @@ def test_strata_growth() -> None:
           abs((strata_mb(tbl(), ctx()) or 0) - (60 + 900 + 48000)) < 1, str(strata_mb(tbl(), ctx())))
     check("strata_mb(): provider pids count too", abs((strata_mb(tbl(), ctx(extra=(30,))) or 0) - 48965) < 1)
     check("strata_mb(): no Strata -> None", strata_mb({1: P(1, "x.exe")}, ctx()) is None)
+
+
+def test_evicted() -> None:
+    section("4b. Strata pushed out of RAM (measured: a game evicted a 49 GB model within ~10 s)")
+    st = ready(3000)
+
+    def strata_at(mb: float, *extra: ProcInfo):
+        t2 = tbl(*extra)
+        t2[33] = P(33, "strata.exe", ppid=32, ct=ARM - 197, mb=mb, exe=STRATA_DIR + r"\engine\strata.exe")
+        return t2
+    game = big(name="Game.exe", mb=2500)
+    got, _ = series(st, lambda t: strata_at(1500, game), NOW, NOW + 60, 300)
+    check("Strata 49 GB -> 2.5 GB, 0.3 GB available, a 2.5 GB new app -> one report after 6 s",
+          [t - NOW for t, _ in got] == [6.0], str([(t - NOW, r.reason) for t, r in got]))
+    if got:
+        r = got[0][1]
+        check("the report names the app and says why", (r.reason, r.title, r.ram_mb, r.strata_mb) ==
+              ("evicted", "Game", 2500.0, 2460.0) and abs((r.strata_peak_mb or 0) - 48960) < 1
+              and "fell to 2460 MB" in r.why() and "Game" in r.why(), r.why())
+    got, _ = series(st, lambda t: strata_at(1500, game), NOW, NOW + 60, 3000 + 44000)
+    check("Strata unloaded by itself (its memory is available again) -> never", got == [])
+    got, _ = series(st, lambda t: strata_at(1500, game), NOW, NOW + 60, 3000 + 46500 * 0.5 - 1)
+    check("just under half of the lost memory available -> reported", len(got) == 1)
+    got, _ = series(st, lambda t: strata_at(1500), NOW, NOW + 60, 300)
+    check("no new app to name (only apps from before Strata was ready) -> never", got == [])
+    got, _ = series(st, lambda t: strata_at(1500, game), NOW, NOW + 60, 300,
+                    cfg=dataclasses.replace(FAST, evict_app_mb=3000))
+    check("the new app is below the naming size -> never", got == [])
+    got, _ = series(st, lambda t: strata_at(48000 * 0.6, game), NOW, NOW + 60, 300)
+    check("Strata at 60 % of its peak -> never", got == [])
+    got, _ = series(st, lambda t: strata_at(48000 if t == NOW + 3 else 1500, game), NOW, NOW + 30, 300)
+    check("Strata back in RAM for one pass resets the timer", [t - NOW for t, _ in got] == [12.0],
+          str([t - NOW for t, _ in got]))
+    got, _ = series(st, lambda t: strata_at(1500, game, big(pid=200, name="Editor.exe", mb=3500, ct=NOW - 5)),
+                    NOW, NOW + 120, 300)
+    check("two new apps: the largest is named, once", [r.title for _t, r in got] == ["Editor"],
+          str([r.title for _t, r in got]))
+    got, _ = series(st, lambda t: strata_at(1500, big(name="Chatty.exe", mb=9000)), NOW, NOW + 60, 300)
+    check("a protected app is never named", got == [])
+    got, _ = series(st, lambda t: tbl(game, drop=(31, 32, 33)), NOW, NOW + 60, 300)
+    check("Strata's processes gone (stopped) -> never", got == [])
+    grow, s2 = series(st, lambda t: strata_at(58000, game), NOW, NOW + 3, 3000)
+    got, _ = series(s2, lambda t: strata_at(28000, game), NOW + 6, NOW + 30, 300)
+    check("the reference is Strata's peak since ready, not the first reading (58 GB peak, 29 GB now -> reported)",
+          grow == [] and len(got) == 1 and abs((got[0][1].strata_peak_mb or 0) - 58960) < 1, str(got))
+    small = MemState(arm_time=ARM)
+    _r, small = run(small, strata_at(40), ARM + 1, 3000)
+    got, _ = series(small, lambda t: strata_at(1, game), NOW, NOW + 60, 300)
+    check("an engine that never held 1 GB is not judged", got == [])
+    # both rules at once: one report for the app, not two
+    got, _ = series(st, lambda t: strata_at(1500, big(name="Game.exe", mb=6000)), NOW, NOW + 60, 300)
+    check("an app that meets both rules is reported once (the eviction comes first)",
+          [(t - NOW, r.reason) for t, r in got] == [(6.0, "evicted")], str([(t - NOW, r.reason) for t, r in got]))
 
 
 # ----------------------------------------------------------------------------------------- 5. grouping/protection
@@ -684,7 +738,7 @@ def test_scan_cost() -> None:
 def main() -> int:
     logging.basicConfig(level=logging.WARNING, format="  log %(levelname)s %(message)s")
     try:
-        for fn in (test_config, test_floor, test_decide, test_strata_growth, test_grouping, test_inputs,
+        for fn in (test_config, test_floor, test_decide, test_strata_growth, test_evicted, test_grouping, test_inputs,
                    test_shared_pass, test_real_thread, test_scan_cost):
             try:
                 fn()

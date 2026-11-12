@@ -50,9 +50,13 @@ it off. Launchers, SteamVR and redistributable installers don't count. Windows h
 games (Do Not Disturb), which is why the default acts instead of asking.
 
 **When memory runs low** (Settings; default *Ask me*): games are found by their install folder, so a game
-installed elsewhere, or any other heavy program, is not noticed by the rule above. A second check watches for
-an app that was started after Strata became ready, holds a lot of memory (4 GB for the whole app by default)
-and coincides with the PC running short of available memory for 15 seconds. *Ask me* shows a toast naming the
+installed elsewhere, or any other heavy program, is not noticed by the rule above. A second check watches two
+things. The firm one: Strata's own memory in RAM has fallen below half of its peak for 6 seconds, that memory
+did not come back as available memory (so Windows paged the model out; an unload gives it back), and an app
+started after Strata became ready is running. This fires after the model has been pushed out - on a 64 GB PC a
+game did that to a 49 GB model within about 10 seconds - so it rescues the PC and the app, not the loaded model.
+The softer one: such a new app holds a lot of memory (4 GB for the whole app by default) while the PC runs
+short of available memory for 15 seconds. *Ask me* shows a toast naming the
 app and its memory, with the same **Turn off Strata** button; *Turn Strata off* does the same safe turn-off as
 for a game; *Do nothing* switches the check off. It only observes: it never closes anything. Apps on your
 protected list, system processes and apps that were already open never trigger it, and an app is reported
@@ -206,6 +210,7 @@ started*, then *Reopened 3 apps*.
 | `user_whitelist` | Edited by the ⚙ dialog |
 | `backend` | The inference engine: `strata` (the only one today; a missing or unknown value means `strata`). See `docs/engines.md` |
 | `mem_watch_app_mb`, `mem_watch_sustain_s` | Memory-pressure check: an app's memory that counts as large (4096), and how long both conditions must hold (15) |
+| `mem_watch_evict_pct`, `mem_watch_evict_sustain_s`, `mem_watch_evict_app_mb` | Pushed-out check: Strata's memory in RAM below this share of its peak (50) for this long (6), and the smallest new app that is named as the cause, in MB (512) |
 | `mem_watch_floor_baseline_pct`, `mem_watch_floor_total_pct` | "Running short" = available memory below the smaller of this share of what was available when Strata became ready (50) and this share of installed RAM (6) |
 
 To serve another Strata model, pick its `run-*.bat` in ⚙ Settings — no hand-editing needed. `state.json` (next to
