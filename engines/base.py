@@ -130,11 +130,14 @@ class LiveSample:
 class RequestSample:
     """One FINISHED request. key identifies it across polls (the store keeps each key once); time orders it.
     decode_tps / prompt_tps are the speeds to plot, already cleaned by the engine (None = do not plot: too
-    short an answer, a cache hit, no timing)."""
+    short an answer, a cache hit, no timing). prompt_tokens / generated_tokens are the request's sizes for the
+    usage history (None = the engine does not report them; the request is then counted without tokens)."""
     key: str
     time: float | None = None
     decode_tps: float | None = None
     prompt_tps: float | None = None
+    prompt_tokens: int | None = None
+    generated_tokens: int | None = None
 
 
 @dataclass(frozen=True)

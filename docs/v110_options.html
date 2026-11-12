@@ -1,0 +1,114 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Agent Start 1.10 mockups</title>
+<style>
+  body{background:#0c0c0d;color:#EDEDEB;font:13px "Segoe UI",system-ui,sans-serif;margin:0;padding:20px}
+  h2{font-size:13px;font-weight:600;color:#A1A1A6;margin:0 0 4px}
+  .note{color:#6E6E73;font-size:12px;margin:0 0 10px;max-width:340px}
+  .wrap{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start}
+  .win{background:#141415;border:1px solid #2C2C30;border-radius:8px;padding:12px;box-sizing:border-box}
+  .hd{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+  .hd b{font-size:14px}.muted{color:#6E6E73}.t2{color:#A1A1A6}.small{font-size:12px}
+  .mono{font-family:Consolas,monospace;font-size:12px}
+  .btn{background:#26262A;border-radius:8px;height:30px;line-height:30px;padding:0 10px;box-sizing:border-box}
+  .ghost{border:1px solid #303035;background:transparent;text-align:center}
+  .row{display:flex;align-items:center;gap:8px;margin-top:10px}
+  .sw{width:36px;height:18px;border-radius:9px;background:#3CC77E;position:relative;flex:none}
+  .sw:after{content:"";position:absolute;right:1px;top:-1px;width:20px;height:20px;border-radius:50%;background:#EDEDEB}
+  .sel{background:#26262A;border-radius:8px;height:26px;line-height:26px;padding:0 10px;width:150px;box-sizing:border-box;display:flex;justify-content:space-between}
+  .lab{width:158px}
+  .new{outline:1px dashed #E0A33A;outline-offset:3px;border-radius:6px}
+  .tag{color:#E0A33A;font-size:11px;margin-left:6px}
+  hr{border:0;border-top:1px solid #2C2C30;margin:12px 0}
+  table{border-collapse:collapse;width:100%}
+  th{font-weight:400;color:#6E6E73;font-size:11px;text-align:right;padding:4px 6px;border-bottom:1px solid #2C2C30}
+  td{text-align:right;padding:5px 6px;font-variant-numeric:tabular-nums}
+  th:first-child,td:first-child{text-align:left}
+  tr.day td{border-top:1px solid #2C2C30}
+  tr.model td{color:#A1A1A6;font-size:12px;padding-top:1px;padding-bottom:1px}
+  tr.model td:first-child{padding-left:18px;font-family:Consolas,monospace}
+  .cards{display:flex;gap:8px;margin-bottom:10px}
+  .card{background:#1C1C1E;border-radius:8px;padding:8px 10px;flex:1}
+  .card .v{font-size:17px;font-weight:600}.card .k{color:#6E6E73;font-size:11px}
+  .bars{display:flex;align-items:flex-end;gap:5px;height:70px;background:#1C1C1E;border-radius:8px;padding:8px 10px;margin-bottom:4px}
+  .bars div{flex:1;background:#3CC77E;border-radius:2px 2px 0 0;min-height:2px}
+  .bars div.p{background:#4DB6F5}
+  .seg{display:flex;gap:0;background:#1C1C1E;border-radius:8px;padding:2px;width:max-content}
+  .seg span{padding:3px 10px;border-radius:6px;color:#A1A1A6;font-size:12px}.seg span.on{background:#26262A;color:#EDEDEB}
+  .axis{display:flex;justify-content:space-between;color:#6E6E73;font-size:11px;padding:0 10px;margin-bottom:10px}
+</style></head><body>
+<div class="wrap">
+
+<div>
+<h2>Settings (340 px wide, as now)</h2>
+<p class="note">Dashed amber = new. The engine row only appears once a second engine is installed; with Strata alone it is hidden and the dialog is 34 px shorter.</p>
+<div class="win" style="width:340px">
+  <div class="hd"><b>Settings</b><span class="muted small">v1.10.0</span></div>
+  <div style="display:flex;justify-content:flex-end"><div class="btn small" style="height:24px;line-height:24px">Check for updates</div></div>
+  <div class="row new" style="margin-top:8px"><span class="lab">Engine</span><div class="sel"><span>Strata</span><span>⌄</span></div><span class="tag">hidden for now</span></div>
+  <div class="t2 small" style="margin-top:10px">Strata launcher</div>
+  <div class="row" style="margin-top:4px"><div class="btn" style="flex:1;display:flex;justify-content:space-between"><span>swift-1.5-iq3_s</span><span>⌄</span></div><div class="btn" style="width:76px;text-align:center">Browse…</div></div>
+  <div class="mono t2" style="margin-top:6px">run-swift-iq3_s.bat · port 8080</div>
+  <div class="t2 small" style="margin-top:6px">Endpoint</div>
+  <div class="btn" style="margin-top:4px;display:flex;justify-content:space-between;background:#1C1C1E"><span>Open Strata dashboard ↗</span><span class="mono t2">127.0.0.1:8080</span></div>
+  <hr>
+  <div style="display:flex;gap:8px">
+    <div class="btn" style="flex:1">Protected apps…</div>
+    <div class="btn new" style="flex:1">Usage history…</div>
+  </div>
+  <div class="row"><div class="sw"></div>Reopen closed apps after Turn off</div>
+  <div class="row"><div class="sw"></div>Keep running in the tray</div>
+  <div class="row"><div class="sw"></div>Start with Windows</div>
+  <div class="row"><span class="lab">When a game starts</span><div class="sel"><span>Turn Strata off</span><span>⌄</span></div></div>
+  <div class="row"><span class="lab">When memory runs low</span><div class="sel"><span>Ask me</span><span>⌄</span></div></div>
+  <div class="row new"><span class="lab">When that app closes</span><div class="sel"><span>Ask me</span><span>⌄</span></div></div>
+  <div class="muted small" style="margin:4px 0 0 0">Ask me · Turn Strata back on · Do nothing</div>
+  <div class="row"><div class="sw"></div>Check for updates daily</div>
+  <div style="display:flex;gap:8px;margin-top:14px"><div class="btn ghost" style="flex:1">Cancel</div><div class="btn" style="flex:1;text-align:center;color:#6E6E73">Save</div></div>
+</div>
+</div>
+
+<div>
+<h2>History, option A: table only</h2>
+<p class="note">One row per day, newest first; models indented under the day. Smallest to build, and every number is readable.</p>
+<div class="win" style="width:520px">
+  <div class="hd"><b>Usage history</b><div class="seg"><span>7 days</span><span class="on">30 days</span><span>All</span></div></div>
+  <table>
+    <tr><th>Day</th><th>Requests</th><th>Prompt tok</th><th>Generated tok</th><th>Avg tok/s</th><th>Served</th></tr>
+    <tr class="day"><td>Today</td><td>214</td><td>3.42 M</td><td>186 K</td><td>98.4</td><td>5 h 12 m</td></tr>
+    <tr class="model"><td>swift-1.5-iq3_s</td><td>171</td><td>2.90 M</td><td>151 K</td><td>101.7</td><td>4 h 02 m</td></tr>
+    <tr class="model"><td>swift-1.5-iq3_xxs</td><td>43</td><td>0.52 M</td><td>35 K</td><td>84.1</td><td>1 h 10 m</td></tr>
+    <tr class="day"><td>Wed 11 Nov</td><td>96</td><td>1.18 M</td><td>74 K</td><td>102.3</td><td>2 h 40 m</td></tr>
+    <tr class="model"><td>swift-1.5-iq3_s</td><td>96</td><td>1.18 M</td><td>74 K</td><td>102.3</td><td>2 h 40 m</td></tr>
+    <tr class="day"><td>Tue 10 Nov</td><td>0</td><td>–</td><td>–</td><td>–</td><td>18 m</td></tr>
+    <tr class="day"><td style="color:#A1A1A6">30 days</td><td>1,902</td><td>31.6 M</td><td>1.71 M</td><td>99.8</td><td>61 h 05 m</td></tr>
+  </table>
+  <div style="display:flex;justify-content:space-between;margin-top:12px;align-items:center"><span class="muted small">Kept on this PC only · usage.json</span><div class="btn ghost" style="width:90px">Close</div></div>
+</div>
+</div>
+
+<div>
+<h2>History, option B: totals + chart + table</h2>
+<p class="note">Totals for the chosen range on top, generated tokens per day as bars, then the same table. Better for comparing days at a glance; about 1 h more to build.</p>
+<div class="win" style="width:520px">
+  <div class="hd"><b>Usage history</b><div class="seg"><span>7 days</span><span class="on">30 days</span><span>All</span></div></div>
+  <div class="cards">
+    <div class="card"><div class="v">1,902</div><div class="k">requests</div></div>
+    <div class="card"><div class="v">1.71 M</div><div class="k">generated tokens</div></div>
+    <div class="card"><div class="v">99.8</div><div class="k">avg tok/s</div></div>
+    <div class="card"><div class="v">61 h</div><div class="k">served</div></div>
+  </div>
+  <div class="bars"><div style="height:20%"></div><div style="height:35%"></div><div style="height:0"></div><div style="height:60%"></div><div style="height:48%"></div><div style="height:12%"></div><div style="height:0"></div><div style="height:75%"></div><div style="height:66%"></div><div style="height:30%"></div><div style="height:22%"></div><div style="height:0"></div><div style="height:90%"></div><div style="height:41%"></div><div style="height:55%"></div><div style="height:18%"></div><div style="height:0"></div><div style="height:37%"></div><div style="height:62%"></div><div style="height:70%"></div><div style="height:25%"></div><div style="height:0"></div><div style="height:44%"></div><div style="height:52%"></div><div style="height:33%"></div><div style="height:15%"></div><div style="height:0"></div><div style="height:8%"></div><div style="height:40%"></div><div style="height:100%"></div></div>
+  <div class="axis"><span>14 Oct</span><span>generated tokens per day</span><span>Today</span></div>
+  <table>
+    <tr><th>Day</th><th>Requests</th><th>Prompt tok</th><th>Generated tok</th><th>Avg tok/s</th><th>Served</th></tr>
+    <tr class="day"><td>Today</td><td>214</td><td>3.42 M</td><td>186 K</td><td>98.4</td><td>5 h 12 m</td></tr>
+    <tr class="model"><td>swift-1.5-iq3_s</td><td>171</td><td>2.90 M</td><td>151 K</td><td>101.7</td><td>4 h 02 m</td></tr>
+    <tr class="model"><td>swift-1.5-iq3_xxs</td><td>43</td><td>0.52 M</td><td>35 K</td><td>84.1</td><td>1 h 10 m</td></tr>
+    <tr class="day"><td>Wed 11 Nov</td><td>96</td><td>1.18 M</td><td>74 K</td><td>102.3</td><td>2 h 40 m</td></tr>
+  </table>
+  <div style="display:flex;justify-content:space-between;margin-top:12px;align-items:center"><span class="muted small">Kept on this PC only · usage.json</span><div class="btn ghost" style="width:90px">Close</div></div>
+</div>
+</div>
+
+</div>
+</body></html>

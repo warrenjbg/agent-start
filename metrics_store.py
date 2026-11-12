@@ -132,6 +132,15 @@ def _strata_live(live: Any) -> LiveSample | None:
         prompt_tps_mean=_num(live.get("prefill_tok_s_mean")))
 
 
+def _count(*values: Any) -> int | None:
+    """The first value that is a whole, non-negative token count (None when none is)."""
+    for v in values:
+        n = _num(v)
+        if n is not None and n >= 0:
+            return int(n)
+    return None
+
+
 def strata_sample(doc: Any) -> MetricsSample | None:
     """One Strata GET /metrics JSON document -> MetricsSample (None for a non-dict). Pure; never raises on junk.
 
@@ -150,7 +159,9 @@ def strata_sample(doc: Any) -> MetricsSample | None:
             if key is None:
                 continue
             requests.append(RequestSample(key=key, time=_num(req.get("time")), decode_tps=decode_rate(req),
-                                          prompt_tps=prompt_rate(req)))
+                                          prompt_tps=prompt_rate(req), prompt_tokens=_count(req.get("prompt_total")),
+                                          generated_tokens=_count(req.get("engine_generated"),
+                                                                  req.get("output_tokens"))))
     hw = doc.get("hardware")
     used = _num(hw.get("gpu_mem_used")) if isinstance(hw, dict) else None
     total = _num(hw.get("gpu_mem_total")) if isinstance(hw, dict) else None

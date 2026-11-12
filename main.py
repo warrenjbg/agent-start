@@ -105,10 +105,23 @@ GAME_ACTION_LABELS = {"off": "Turn Strata off", "ask": "Ask me", "none": "Do not
 def action_labels(engine_name: str) -> dict[str, str]:
     """The three choices of the "When a game starts" / "When memory runs low" settings, naming the engine."""
     return {"off": f"Turn {engine_name} off", "ask": "Ask me", "none": "Do nothing"}
-PROTOCOL = "agentstart"                  # agentstart://game-off (toast button; registered by the installer)
+
+
+RESUME_ACTIONS = ("ask", "on", "none")   # Settings "When that app closes": ask / turn the engine back on / nothing
+RESUME_ALERT_VALID_S = 1800.0            # the "Turn on" button of the "closed" toast works this long
+RESUME_TARGETS_MAX = 8                   # remembered causes (game / app) of this session's alerts
+
+
+def resume_labels(engine_name: str) -> dict[str, str]:
+    """The three choices of the "When that app closes" setting, naming the engine."""
+    return {"ask": "Ask me", "on": f"Turn {engine_name} back on", "none": "Do nothing"}
+
+
+PROTOCOL = "agentstart"                  # agentstart://game-off, ://resume-on (toast buttons; installer-registered)
 TOOL_WAIT_S = 600.0                      # after a request that ended in a tool call the agent comes back with the tool's
                                          # result; "when it's done" waits up to this long for that next request
 SWITCH_GLYPH = "\uE8AB"                  # Segoe Fluent Icons "Switch"
+USAGE_FLUSH_S = 60.0                     # usage history: serving time is added and the file saved this often
 LIVE_POLL_S = 1.0                        # /metrics poll while serving (model state on the status line), as Strata's
                                          # own Monitor; stopped while the window is minimised
 ACT_BAR_X = 22                           # activity bar under the status line: starts at the state text...
@@ -205,6 +218,16 @@ def _toast_worker(title: str, msg: str, buttons: list[tuple[str, str]] | None = 
         log.debug("toast failed", exc_info=True)
 
 
+def _save_backend_worker(engine_id: str) -> None:
+    """Worker: write the chosen engine into config.json (re-read first: keep whatever else changed on disk)."""
+    try:
+        disk = config_store.load_config()
+        disk["backend"] = engine_id
+        config_store.save_config(disk)
+    except Exception:  # noqa: BLE001
+        log.exception("saving the engine choice failed")
+
+
 def _protocol_registered() -> bool:
     """agentstart:// opens THIS exe (installer-registered): only then does a toast button work."""
     try:
@@ -217,7 +240,8 @@ def _protocol_registered() -> bool:
 
 
 def parse_protocol(argv: list[str]) -> str | None:
-    """The action of an agentstart:// argument: 'game-off', 'show' (any other agentstart: URL), or None."""
+    """The action of an agentstart:// argument: 'game-off', 'resume-on', 'show' (any other agentstart: URL), or
+    None."""
     from urllib.parse import urlsplit
     for a in argv:
         if not str(a).lower().startswith(PROTOCOL + ":"):
@@ -227,7 +251,9 @@ def parse_protocol(argv: list[str]) -> str | None:
         except ValueError:
             return "show"
         verb = (u.netloc or u.path.lstrip("/")).strip("/").lower()
-        return "game-off" if u.scheme.lower() == PROTOCOL and verb == "game-off" and not u.query else "show"
+        if u.scheme.lower() == PROTOCOL and verb in ("game-off", "resume-on") and not u.query:
+            return verb
+        return "show"
     return None
 
 
@@ -371,6 +397,12 @@ class AgentStartApp(ctk.CTk):
         self._fetch_status = status_fetcher if status_fetcher is not None or metrics_fetcher is None \
             else (lambda _root: None)
         self.metrics = MetricsStore()
+        self.usage = None                        # usage_history.UsageHistory: per-day / per-model totals (local file)
+        try:
+            import usage_history
+            self.usage = usage_history.UsageHistory()
+        except Exception:  # noqa: BLE001 - the history is optional: the app works without it
+            log.exception("usage history unavailable")
         self._metrics_fails = 0
         self._metrics_epoch = 0                  # bumped per start: a late poll of the old server is dropped
         self.vram = vram_sampler if vram_sampler is not None else VramSampler()
@@ -410,6 +442,15 @@ class AgentStartApp(ctk.CTk):
         ma = saved.get("memory_action")
         self._mem_action = ma if ma in GAME_ACTIONS else "ask"
         self.memwatch = None                     # mem_watch.MemWatcher (extras only); runs inside the game scan
+        # Settings "When that app closes": after a stop made for a game / a memory-hungry app, offer (or do) the
+        # turn-on once that app has closed. New key: a state.json without it means "ask".
+        ra = saved.get("resume_action")
+        self._resume_action = ra if ra in RESUME_ACTIONS else "ask"
+        self.resume = None                       # resume_watch.ResumeWatcher (extras only)
+        self._resume_targets: dict[str, Any] = {}           # alert title -> ResumeTarget (what to watch for)
+        self._resume_alert: tuple[float, str] | None = None  # (monotonic, title) of the last "closed" toast
+        self._backend_pending: str | None = None  # engine chosen in Settings, used after a restart
+        self._cancel_game: str | None = None      # the game a still-loading start was cancelled for
         self._mem_armed = False
         self._mem_queued: tuple[str, float] | None = None   # reported while a dialog / box was open
         self._no_tray = not extras or not self._tray_pref
@@ -1080,6 +1121,7 @@ class AgentStartApp(ctk.CTk):
             # a new Strata session: nothing of an earlier stop's wording / reopen choice may leak into it
             self._skip_reopen_once, self._stop_toast, self._last_stop_game = False, None, None
             self._game_alert = None
+            self._cancel_resume()                # the engine is coming up: nothing left to offer
         self.state_name = st
         self._state_seq += 1
         self._note_until = 0.0                   # a note belongs to the state it was shown in
@@ -1368,6 +1410,8 @@ class AgentStartApp(ctk.CTk):
         last_poll = 0.0
         last_epoch = None
         poller = None
+        served_acc, served_last = 0.0, None      # serving time for the usage history, added once a minute
+        served_model = None
         while not self._stop_evt.is_set():
             try:
                 # Every LIVE_POLL_S while serving: the status line shows what the model is doing (reading /
@@ -1394,7 +1438,30 @@ class AgentStartApp(ctk.CTk):
                         # stop then waits the engine's idle time instead of being treated as a dead server
                         sample = MetricsSample()
                     last_poll, last_epoch = now, epoch
+                    usage = self.usage
+                    if usage is not None:
+                        if sample is not None:
+                            usage.record(sample, now=time.time())
+                        if self.state_name == ACTIVE and self.loaded is not False:
+                            if served_last is not None:      # capped: sleep / hibernation is not serving time
+                                served_acc += min(max(0.0, now - served_last), 5.0)
+                            served_last = now
+                            served_model = self.model_id or served_model
+                        else:
+                            served_last = None
+                        if served_acc >= USAGE_FLUSH_S:
+                            usage.add_served(served_model, served_acc, now=time.time())
+                            served_acc = 0.0
+                            usage.flush()
                     self.post(self._apply_metrics, epoch, sample)
+                else:
+                    served_last = None
+                    usage = self.usage
+                    if usage is not None and (served_acc > 0 or usage.dirty):
+                        if served_acc > 0:
+                            usage.add_served(served_model, served_acc, now=time.time())
+                            served_acc = 0.0
+                        usage.flush()
             except Exception:  # noqa: BLE001
                 log.debug("metrics poll failed", exc_info=True)
             self._stop_evt.wait(LIVE_POLL_S)
@@ -1725,7 +1792,9 @@ class AgentStartApp(ctk.CTk):
         elif st == STARTING:
             self.cancel_start()
 
-    def turn_on(self) -> None:
+    def turn_on(self, skip_sweep: bool = False) -> None:
+        """skip_sweep: start at once, without scanning for apps to close and without the start dialog (the automatic
+        turn-on after a game closed: nobody is there to answer it, and nothing may be closed unasked)."""
         if self.updates.updating:
             self._set_note("Installing an update · try again after the restart")
             return
@@ -1734,6 +1803,7 @@ class AgentStartApp(ctk.CTk):
             return
         self._sweep_note = ""
         self._reopen_this = False
+        self._cancel_game = None
         if self._reopen_offer:                   # starting again: the old "Reopen …" offer is stale
             self._reopen_offer = []
             self._run_worker("hc-reopen-clear", reopen.clear_pending)
@@ -1744,6 +1814,9 @@ class AgentStartApp(ctk.CTk):
         self._error_hold_until = 0.0
         self._start_phase = "scan"
         self._set_state(STARTING)
+        if skip_sweep:
+            self._begin_server_start(token)
+            return
         self._set_preview("Scanning for apps to close…")
 
         def work() -> None:
@@ -1862,6 +1935,8 @@ class AgentStartApp(ctk.CTk):
         self._metrics_epoch += 1                 # a new server: its request history starts empty
         self._metrics_fails = 0
         self.metrics.reset()
+        if self.usage is not None:               # a new server run may reuse request ids
+            self.usage.begin_session()
         try:
             self._avail_at_launch = psutil.virtual_memory().available / 1048576.0
         except Exception:  # noqa: BLE001
@@ -2199,7 +2274,8 @@ class AgentStartApp(ctk.CTk):
                 self._switching = False
                 self._set_state(ACTIVE)
             return
-        self._last_stop_game = None
+        stop_game, self._last_stop_game = self._last_stop_game, None
+        cancel_game, self._cancel_game = self._cancel_game, None
         released = _released(result)             # the engine no longer holds the model (however it got there)
         if not (released or result.get("cancelled_start")):
             self._switching = False
@@ -2210,6 +2286,8 @@ class AgentStartApp(ctk.CTk):
             self.model_id, self.loaded = None, None
             self._set_state(IDLE)
             self._set_note("Start cancelled")
+            if not self._exit_pending:
+                self._arm_resume(cancel_game)    # the load was cancelled for a game: offer it once that closes
             self._request_preview()
         elif released:
             self.model_id, self.loaded = None, None
@@ -2224,6 +2302,7 @@ class AgentStartApp(ctk.CTk):
                                                      if self._pending_launcher else self.cfg.get("model_name")))
                 self.after(300, self._switch_start)
             elif not self._exit_pending:
+                self._arm_resume(stop_game)      # stopped for a game / an app: offer the turn-on once it closes
                 self._reopening = True
                 auto = self._reopen_pref and not self._skip_reopen_once
                 self._run_worker("hc-reopen", self._reopen_worker, auto)
@@ -2255,7 +2334,9 @@ class AgentStartApp(ctk.CTk):
             update_version=self.updates.offer_version(),
             on_update=self.updates.install, switches=self._settings_switches(),
             on_check_updates=self.updates.check_now, can_check_updates=self.updates.available(),
-            engine=self.engine)
+            engine=self.engine,
+            on_history=self.open_history if self.usage is not None else None,
+            engine_choices=engines.choices(), on_engine_change=self.set_backend)
 
     # ------------------------------------------------------------------ system tray
     def _start_tray(self) -> None:
@@ -2441,7 +2522,7 @@ class AgentStartApp(ctk.CTk):
                 import mem_watch
                 self.memwatch = mem_watch.MemWatcher(
                     self.cfg,                          # the dict the detector reads: protected-list edits apply live
-                    on_app=lambda r: post(self._on_memory_app, r.title, r.ram_mb, r.why()),
+                    on_app=lambda r: post(self._on_memory_app, r.title, r.ram_mb, r.why(), r),
                     protected_pids=self.endpoint.protected_pids,
                     engine_protects=lambda i: self.engine.protects_process(i.cmdline, i.exe, self.cfg))
             except Exception:  # noqa: BLE001
@@ -2449,9 +2530,20 @@ class AgentStartApp(ctk.CTk):
                 log.exception("memory watcher unavailable")
             self.games = game_watch.GameWatcher(list(self.cfg.get("game_dirs") or []),
                                                 list(self.cfg.get("game_exclude") or []),
-                                                on_game=lambda g: post(self._on_game_started, g.title, g.ram_mb),
+                                                on_game=lambda g: post(self._on_game_started, g.title, g.ram_mb, g),
                                                 co_scan=self.memwatch)
             self.games.start()
+            try:
+                import resume_watch
+                cfg = self.cfg
+                self.resume = resume_watch.ResumeWatcher(
+                    lambda: list(cfg.get("game_dirs") or []),
+                    on_closed=lambda t, s: post(self._on_resume_closed, t, s),   # watcher thread: only post
+                    game_exclude=lambda: list(cfg.get("game_exclude") or []), cfg=cfg)
+                self.resume.start()
+            except Exception:  # noqa: BLE001
+                self.resume = None
+                log.exception("resume watcher unavailable")
         except Exception:  # noqa: BLE001
             self.games = None
             self.memwatch = None
@@ -2492,10 +2584,11 @@ class AgentStartApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             log.debug("memory watcher arm/disarm failed", exc_info=True)
 
-    def _on_memory_app(self, title: str, ram_mb: float = 0.0, why: str = "") -> None:
+    def _on_memory_app(self, title: str, ram_mb: float = 0.0, why: str = "", src: Any = None) -> None:
         """mem_watch reported an app started while serving that holds a lot of memory while the PC runs short.
         Same safe turn-off as for a game (reply / tool call first, no dialog, closed apps become a Reopen offer),
-        with its own setting."""
+        with its own setting. src: the MemReport (so the app can be watched for closing after the stop)."""
+        self._remember_target(title, src, "app")
         if self._mem_action == "none" or self._destroyed or self.state_name != ACTIVE or self.loaded is False:
             return
         if self._game_blocked():
@@ -2521,15 +2614,17 @@ class AgentStartApp(ctk.CTk):
         log.info("when memory runs low: %s", action)
         return True
 
-    def _on_game_started(self, title: str, ram_mb: float = 0.0) -> None:
+    def _on_game_started(self, title: str, ram_mb: float = 0.0, src: Any = None) -> None:
         if not self._game_pref or self._destroyed:
             return
+        self._remember_target(title, src, "game")
         if self.state_name == STARTING and self._start_phase == "server" and self._game_action == "off" \
                 and not self._exit_pending:
             log.info("game started during the load (%s): cancelling the start", title)
             name = self.engine.name
             self._run_worker("hc-toast", _toast_worker, f"{name} start cancelled",
                              f"{_short(title, 40)} started, so {name} stopped loading and left the memory to it.")
+            self._cancel_game = title            # the cancelled load is offered again once the game closes
             self.cancel_start()
             return
         if self.state_name == STARTING or (self.state_name == ACTIVE and self.loaded is False):
@@ -2554,6 +2649,111 @@ class AgentStartApp(ctk.CTk):
         self._run_worker("hc-toast", _toast_worker, "Game started",
                          f"{_short(title, 40)} started while {self.engine.name} is running ({free})."
                          + ("" if buttons else " Open Agent Start to turn it off."), buttons)
+
+    # ------------------------------------------------------------------ back on when that app closes
+    def _remember_target(self, title: str, src: Any, kind: str) -> None:
+        """Keep what to watch for (the game's install / the app's processes) under the alert's title."""
+        if src is None or self._destroyed:
+            return
+        try:
+            import resume_watch
+            if kind == "game":
+                target = resume_watch.target_for_game(src, list(self.cfg.get("game_dirs") or []))
+            else:
+                target = resume_watch.target_for_app(src)
+        except Exception:  # noqa: BLE001
+            log.debug("resume target unavailable for %s", title, exc_info=True)
+            return
+        self._resume_targets.pop(title, None)
+        self._resume_targets[title] = target
+        while len(self._resume_targets) > RESUME_TARGETS_MAX:
+            self._resume_targets.pop(next(iter(self._resume_targets)))
+
+    def _arm_resume(self, title: str | None) -> None:
+        """A stop made for `title` (a game / a memory-hungry app) released the model: watch for it to close."""
+        if not title or self._resume_action == "none" or self.resume is None:
+            return
+        target = self._resume_targets.get(title)
+        if target is None:
+            return
+        try:
+            self.resume.watch(target)
+            log.info("watching for %s to close (then: %s)", title, self._resume_action)
+        except Exception:  # noqa: BLE001
+            log.exception("resume watch failed")
+
+    def _cancel_resume(self) -> None:
+        self._resume_alert = None
+        watcher = getattr(self, "resume", None)
+        if watcher is not None:
+            try:
+                watcher.cancel()
+            except Exception:  # noqa: BLE001
+                log.debug("resume cancel failed", exc_info=True)
+
+    def _on_resume_closed(self, target: Any, closed_for_s: float = 0.0) -> None:
+        """The game / app a stop was made for has closed: turn the engine back on, or offer it (Settings)."""
+        if self._destroyed or self._resume_action == "none" or self.state_name != IDLE:
+            return
+        title = str(getattr(target, "title", "") or "The app")
+        name = self.engine.name
+        log.info("%s closed (%.0f s ago); when that app closes: %s", title, closed_for_s, self._resume_action)
+        if self._resume_action == "on" and not self._game_blocked():
+            self._run_worker("hc-toast", _toast_worker, f"{name} is starting",
+                             f"{_short(title, 40)} closed, so {name} is turning back on. No apps were closed for it.")
+            self.turn_on(skip_sweep=True)
+            return
+        self._resume_alert = (time.monotonic(), title)
+        buttons = [(f"Turn on {name}", f"{PROTOCOL}://resume-on")] if config_store.FROZEN and _protocol_registered() \
+            else []
+        self._run_worker("hc-toast", _toast_worker, f"{_short(title, 40)} closed",
+                         f"Turn {name} back on?" + ("" if buttons else " Open Agent Start to turn it on."), buttons)
+
+    def resume_on_requested(self) -> None:
+        """The "closed" toast's button (agentstart://resume-on, via a second launch): the normal Turn on, with its
+        start dialog. An old notification-centre entry only opens the window."""
+        alert = self._resume_alert
+        fresh = alert is not None and time.monotonic() - alert[0] < RESUME_ALERT_VALID_S
+        if not fresh or self.state_name != IDLE or self._game_blocked():
+            log.info("resume toast button: %s; opening the window", "not now" if fresh else "no fresh alert")
+            self.show_window()
+            return
+        self._resume_alert = None
+        self.show_window()
+        self.turn_on()
+
+    def set_resume_action(self, action: str) -> bool:
+        if action not in RESUME_ACTIONS:
+            action = {v: k for k, v in resume_labels(self.engine.name).items()}.get(action, "ask")
+        self._resume_action = action
+        self._save_state_later("resume_action", action)
+        if action == "none":
+            self._cancel_resume()
+        log.info("when that app closes: %s", action)
+        return True
+
+    # ------------------------------------------------------------------ usage history / engine choice
+    def open_history(self) -> Any:
+        """Settings > Usage history: the window, or None when there is no history store."""
+        if self.usage is None:
+            return None
+        import history_dialog
+        return history_dialog.HistoryDialog(self, self.usage)
+
+    def set_backend(self, engine_id: str) -> str | None:
+        """Settings > Engine (only shown with two or more engines): saved to config.json and used from the next
+        start of Agent Start; the running engine, and whatever it serves, stay as they are. Returns the note to
+        show, or None when nothing changed."""
+        names = dict(engines.choices())
+        if engine_id not in names:
+            return "That engine is not installed"
+        running = getattr(self.engine, "id", None)
+        if engine_id == (self._backend_pending or running):
+            return None
+        self._backend_pending = None if engine_id == running else engine_id
+        self._run_worker("hc-backend", _save_backend_worker, engine_id)
+        log.info("engine choice saved: %s (running: %s)", engine_id, running)
+        return None if engine_id == running else f"{names[engine_id]} is used after Agent Start restarts"
 
     # ------------------------------------------------------------------ settings switches
     def set_tray_pref(self, on: bool) -> bool:
@@ -2603,6 +2803,7 @@ class AgentStartApp(ctk.CTk):
     def _settings_switches(self) -> list[dict]:
         frozen = config_store.FROZEN
         labels = action_labels(self.engine.name)
+        rlabels = resume_labels(self.engine.name)
         auto_on = False
         if frozen:
             try:
@@ -2621,6 +2822,9 @@ class AgentStartApp(ctk.CTk):
              "enabled": self._extras},
             {"key": "memory", "label": "When memory runs low", "choices": [labels[a] for a in GAME_ACTIONS],
              "value": labels[self._mem_action], "on_change": self.set_memory_action,
+             "enabled": self._extras},
+            {"key": "resume", "label": "When that app closes", "choices": [rlabels[a] for a in RESUME_ACTIONS],
+             "value": rlabels[self._resume_action], "on_change": self.set_resume_action,
              "enabled": self._extras},
             {"key": "updates", "label": "Check for updates daily" if frozen
              else "Check for updates daily (installed app only)", "value": self.updates.daily,
@@ -2809,6 +3013,17 @@ class AgentStartApp(ctk.CTk):
                 games.stop()
             except Exception:  # noqa: BLE001
                 log.debug("game watcher stop failed", exc_info=True)
+        resume, self.resume = self.resume, None
+        if resume is not None:
+            try:
+                resume.stop()
+            except Exception:  # noqa: BLE001
+                log.debug("resume watcher stop failed", exc_info=True)
+        if self.usage is not None:               # the metrics worker is a daemon: it may not get another turn
+            try:
+                self.usage.flush()
+            except Exception:  # noqa: BLE001
+                log.debug("usage history flush failed", exc_info=True)
         try:
             self.vram.stop()
         except Exception:  # noqa: BLE001
@@ -2901,6 +3116,8 @@ def _check_config() -> None:
 _EVENTS: list = []                               # the named events below, created right after the mutex
 SHOW_EVENT = "AgentStart.Show"                   # a second launch sets it: the running app shows its window
 GAME_OFF_EVENT = "AgentStart.GameOff"            # agentstart://game-off (toast button): turn Strata off for a game
+RESUME_ON_EVENT = "AgentStart.ResumeOn"          # agentstart://resume-on (toast button): turn it back on
+_PROTOCOL_EVENTS = {"game-off": GAME_OFF_EVENT, "resume-on": RESUME_ON_EVENT}
 
 
 def _selftest() -> int:
@@ -2911,6 +3128,9 @@ def _selftest() -> int:
         import autostart  # noqa: F401
         import game_watch  # noqa: F401
         import mem_watch  # noqa: F401
+        import resume_watch  # noqa: F401
+        import usage_history  # noqa: F401
+        import history_dialog  # noqa: F401
         import toasts  # noqa: F401
         import engines.strata  # noqa: F401
         if "strata" not in engines.available():      # discovery imports every engine module of the build
@@ -2950,17 +3170,20 @@ def _watch_show_event(app: "AgentStartApp") -> None:
     try:
         ev = win32event.CreateEvent(None, False, False, SHOW_EVENT)
         game = win32event.CreateEvent(None, False, False, GAME_OFF_EVENT)
+        resume = win32event.CreateEvent(None, False, False, RESUME_ON_EVENT)
     except Exception:  # noqa: BLE001
         log.debug("show event unavailable", exc_info=True)
         return
     while not app._destroyed:
-        r = win32event.WaitForMultipleObjects([ev, game], False, 1000)
+        r = win32event.WaitForMultipleObjects([ev, game, resume], False, 1000)
         if app._destroyed:
             break
         if r == win32event.WAIT_OBJECT_0:
             app.post(app.show_window)
         elif r == win32event.WAIT_OBJECT_0 + 1:
             app.post(app.game_off_requested)
+        elif r == win32event.WAIT_OBJECT_0 + 2:
+            app.post(app.resume_on_requested)
 
 
 def main() -> None:
@@ -2979,7 +3202,7 @@ def main() -> None:
             sys.exit(0)
         action = parse_protocol(sys.argv[1:])
         try:                                         # the running app shows itself (also when hidden in the tray)
-            name = GAME_OFF_EVENT if action == "game-off" else SHOW_EVENT
+            name = _PROTOCOL_EVENTS.get(action or "", SHOW_EVENT)
             ev = win32event.OpenEvent(win32event.EVENT_MODIFY_STATE, False, name)
             win32event.SetEvent(ev)
             sys.exit(0)
@@ -3001,7 +3224,8 @@ def main() -> None:
     global _EVENTS
     try:      # before the window exists: a second launch during our start-up must find them (else it shows a box)
         _EVENTS = [win32event.CreateEvent(None, False, False, SHOW_EVENT),
-                   win32event.CreateEvent(None, False, False, GAME_OFF_EVENT)]
+                   win32event.CreateEvent(None, False, False, GAME_OFF_EVENT),
+                   win32event.CreateEvent(None, False, False, RESUME_ON_EVENT)]
     except Exception:  # noqa: BLE001
         _EVENTS = []
     _setup_logging()

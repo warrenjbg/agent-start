@@ -58,8 +58,8 @@ child server processes in router mode (`is_server_process` is asked about every 
 1. **Port and endpoint in Settings.** The program + arguments boxes save the command only. `port` and
    `endpoint_url` stay as they are in `config.json`; the module's `apply_launcher` should read `--port` from the
    arguments and set both, as Strata's does from its launcher file.
-2. **Choosing the engine.** `backend` is read from `config.json`; there is no control for it in Settings, so
-   switching engines means editing that file. Adding a control is a UI change, separate from adding the module.
+2. **Choosing the engine.** `backend` is read from `config.json`. Settings shows an Engine row once a second
+   engine module is installed; choosing one saves `backend` and takes effect after Agent Start restarts.
 3. **Idle wait without tool-call knowledge.** Pick `idle_grace_s` from real agent runs.
 4. **Unverified facts** to confirm on a real install: the winget install path; whether CTRL_BREAK kills without
    cleanup; what happens to mmapped weights under memory pressure and the `mlock` limits on Windows (relevant to

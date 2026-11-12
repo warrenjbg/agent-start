@@ -37,6 +37,7 @@ class SettingsDialog(ctk.CTkToplevel):
     HEIGHT = 362                                 # with one switch; each further switch adds SWITCH_STEP
     SWITCH_STEP = 34                             # switch 24 px + 10 px gap
     UPDATE_ROW_H = 30                            # the "Check for updates" row under the title (24 px + 6 px gap)
+    ENGINE_ROW_H = 34                            # the "Engine" row (26 px + 8 px gap); only with 2+ engines
     EXT_GLYPH = "\uE8A7"   # Segoe Fluent Icons "Open in new window"
 
     def __init__(self, master, cfg: dict, detector,
@@ -50,11 +51,21 @@ class SettingsDialog(ctk.CTkToplevel):
                  on_update: Callable[[], None] | None = None,
                  switches: list[dict] | None = None,
                  on_check_updates: Callable[[Callable[[str, str | None], bool]], str] | None = None,
-                 can_check_updates: bool = True, engine=None) -> None:
+                 can_check_updates: bool = True, engine=None,
+                 on_history: Callable[[], Any] | None = None,
+                 engine_choices: list[tuple[str, str]] | None = None,
+                 on_engine_change: Callable[[str], str | None] | None = None) -> None:
         """on_check_updates(on_result) adds the "Check for updates" row under the title (none when it is None): it
         starts a check and returns "started" / "joined" (on_result(status, version) follows once, on the Tk thread,
         status "current" | "newer" | "error"; it returns True when the dialog showed it) or "busy" / "unavailable".
         can_check_updates=False (run from source): the button is greyed with the switch's "(installed app only)".
+
+        on_history() opens the usage history window and returns it (a "Usage history…" button next to
+        "Protected apps…"; none when it is None).
+
+        engine_choices: [(engine id, display name)]. With two or more, an "Engine" row is shown;
+        on_engine_change(id) saves the choice and returns the note to show (e.g. when it applies) or None.
+        With one engine (or none given) there is nothing to choose and the row is not built.
 
         switches: more on/off settings under the reopen switch, applied at once (like it):
         {"key", "label", "value": bool, "on_change": callable(bool), "enabled": bool = True}.
@@ -74,12 +85,16 @@ class SettingsDialog(ctk.CTkToplevel):
         self._on_reopen_changed = on_reopen_changed
         self._on_update = on_update
         self._on_check_updates = on_check_updates
+        self._on_history = on_history
+        self._on_engine_change = on_engine_change
+        self._engine_choices = [(str(i), str(n)) for i, n in (engine_choices or [])]
+        self.has_engine_row = len(self._engine_choices) >= 2 and on_engine_change is not None
         self._can_check = bool(can_check_updates)
         self._checking = False
         self._running = bool(running)
         self._closed = False
         self._saving = False
-        self._child: WhitelistModal | None = None
+        self._child: Any = None                      # the protected-apps list or the usage history window
         self._engine = engine if engine is not None else engines.get_engine(cfg)
         self._cfg = cfg
         self._files = self._engine.can(CAP_LAUNCHER_FILES)   # a launcher-file picker, else program + arguments
@@ -93,7 +108,8 @@ class SettingsDialog(ctk.CTkToplevel):
         self.resizable(False, False)
         self._extra_switches = [sw for sw in (switches or []) if isinstance(sw, dict) and sw.get("key")]
         self.logical_height = (self.HEIGHT + self.SWITCH_STEP * len(self._extra_switches)
-                               + (self.UPDATE_ROW_H if on_check_updates is not None else 0))
+                               + (self.UPDATE_ROW_H if on_check_updates is not None else 0)
+                               + (self.ENGINE_ROW_H if self.has_engine_row else 0))
         center_over(self, master, self.WIDTH, self.logical_height)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<Escape>", lambda _e: self.close())
@@ -132,6 +148,25 @@ class SettingsDialog(ctk.CTkToplevel):
                 text_color_disabled=T.TEXT_3, command=self.check_updates,
                 state="normal" if self._can_check else "disabled")
             self._check_btn.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+        # Engine: only when there is a choice (a second engine module is installed)
+        self._engine_var: ctk.StringVar | None = None
+        self._engine_menu: ctk.CTkOptionMenu | None = None
+        if self.has_engine_row:
+            erow = ctk.CTkFrame(head, fg_color="transparent")
+            erow.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            erow.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(erow, text="Engine", font=body, text_color=T.TEXT, anchor="w", height=26).grid(
+                row=0, column=0, sticky="w", padx=(2, 0))
+            names = [n for _i, n in self._engine_choices]
+            current = next((n for i, n in self._engine_choices if i == getattr(self._engine, "id", None)), names[0])
+            self._engine_var = ctk.StringVar(value=current)
+            self._engine_menu = ctk.CTkOptionMenu(
+                erow, values=names, variable=self._engine_var, width=150, height=26, font=body, dropdown_font=body,
+                fg_color=T.RAISED, button_color=T.RAISED, button_hover_color=T.RAISED_HOVER, text_color=T.TEXT,
+                dropdown_fg_color=T.SURFACE, dropdown_hover_color=T.RAISED, dropdown_text_color=T.TEXT,
+                command=self._engine_picked)
+            self._engine_menu.grid(row=0, column=1, sticky="e")
 
         name = self._engine.name
         ctk.CTkLabel(self, text=f"{name} launcher" if self._files else f"{name} program and arguments", anchor="w",
@@ -220,10 +255,20 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkFrame(self, height=1, fg_color=T.HAIRLINE, bg_color=T.HAIRLINE, corner_radius=0).grid(
             row=7, column=0, sticky="ew", padx=12, pady=(10, 10))
 
-        self._protected_btn = ctk.CTkButton(self, text="Protected apps…", height=30, corner_radius=8, font=body,
+        tools = ctk.CTkFrame(self, fg_color="transparent")
+        tools.grid(row=8, column=0, sticky="ew", padx=12)
+        tools.grid_columnconfigure(0, weight=1, uniform="tools")
+        self._protected_btn = ctk.CTkButton(tools, text="Protected apps…", height=30, corner_radius=8, font=body,
                                             fg_color=T.RAISED, hover_color=T.RAISED_HOVER, text_color=T.TEXT,
                                             anchor="w", command=self.open_protected)
-        self._protected_btn.grid(row=8, column=0, sticky="ew", padx=12)
+        self._protected_btn.grid(row=0, column=0, sticky="ew")
+        self._history_btn: ctk.CTkButton | None = None
+        if on_history is not None:
+            tools.grid_columnconfigure(1, weight=1, uniform="tools")
+            self._history_btn = ctk.CTkButton(tools, text="Usage history…", height=30, corner_radius=8, font=body,
+                                              fg_color=T.RAISED, hover_color=T.RAISED_HOVER, text_color=T.TEXT,
+                                              anchor="w", command=self.open_history)
+            self._history_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
         # Reopen the apps closed for Strata after Turn off (also offered in the start dialog). Applies at once.
         self._reopen_var = ctk.BooleanVar(value=bool(reopen_after))
@@ -574,6 +619,41 @@ class SettingsDialog(ctk.CTkToplevel):
             log.debug("grab_release failed", exc_info=True)
         self._child = WhitelistModal(self._app, self._detector, on_saved=self._whitelist_saved)
         self._child.bind("<Destroy>", self._on_child_destroy, add="+")
+
+    def open_history(self) -> None:
+        """The usage history window, as a child like the protected-apps list (it takes the grab)."""
+        if self._saving or self._on_history is None:
+            return
+        if self._child is not None and self._child_alive():
+            self._child.lift()
+            self._child.focus_force()
+            return
+        try:
+            self.grab_release()
+        except Exception:  # noqa: BLE001
+            log.debug("grab_release failed", exc_info=True)
+        try:
+            child = self._on_history()
+        except Exception:  # noqa: BLE001
+            log.exception("usage history could not be opened")
+            child = None
+        if child is None:
+            self._msg.configure(text="Usage history is not available", text_color=T.TEXT_2)
+            return
+        self._child = child
+        child.bind("<Destroy>", self._on_child_destroy, add="+")
+
+    def _engine_picked(self, shown: str) -> None:
+        """Engine row: hand the engine id to the app; show its note (when the change applies)."""
+        eid = next((i for i, n in self._engine_choices if n == shown), None)
+        if eid is None or self._on_engine_change is None:
+            return
+        try:
+            note = self._on_engine_change(eid)
+        except Exception:  # noqa: BLE001
+            log.exception("engine change failed")
+            note = "The engine could not be changed"
+        self._msg.configure(text=str(note or ""), text_color=T.TEXT_2)
 
     def _child_alive(self) -> bool:
         try:

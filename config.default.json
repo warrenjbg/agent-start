@@ -19,6 +19,8 @@
   "mem_watch_evict_pct": 50,
   "mem_watch_evict_sustain_s": 6,
   "mem_watch_evict_app_mb": 512,
+  "resume_confirm_s": 10,
+  "resume_expire_s": 21600,
   "game_dirs": [
     "steamapps",
     "Epic Games",

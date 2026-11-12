@@ -62,12 +62,20 @@ for a game; *Do nothing* switches the check off. It only observes: it never clos
 protected list, system processes and apps that were already open never trigger it, and an app is reported
 once per Strata session. The thresholds are `mem_watch_*` keys in `config.json`.
 
+**When that app closes** (Settings; default *Ask me*): when Agent Start itself turned Strata off for a game or
+for a memory-hungry app (the two rules above), it watches for that game or app to close. It counts as closed once
+it has been gone for about 10 seconds, so a game that restarts through its launcher does not count; the watch gives
+up after 6 hours. *Ask me* shows a toast *ELDEN RING closed* with a **Turn on Strata** button (it works for 30 min).
+*Turn Strata back on* starts Strata by itself, without the start dialog: nothing is closed, so Strata may load in
+Low-RAM mode if other apps hold the memory. *Do nothing* switches it off. Turning Strata on yourself ends the watch.
+It only observes: it never closes anything. The timings are `resume_*` keys in `config.json`.
+
 **Updates:** once a day the app asks GitHub for the latest release (one small request, no data about you). When a
 newer version exists, the idle line says *Update to x.y.z available · click to install*. Click → confirm → it
 downloads the installer from this repo's Releases, checks its size and SHA-256 against what GitHub lists, closes,
 upgrades silently and starts again. A running Strata keeps running. Nothing is downloaded without your click.
 
-Settings and logs live in `%APPDATA%\AgentStart` (`config.json`, `logs\`, `state.json`); the first launch copies
+Settings and logs live in `%APPDATA%\AgentStart` (`config.json`, `logs\`, `state.json`, `usage.json`); the first launch copies
 the bundled default config there. Uninstalling keeps that folder. Upgrading from the earlier name *Hermes
 Controller* replaces it and moves its settings over.
 
@@ -95,7 +103,7 @@ script); the Settings dialog and the log show the same number.
 |---|---|
 | Status line | LED + state + a short summary: Idle (grey) *2 apps to close · 6.8 GB* · Starting (amber) *Loading experts into RAM* + timer · Serving (green) *model* · Low-RAM (amber) · Error (red) *what failed*. While Strata works on a request it shows the model state, like Strata's Monitor: **Reading** (blue) *12% · 10,752 / 87,072* with a thin progress bar under the line, **Generating** (green) *412 tokens · 98.4 tok/s*, **Queued** (amber) *2 waiting*; then back to Serving. Read from `/metrics` once a second while serving (paused while minimised). Click it to show or hide the detail line (remembered) |
 | ⇄ (left of ⚙) | **Switch model**: shown when your Strata folder has two or more `run-*.bat`. Pick one: while idle it becomes the launcher for the next Turn on; while serving, Strata stops and starts again with the new model (the apps closed for the old one stay closed). Disabled while starting/stopping |
-| ⚙ | **Settings**: Strata launcher, the Strata dashboard link + API address, Protected apps, *Reopen closed apps after Turn off* (see below). Disabled while starting/stopping |
+| ⚙ | **Settings**: Strata launcher, the Strata dashboard link + API address, Protected apps, Usage history, *Reopen closed apps after Turn off* (see below). Disabled while starting/stopping |
 | Detail line | Optional: idle = which apps would be closed; serving = *Up 12 min · last reply 85 tok/s*. Always shown when it matters: loading (phase, *usually 0:58*, progress bar), Low-RAM mode, errors (click opens the log), notes such as *Stopped · freed 47 GB*, and the one-click *Reopen …* offer |
 | Button | **Turn on** · **Cancel** (while starting) · **Turn off** |
 | Panels | **Memory** (bar + legend of physical RAM: other apps · Strata · free; "Freed" total for the session), **VRAM**, **Decode**, **Prompt reading** (see Stats). Each has a pin (shown on hover; filled when pinned): pinned panels stay visible while collapsed, in this order. Default: Memory pinned. Nothing pinned = just the status line and the button |
@@ -103,6 +111,8 @@ script); the Settings dialog and the log show the same number.
 
 ## Settings (⚙)
 
+- **Engine** — shown only when a second engine module is installed (Strata is the only one today, so the row is
+  hidden). Choosing another engine saves `backend` in `config.json` and takes effect after Agent Start restarts.
 - **Strata launcher** — a dropdown of every `run-*.bat` in the Strata folder (other `.bat` files such as
   `SETUP.bat` are not listed) plus **Browse…** for a `.bat` anywhere. The line below shows what that launcher
   runs: *model · config file · port*.
@@ -117,9 +127,15 @@ script); the Settings dialog and the log show the same number.
   its settings) in your browser; greyed out with *not running* while Strata is off. Below it the API address
   (`…/v1`) with **Copy**, for pasting into Hermes or other clients.
 - **Protected apps…** — the whitelist: apps that are never offered for closing.
+- **Usage history…** — a window with totals for 7 days, 30 days or all (requests, generated tokens, average tok/s,
+  time served), a bar per day of generated tokens, and a table per day and per model (requests, prompt tokens,
+  generated tokens, average speed, time served). It is kept in `usage.json` in the data folder, on this PC only;
+  nothing is sent anywhere. History starts with the first request after 1.10 is installed, and days older than 400
+  days are dropped. The average speed is weighted by tokens and leaves out very short answers. Prompt tokens count
+  each request's full prompt, so agent turns that re-send the same context count it every time.
 - **Switches** (apply at once): *Reopen closed apps after Turn off* (same as the start dialog's checkbox; off = the
   closed apps are offered as one click instead), *Keep running in the tray*, *Start with Windows*, *When a game
-  starts*, *When memory runs low*, *Check for updates daily*.
+  starts*, *When memory runs low*, *When that app closes*, *Check for updates daily*.
 - **Check for updates** (top right, under the version) — asks GitHub now, whatever the daily switch says, and
   shows the answer next to the button: up to date, a new version (the version label becomes the install link),
   or that GitHub could not be reached. It only checks; installing still asks first. Greyed out when the app
@@ -208,10 +224,11 @@ started*, then *Reopened 3 apps*.
 | `min_ram_mb`, `min_vram_mb`, `min_game_ram_mb` | 250 / 200 / 50 |
 | `game_dirs`, `game_exclude` | Game folders; exe names never treated as games (Wallpaper Engine) |
 | `user_whitelist` | Edited by the ⚙ dialog |
-| `backend` | The inference engine: `strata` (the only one today; a missing or unknown value means `strata`). See `docs/engines.md` |
+| `backend` | The inference engine: `strata` (the only one today; a missing or unknown value means `strata`). Settings shows an Engine row for it once a second engine is installed. See `docs/engines.md` |
 | `mem_watch_app_mb`, `mem_watch_sustain_s` | Memory-pressure check: an app's memory that counts as large (4096), and how long both conditions must hold (15) |
 | `mem_watch_evict_pct`, `mem_watch_evict_sustain_s`, `mem_watch_evict_app_mb` | Pushed-out check: Strata's memory in RAM below this share of its peak (50) for this long (6), and the smallest new app that is named as the cause, in MB (512) |
 | `mem_watch_floor_baseline_pct`, `mem_watch_floor_total_pct` | "Running short" = available memory below the smaller of this share of what was available when Strata became ready (50) and this share of installed RAM (6) |
+| `resume_confirm_s`, `resume_expire_s` | When that app closes: how long the game or app must be gone before it counts as closed (10), and when the watch gives up (21600), in seconds |
 
 To serve another Strata model, pick its `run-*.bat` in ⚙ Settings — no hand-editing needed. `state.json` (next to
 `config.json`) remembers the last cold-load time and whether the stats section is open.
@@ -271,16 +288,20 @@ notification area on a runner). *Local* suites open the real window and take scr
 | `tests\test_updater.py` | CI | GitHub release check + download against a local server: size/SHA-256, redirects, cancel, path checks, installer argv; a throwaway Inno Setup installer when ISCC is present |
 | `tests\test_update_controller.py` | Local | The update flow as its own controller, with a stubbed updater and a fake app: daily check, the manual "Check for updates" (ignores the interval, one request at a time), offer, confirm, download, install hand-off; the Settings button states (one invisible window) |
 | `tests\test_mem_watch.py` | CI | Memory-pressure trigger: the decision function on fake process lists (both conditions, sustain, once per session, protected and system apps, games already reported), config fallbacks, the shared scan |
+| `tests\test_resume_watch.py` | CI | When that app closes: is the game/app still running (fake process lists), the confirm window, gaps and expiry, the watcher with a fake clock and on its own thread, one read-only real snapshot (starts no process) |
 | `tests\test_kill_path.py` | CI | What a stop may kill and when it refuses, on fake processes: kill targets, the launcher cmd.exe, identity, foreign listeners, busy, force |
 | `tests\test_engines.py` | CI | The engine interface: registry and `backend`, the Strata engine's answers, and a fake llama-server-shaped engine driving the supervisor (no unload, no launcher; an engine cannot widen a kill; API key never sent with the identity probe) |
 | `tests\test_metrics_sample.py` | CI | Engine-neutral metrics samples: the Strata converter, old-vs-new store equivalence, a non-Strata sample, the Strata poller with fake fetchers |
+| `tests\test_usage_history.py` | CI | Usage history store: per-day / per-model totals, local midnight, each request counted once (also across an app restart), token-weighted speed, time served, atomic writes, corrupt or unreadable `usage.json`, dropping old days, threads; temp files only |
 | `tests\test_server_manager.py` | CI | Fake Strata on a random port: start/ready/timeout/lazy-load/adopt/busy+force/cancel/foreign-listener/launcher topology/launch from a parsed `.bat` (shows one real toast) |
 | `tests\test_detector.py` | Advisory | Real-system scan + dry run (asserts nothing protected is ever listed), synthetic graph rules, kill test on its own throwaway process only |
 | `tests\test_tray.py` | Advisory | Tray icon on its own thread: status icon, menu + Switch model submenu, balloon clicks, callbacks, no GDI leaks (shows one balloon) |
 | `tests\test_ui_smoke.py` | Local | UI with stub backends, every state, Settings dialog, stats section (100 % and 150 % scaling), screenshots `tests\ui_*.png` |
 | `tests\test_busy_switch.py` | Local | Safe Turn off during a reply (busy dialog / stop when idle) and the quick model switch, stub backends, screenshots `tests\ui_busy_*.png` |
+| `tests\test_history_dialog.py` | Local | The Usage history window (opens one window) |
 | `tests\test_e2e_fake.py` | Local | The real app + real manager/detector/NVML against a fake Strata started from a parsed `.bat`: ON → graphs fill → change launcher → OFF → ON |
 | `tests\test_app_extras.py` | Local | Tool-call-aware safe Turn off, tray wiring, update offer/install flow (stubbed), first-start Strata search, the reopen switch |
+| `tests\test_v110.py` | Local | The 1.10 additions in the app window: When that app closes, Usage history, the Engine row |
 | `tests\run_real_idle.py` | Never | **Real** backends: the real app against your real setup, IDLE only, no clicks, no kills, screenshot |
 | `tests\run_real_onoff.py` | Never | **Real** Strata ON → OFF through the app (only with explicit intent; closes no apps) |
 | `tests\run_installed_onoff.py` | Never | **Real** Strata through the **installed** `AgentStart.exe`, driven with mouse clicks (only with explicit intent) |

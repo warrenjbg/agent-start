@@ -21,8 +21,10 @@ an `Engine` object from `engines/`, chosen by the `backend` key in `config.json`
 
 That is all: the registry imports every module in `engines/` and registers each `Engine` subclass under its `id`,
 `AgentStart.spec` collects the whole package, and `--selftest` loads it. Nothing in `server_manager.py`,
-`detector.py`, `main.py` or the dialogs needs to change. The user selects the engine with `backend` in
-`config.json`; there is no control for it in Settings yet.
+`detector.py`, `main.py` or the dialogs needs to change. The engine is the `backend` key in `config.json`.
+
+Settings shows an **Engine** row once two or more engines are installed (with Strata alone it is hidden). Choosing
+an engine there saves `backend`; the choice takes effect after Agent Start restarts.
 
 Not yet proven on a frozen build: the package-wide collection in the spec and the registry's discovery inside the
 packaged app. The first build after this change must run `--selftest`.

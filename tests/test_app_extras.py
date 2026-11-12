@@ -739,7 +739,7 @@ def test_settings_switches() -> None:
         pump(app, 0.4)
         d = app.dialog
         keys = list(getattr(d, "switches", {}))
-        check(keys == ["reopen", "tray", "autostart", "games", "memory", "updates"], f"Settings switches ({keys})")
+        check(keys == ["reopen", "tray", "autostart", "games", "memory", "resume", "updates"], f"Settings switches ({keys})")
         U.shot(d, "extras_settings_switches")
         if "tray" in keys:
             check(d.switches["tray"][0].get() is True, "tray switch on")

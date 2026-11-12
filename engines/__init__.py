@@ -54,6 +54,17 @@ def available() -> list[str]:
     return sorted(_FACTORIES)
 
 
+def choices() -> list[tuple[str, str]]:
+    """(id, display name) of every available engine, for the Settings "Engine" row."""
+    out: list[tuple[str, str]] = []
+    for eid in available():
+        try:
+            out.append((eid, str(_FACTORIES[eid]().name)))
+        except Exception:  # noqa: BLE001 - a broken engine is not offered
+            log.exception("engine %s could not be created", eid)
+    return out
+
+
 def backend_of(cfg: Mapping[str, Any] | None) -> str:
     """The configured backend id; a missing, empty or non-text value means the default (configs written before
     the key existed keep working)."""
