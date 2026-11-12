@@ -369,11 +369,18 @@ class HermesControllerApp(ctk.CTk):
                                     text_color_disabled=T.TEXT_3)
         self.toggle.grid(row=3, column=0, pady=(GAP_HEAD_BUTTON, 0))
 
-        card = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=T.R_CARD)
+        # Two cards: pinned panels (always shown) and the rest (shown while expanded). The panels are children of
+        # the window, gridded into whichever card they belong to (grid in_=), so a pin moves them between cards.
+        # The cards are created first so the panels stack above them.
+        self.pin_card = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=T.R_CARD)
+        self.more_card = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=T.R_CARD)
+        for c in (self.pin_card, self.more_card):
+            c.grid_columnconfigure(0, weight=1)
+        card = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=0)
         card.grid_columnconfigure(0, weight=1)
-        self.mem_card = card
+        self.mem_card = card                     # the Memory panel
         head = ctk.CTkFrame(card, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
+        head.grid(row=0, column=0, sticky="ew", pady=(10, 6))     # the card's 12 px inset comes from the panel
         head.grid_columnconfigure(0, weight=1)
         self.mem_title = ctk.CTkLabel(head, text="Memory", font=self._font(12), text_color=T.TEXT_2,
                                       anchor="w", height=16)
@@ -384,13 +391,13 @@ class HermesControllerApp(ctk.CTk):
         self._add_pin(head, "memory", column=2)
 
         self.gauge = ctk.CTkFrame(card, height=8, corner_radius=4, fg_color=T.RAISED)
-        self.gauge.grid(row=1, column=0, sticky="ew", padx=12)
+        self.gauge.grid(row=1, column=0, sticky="ew")
         self.gauge.grid_propagate(False)
         self._seg_apps = ctk.CTkFrame(self.gauge, height=8, corner_radius=4, fg_color=T.APPS_SEG)
         self._seg_strata = ctk.CTkFrame(self.gauge, height=8, corner_radius=4, fg_color=T.ACCENT)
 
         legend = ctk.CTkFrame(card, fg_color="transparent")
-        legend.grid(row=2, column=0, sticky="ew", padx=12, pady=(8, 10))
+        legend.grid(row=2, column=0, sticky="ew", pady=(8, 10))
         self.legend = {}
         for col, (key, color, label) in enumerate((("apps", T.APPS_SEG, "Apps"), ("strata", T.ACCENT, "Strata"),
                                                    ("free", T.RAISED, "Free"))):
@@ -402,16 +409,16 @@ class HermesControllerApp(ctk.CTk):
             lbl.grid(row=0, column=1)
             self.legend[key] = (lbl, label)
 
-        # Stats section (gridded only while expanded): one card, three rows split by hairlines.
-        self.stats = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=T.R_CARD, height=STATS_H)
-        self.stats.grid_propagate(False)
-        self.stats.grid_columnconfigure(0, weight=1)
-        self.row_vram = StatRow(self.stats, "VRAM · 5 min", lambda m: LineGraph(m, window_s=self.vram.window_s))
-        self.row_decode = StatRow(self.stats, "Decode · per request", BarGraph)
-        self.row_prompt = StatRow(self.stats, "Prompt reading · per request", BarGraph)
+        # Graph panels
+        self.row_vram = StatRow(self, "VRAM · 5 min", lambda m: LineGraph(m, window_s=self.vram.window_s),
+                                fg_color=T.SURFACE)
+        self.row_decode = StatRow(self, "Decode · per request", BarGraph, fg_color=T.SURFACE)
+        self.row_prompt = StatRow(self, "Prompt reading · per request", BarGraph, fg_color=T.SURFACE)
         self._rows = {"vram": self.row_vram, "decode": self.row_decode, "prompt": self.row_prompt}
-        self._hairs = [ctk.CTkFrame(self.stats, height=1, fg_color=T.HAIRLINE, bg_color=T.HAIRLINE, corner_radius=0)
-                       for _ in range(2)]
+        # hairlines between panels: up to 3 per card
+        self._hairs = {c: [ctk.CTkFrame(self, height=1, fg_color=T.HAIRLINE, bg_color=T.HAIRLINE, corner_radius=0)
+                           for _ in range(len(PANELS) - 1)] for c in ("pin", "more")}
+        self.stats = self.more_card              # the card that the expand bar opens
         for key, row in self._rows.items():
             self._add_pin(row.head_frame(), key, column=3)
         self._panel_frames = {"memory": self.mem_card, **self._rows}
@@ -883,31 +890,34 @@ class HermesControllerApp(ctk.CTk):
         return any(p in self._visible_panels() for p in ("vram", "decode", "prompt"))
 
     def _apply_expanded(self) -> None:
-        """Lay out the panels: pinned ones always, the rest while expanded; the bottom bar toggles between the two.
+        """Lay out the panels: pinned ones in the first card (always shown), the others in the second card (shown
+        while expanded), each in PANELS order and split by hairlines; the bottom bar toggles the second card.
         The window grows / shrinks downward to fit."""
-        vis = self._visible_panels()
         everything_pinned = all(p in self.pinned for p in PANELS)
         self.chevron.configure(text=T.CHEVRON_UP if self.expanded else T.CHEVRON_DOWN)
-        top = CARD_TOP
-        if "memory" in vis:
-            self.mem_card.grid(row=4, column=0, sticky="ew", padx=16, pady=(top, 0))  # .grid() is DPI-scaled
-            top = STATS_GAP
-        else:
-            self.mem_card.grid_remove()
-        rows = [k for k in ("vram", "decode", "prompt") if k in vis]
-        if rows:
-            for h in self._hairs:
+        frames = self._panel_frames
+        for f in frames.values():
+            f.grid_remove()
+        for hs in self._hairs.values():
+            for h in hs:
                 h.grid_remove()
-            for k, row in self._rows.items():
-                row.grid_remove()
-            for i, k in enumerate(rows):
+        groups = (("pin", self.pin_card, [p for p in PANELS if p in self.pinned]),
+                  ("more", self.more_card, [p for p in PANELS if p not in self.pinned] if self.expanded else []))
+        top = CARD_TOP
+        for row_no, (name, card, keys) in enumerate(groups, start=4):
+            if not keys:
+                card.grid_remove()
+                continue
+            for i, k in enumerate(keys):
                 if i:
-                    self._hairs[i - 1].grid(row=2 * i - 1, column=0, sticky="ew", padx=12)
-                self._rows[k].grid(row=2 * i, column=0, sticky="ew", padx=12)
-            self.stats.configure(height=len(rows) * 82 + len(rows) - 1)
-            self.stats.grid(row=5, column=0, sticky="ew", padx=16, pady=(top, 0))
-        else:
-            self.stats.grid_remove()
+                    self._hairs[name][i - 1].grid(in_=card, row=2 * i - 1, column=0, sticky="ew", padx=12)
+                frames[k].grid(in_=card, row=2 * i, column=0, sticky="ew", padx=12)
+                frames[k].lift()
+            card.grid(row=row_no, column=0, sticky="ew", padx=16, pady=(top, 0))   # .grid() is DPI-scaled
+            top = STATS_GAP
+        for hs in self._hairs.values():
+            for h in hs:
+                h.lift()
         if everything_pinned:
             self.chevron.grid_remove()
             self._bottom_pad.grid(row=6, column=0, pady=(0, 16 - 1))
@@ -919,7 +929,7 @@ class HermesControllerApp(ctk.CTk):
         self._fit_height(force=True)
         if self.expanded:
             self._keep_on_screen()
-        if rows:
+        if self._graphs_shown():
             self._refresh_stats()
             if self._stats_id is None and not self._destroyed:
                 self._stats_id = self.after(STATS_MS, self._stats_tick)

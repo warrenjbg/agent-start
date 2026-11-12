@@ -366,15 +366,24 @@ def expected_h(app) -> int:
     status + button, optional detail / progress, the visible panels (pinned, or all while expanded), the bar."""
     h = main.BASE_H + (main.DETAIL_H if detail_shown(app) else 0)
     h += main.PROGRESS_H if app.progress.winfo_manager() == "grid" else 0
-    vis = list(main.PANELS) if app.expanded else [p for p in main.PANELS if p in app.pinned]
+    groups = ([p for p in main.PANELS if p in app.pinned],
+              [p for p in main.PANELS if p not in app.pinned] if app.expanded else [])
     first = True
-    if "memory" in vis:
-        h += main.CARD_TOP + main.MEM_CARD_H
-        first = False
-    rows = sum(1 for p in ("vram", "decode", "prompt") if p in vis)
-    if rows:
-        h += (main.CARD_TOP if first else main.STATS_GAP) + rows * 82 + rows - 1
+    for keys in groups:
+        if keys:
+            h += (main.CARD_TOP if first else main.STATS_GAP) + len(keys) - 1
+            h += sum(main.MEM_CARD_H if k == "memory" else 82 for k in keys)
+            first = False
     return h + (16 if all(p in app.pinned for p in main.PANELS) else main.BAR_BLOCK)
+
+
+def card_of(app, key: str):
+    """The card a panel is gridded into (pinned card / more card), or None when hidden."""
+    f = {"memory": app.mem_card, "vram": app.row_vram, "decode": app.row_decode, "prompt": app.row_prompt}[key]
+    if not f.winfo_manager():
+        return None
+    inn = str(f.grid_info().get("in"))
+    return {str(app.pin_card): "pin", str(app.more_card): "more"}.get(inn, inn)
 
 
 def pill(app):
@@ -1130,32 +1139,45 @@ def test_pins(app, det, ep) -> None:
     # pin decode, collapse: memory + decode stay
     app._pin_btns["decode"].invoke(); pump(app, 0.2)
     app.chevron.invoke(); pump(app, 0.4)
-    vis = (app.mem_card.winfo_ismapped(), app.row_vram.winfo_ismapped(), app.row_decode.winfo_ismapped(),
-           app.row_prompt.winfo_ismapped())
-    check(not app.expanded and vis == (True, False, True, False), f"collapsed shows memory + decode ({vis})")
+    cards = {k: card_of(app, k) for k in main.PANELS}
+    check(not app.expanded and cards == {"memory": "pin", "vram": None, "decode": "pin", "prompt": None}
+          and not app.more_card.winfo_ismapped(), f"collapsed: memory + decode share the pinned card ({cards})")
     check(abs(app.winfo_height() - expected_h(app) * scale) <= 2, f"height fits ({app.winfo_height()} vs {expected_h(app)})")
-    check(app.stats.winfo_height() <= 84 * scale, f"graph card holds one row ({app.stats.winfo_height()})")
+    ph = app.pin_card.winfo_height()
+    check(abs(ph - (main.MEM_CARD_H + 1 + 82) * scale) <= 3, f"pinned card = memory + hairline + one graph ({ph})")
+    check(app.row_decode.winfo_rooty() >= app.mem_card.winfo_rooty() + app.mem_card.winfo_height(),
+          "decode below memory inside the card")
     shot(app, "pins_memory_decode")
+    app.chevron.invoke(); pump(app, 0.4)
+    cards = {k: card_of(app, k) for k in main.PANELS}
+    check(cards == {"memory": "pin", "vram": "more", "decode": "pin", "prompt": "more"},
+          f"expanded: unpinned VRAM + prompt in the second card ({cards})")
+    gap = app.more_card.winfo_rooty() - (app.pin_card.winfo_rooty() + app.pin_card.winfo_height())
+    check(abs(gap - main.STATS_GAP * scale) <= 2 and abs(app.winfo_height() - expected_h(app) * scale) <= 2,
+          f"cards {main.STATS_GAP} px apart, height fits ({gap}, {app.winfo_height()} vs {expected_h(app)})")
+    shot(app, "pins_memory_decode_expanded")
+    app.chevron.invoke(); pump(app, 0.3)
     check(pump_until(app, lambda: load_state_file().get("pinned") == ["memory", "decode"], 3), "pins saved")
     # unpin everything: compact look
     app._pin_btns["memory"].invoke(); app._pin_btns["decode"].invoke(); pump(app, 0.4)
-    check(app.pinned == [] and not app.mem_card.winfo_ismapped() and not app.stats.winfo_ismapped()
-          and app.chevron.winfo_ismapped(), "nothing pinned: no panels, only the bar")
+    check(app.pinned == [] and not app.mem_card.winfo_ismapped() and not app.pin_card.winfo_ismapped()
+          and not app.more_card.winfo_ismapped() and app.chevron.winfo_ismapped(), "nothing pinned: no panels, only the bar")
     check(abs(app.winfo_height() - (main.BASE_H + main.BAR_BLOCK) * scale) <= 2,
           f"compact height {app.winfo_height()} == {main.BASE_H + main.BAR_BLOCK}")
     gap = app.chevron.winfo_rooty() - (app.toggle.winfo_rooty() + app.toggle.winfo_height())
     check(0 <= gap <= 8 * scale, f"bar right under the button ({gap})")
     shot(app, "pins_none")
     app.chevron.invoke(); pump(app, 0.4)
-    check(app.expanded and all(f.winfo_ismapped() for f in (app.mem_card, app.row_vram, app.row_decode, app.row_prompt)),
-          "bar expands to every panel")
-    gap = app.mem_card.winfo_rooty() - (app.toggle.winfo_rooty() + app.toggle.winfo_height())
+    check(app.expanded and all(card_of(app, k) == "more" for k in main.PANELS) and not app.pin_card.winfo_ismapped(),
+          "bar expands to every panel, all in one card")
+    shot(app, "pins_none_expanded")
+    gap = app.more_card.winfo_rooty() - (app.toggle.winfo_rooty() + app.toggle.winfo_height())
     check(abs(gap - main.CARD_TOP * scale) <= 2, f"memory card {main.CARD_TOP} px under the button ({gap})")
     app.chevron.invoke(); pump(app, 0.3)
     # pin a graph alone: it takes the first slot, CARD_TOP under the button
     app._pin_btns["vram"].invoke(); pump(app, 0.4)
-    gap = app.stats.winfo_rooty() - (app.toggle.winfo_rooty() + app.toggle.winfo_height())
-    check(app.stats.winfo_ismapped() and not app.mem_card.winfo_ismapped() and abs(gap - main.CARD_TOP * scale) <= 2,
+    gap = app.pin_card.winfo_rooty() - (app.toggle.winfo_rooty() + app.toggle.winfo_height())
+    check(card_of(app, "vram") == "pin" and not app.mem_card.winfo_ismapped() and abs(gap - main.CARD_TOP * scale) <= 2,
           f"VRAM alone sits where memory was ({gap})")
     shot(app, "pins_vram")
     # everything pinned: no bar, 16 px margin
@@ -1164,8 +1186,10 @@ def test_pins(app, det, ep) -> None:
     pump(app, 0.4)
     check(not app.chevron.winfo_ismapped() and abs(app.winfo_height() - expected_h(app) * scale) <= 2,
           f"all pinned: no bar ({app.winfo_height()} vs {expected_h(app)})")
-    check(abs((app.winfo_rooty() + app.winfo_height()) - (app.stats.winfo_rooty() + app.stats.winfo_height())
-              - 16 * scale) <= 4, "all pinned: 16 px bottom margin")
+    check(abs((app.winfo_rooty() + app.winfo_height()) - (app.pin_card.winfo_rooty() + app.pin_card.winfo_height())
+              - 16 * scale) <= 4 and all(card_of(app, k) == "pin" for k in main.PANELS),
+          "all pinned: one card, 16 px bottom margin")
+    shot(app, "pins_all")
     # back to the default for later tests
     for k in ("vram", "decode", "prompt"):
         app._pin_btns[k].invoke()
@@ -1258,7 +1282,9 @@ def check_stats_fit(app, label: str) -> None:
     scale = ctk.ScalingTracker.get_window_scaling(app)
     wscale = ctk.ScalingTracker.get_widget_scaling(app)
     w, h = app.winfo_width(), app.winfo_height()
-    check(abs(w - 360 * scale) <= 2 and abs(h - expected_h(app) * scale) <= 2,
+    # the window takes its content's requested height; at 150 % each of the ~8 stacked rows rounds on its own
+    tol = 2 if scale == 1 else 5
+    check(abs(w - 360 * scale) <= 2 and abs(h - expected_h(app) * scale) <= tol,
           f"{label}: expanded window {w}x{h} != 360x{expected_h(app)}*{scale}")
     bottom = app.winfo_rooty() + h
     card_bottom = app.stats.winfo_rooty() + app.stats.winfo_height()
@@ -1303,7 +1329,7 @@ def test_stats_section(app, det, ep) -> None:
     check(vram.started == 1, "VRAM sampler started with the app")
     cx = app.chevron.winfo_rootx() + app.chevron.winfo_width()
     card_bottom = app.mem_card.winfo_rooty() + app.mem_card.winfo_height()
-    check(cx <= app.mem_card.winfo_rootx() + app.mem_card.winfo_width() + 1 and app.chevron.winfo_rooty() >= card_bottom
+    check(cx <= app.pin_card.winfo_rootx() + app.pin_card.winfo_width() + 1 and app.chevron.winfo_rooty() >= card_bottom
           and app.pinned == ["memory"] and app._pin_btns["memory"].cget("text") == main.PINNED_GLYPH,
           "default: memory pinned, expand bar under it")
     pump(app, 2.6)

@@ -247,8 +247,8 @@ class StatRow(ctk.CTkFrame):
     the rounded corners of the card it sits in.
     """
 
-    def __init__(self, master, title: str, graph_factory) -> None:
-        super().__init__(master, fg_color="transparent", height=ROW_H, corner_radius=0)
+    def __init__(self, master, title: str, graph_factory, fg_color: str = "transparent") -> None:
+        super().__init__(master, fg_color=fg_color, height=ROW_H, corner_radius=0)
         self.grid_propagate(False)
         self.grid_columnconfigure(0, weight=1)
         ui = ctk.CTkFont(family=T.ui_family(), size=12)
