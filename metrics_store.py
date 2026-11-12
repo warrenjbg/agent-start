@@ -249,3 +249,26 @@ def fetch_metrics(root_url: str, timeout: float = FETCH_TIMEOUT_S, all_requests:
         log.debug("GET %s failed: %s", url, exc)
         return None
     return data if isinstance(data, dict) else None
+
+
+def fetch_status(root_url: str, timeout: float = FETCH_TIMEOUT_S) -> dict | None:
+    """GET <root>/status as JSON, or None on any failure (401 with an API key, timeouts, ...). Worker threads only.
+
+    Strata 0.2.10 (serve/server.py, `path == "/status"`): what the model is doing. While idle (non-parallel mode) it
+    still holds the LAST request's final `phase` ("answering", "thinking", "tool call complete", "writing a tool
+    call: <name>") - how that request ended, which tells whether an agent will send another one.
+    """
+    url = str(root_url).rstrip("/") + "/status"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+        with _OPENER.open(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            raw = resp.read(64 * 1024 + 1)
+        if len(raw) > 64 * 1024:
+            return None
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("GET %s failed: %s", url, exc)
+        return None
+    return data if isinstance(data, dict) else None

@@ -24,14 +24,18 @@ NO_LAUNCHERS = "No run-*.bat found"
 
 class SettingsDialog(ctk.CTkToplevel):
     WIDTH = 340
-    HEIGHT = 326
+    HEIGHT = 362
     EXT_GLYPH = "\uE8A7"   # Segoe Fluent Icons "Open in new window"
 
     def __init__(self, master, cfg: dict, detector,
                  on_save: Callable[[LauncherInfo, Callable[[str | None], None]], None],
                  on_closed: Callable[[], None] | None = None,
                  current_bat: str | None = None, running: bool = False,
-                 on_whitelist_saved: Callable[[], None] | None = None) -> None:
+                 on_whitelist_saved: Callable[[], None] | None = None,
+                 reopen_after: bool | None = None,
+                 on_reopen_changed: Callable[[bool], None] | None = None,
+                 update_version: str | None = None,
+                 on_update: Callable[[], None] | None = None) -> None:
         """on_save(info, done) persists the launcher and calls done(error | None) on the Tk thread.
 
         current_bat overrides the configured launcher (a saved change that is waiting for the next start);
@@ -44,6 +48,8 @@ class SettingsDialog(ctk.CTkToplevel):
         self._on_save = on_save
         self._on_closed = on_closed
         self._on_whitelist_saved = on_whitelist_saved
+        self._on_reopen_changed = on_reopen_changed
+        self._on_update = on_update
         self._running = bool(running)
         self._closed = False
         self._saving = False
@@ -70,8 +76,17 @@ class SettingsDialog(ctk.CTkToplevel):
         head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(head, text="Settings", anchor="w", height=20,
                      font=ctk.CTkFont(family=T.ui_family(), size=14, weight="bold")).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(head, text=f"v{__version__}", anchor="e", height=20, font=mono,
-                     text_color=T.TEXT_3).grid(row=0, column=1, sticky="e")
+        if update_version and on_update is not None:     # a newer release: the version label becomes the way in
+            self._update_link = ctk.CTkLabel(head, text=f"v{__version__} · Update to {update_version}", anchor="e",
+                                             height=20, font=ctk.CTkFont(family=T.ui_family(), size=12,
+                                                                         underline=True),
+                                             text_color=T.ACCENT, cursor="hand2")
+            self._update_link.grid(row=0, column=1, sticky="e")
+            self._update_link.bind("<Button-1>", lambda _e: self._update_clicked())
+        else:
+            self._update_link = None
+            ctk.CTkLabel(head, text=f"v{__version__}", anchor="e", height=20, font=mono,
+                         text_color=T.TEXT_3).grid(row=0, column=1, sticky="e")
 
         ctk.CTkLabel(self, text="Strata launcher", anchor="w", text_color=T.TEXT_2, font=small,
                      height=16).grid(row=1, column=0, sticky="ew", padx=12, pady=(8, 4))
@@ -144,11 +159,20 @@ class SettingsDialog(ctk.CTkToplevel):
                                             anchor="w", command=self.open_protected)
         self._protected_btn.grid(row=8, column=0, sticky="ew", padx=12)
 
+        # Reopen the apps closed for Strata after Turn off (also offered in the start dialog). Applies at once.
+        self._reopen_var = ctk.BooleanVar(value=bool(reopen_after))
+        self._reopen_switch = ctk.CTkSwitch(self, text="Reopen closed apps after Turn off", variable=self._reopen_var,
+                                            font=body, text_color=T.TEXT, progress_color=T.ACCENT,
+                                            button_color=T.TEXT, button_hover_color=T.PRIMARY_HOVER,
+                                            fg_color=T.RAISED, switch_width=34, switch_height=18,
+                                            command=self._reopen_toggled)
+        self._reopen_switch.grid(row=9, column=0, sticky="w", padx=12, pady=(10, 0))
+
         self._msg = ctk.CTkLabel(self, text="", anchor="w", text_color=T.TEXT_2, font=small, height=16)
-        self._msg.grid(row=9, column=0, sticky="ew", padx=12, pady=(8, 2))
+        self._msg.grid(row=10, column=0, sticky="ew", padx=12, pady=(8, 2))
 
         btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=10, column=0, sticky="ew", padx=12, pady=(0, 12))
+        btns.grid(row=11, column=0, sticky="ew", padx=12, pady=(0, 12))
         btns.grid_columnconfigure((0, 1), weight=1, uniform="b")
         self._cancel_btn = ctk.CTkButton(btns, text="Cancel", height=30, fg_color="transparent", border_width=1,
                                          border_color=T.RAISED_HOVER, hover_color=T.RAISED, command=self.close)
@@ -287,6 +311,21 @@ class SettingsDialog(ctk.CTkToplevel):
             self.choose(path)
 
     # ------------------------------------------------------------------ protected apps (nested modal)
+    def _update_clicked(self) -> None:
+        cb = self._on_update
+        if cb is None:
+            return
+        master = self.master
+        self.close()                             # the confirmation box belongs to the main window
+        master.after(50, cb)
+
+    def _reopen_toggled(self) -> None:
+        if self._on_reopen_changed is not None:
+            try:
+                self._on_reopen_changed(bool(self._reopen_var.get()))
+            except Exception:  # noqa: BLE001
+                log.exception("reopen setting callback failed")
+
     def open_protected(self) -> None:
         if self._saving:
             return

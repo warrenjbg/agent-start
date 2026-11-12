@@ -242,16 +242,21 @@ def test_busy_dialog_decisions() -> None:
             check(not app._dialog_open() and pending(app) is None, "now: dialog closed, nothing pending")
             check(finish_stop(app, ep) and app.state_name == "IDLE", "forced stop -> IDLE")
             settle_reopen(app)
-        # ---- idle (direct): the model finished while the dialog was open -> a normal stop, right away
+        # ---- idle (direct): the model finished while the dialog was open -> pending, a normal stop after the
+        # idle grace (v1.7: never instantly - an agent may send its next request within seconds)
         serving(app, ep)
         go_busy(app, "generating")
         n = len(ep.stop_calls)
         dlg = press_busy_toggle(app, ep)
         if dlg is not None:
+            app._fetch_metrics.live = "idle"
             dlg.update_activity(None)
             pump(app, 0.1)
-            check(len(ep.stop_calls) == n + 1 and app.state_name == "STOPPING" and not app._dialog_open(),
-                  f"decision 'idle': stops right away ({app.state_name}, stops +{len(ep.stop_calls) - n})")
+            check(len(ep.stop_calls) == n and not app._dialog_open() and pending(app) is not None,
+                  f"decision 'idle': pending, not instant ({app.state_name}, stops +{len(ep.stop_calls) - n})")
+            pump_until(app, lambda: len(ep.stop_calls) > n, main.IDLE_GRACE_S + 4)
+            check(len(ep.stop_calls) == n + 1 and app.state_name == "STOPPING",
+                  f"decision 'idle': stops after the grace ({app.state_name}, stops +{len(ep.stop_calls) - n})")
             check(ep.stop_calls[n:] and ep.stop_calls[-1][1] is False, "decision 'idle': a normal (unforced) stop")
             if app.state_name == "STOPPING":
                 finish_stop(app, ep)

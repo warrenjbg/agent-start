@@ -11,6 +11,14 @@ serve\server.py (no -c / -m / other scripts), exactly one unconditional launch l
 jump (goto / call :label) before it or launch inside if / for / ( ) blocks are refused with a LauncherError.
 
 All functions are pure apart from reading the .bat / config file (and a PATH lookup for a bare `python`).
+
+safe=True (parse_bat / parse_bat_text / missing_files / model_name_for, keyword-only) is for .bat files Agent Start
+did NOT get from the user (the automatic first-start search). Before ANY filesystem access it rejects, with a
+LauncherError, a launcher whose .bat / cwd / interpreter / server.py / --config / any path-like argv element is a
+UNC path (\\host\share, //host/share), a \\?\ / \\.\ / \??\ device path, a reserved device name, or not on a
+local fixed drive (GetDriveTypeW == DRIVE_FIXED); --config must end in .json and be <= 1 MB (stat before open);
+the PATH lookup for a bare `python` only looks in local fixed-drive directories. safe=False (the default, used by
+Settings) behaves exactly as before.
 """
 from __future__ import annotations
 
@@ -19,10 +27,13 @@ import json
 import os
 import re
 import shutil
+import stat as _stat
 from dataclasses import dataclass
 
 DEFAULT_PORT = 8080
 MAX_BAT_BYTES = 256 * 1024
+MAX_CONFIG_BYTES = 1024 * 1024            # safe mode: a larger --config is refused (never opened)
+DRIVE_FIXED = 3                           # GetDriveTypeW
 # config.json keys derived from the chosen launcher (written together, applied together)
 LAUNCHER_KEYS = ("launcher_bat", "launch_cmd", "launch_cwd", "strata_dir", "port", "endpoint_url", "model_name")
 
@@ -50,6 +61,74 @@ _PY_VERSION_RE = re.compile(r"-(?:[23](?:\.\d+)?(?:-(?:32|64))?|V:\S+)")   # py.
 
 class LauncherError(ValueError):
     """The .bat cannot be used as a Strata launcher; str(exc) is a short message for the Settings dialog."""
+
+
+# ------------------------------------------------------------------------------------------- safe-mode paths
+_RESERVED_RE = re.compile(r"(?:con|prn|aux|nul|clock\$|conin\$|conout\$|com[0-9\u00b9\u00b2\u00b3]|"
+                          r"lpt[0-9\u00b9\u00b2\u00b3])", re.IGNORECASE)
+_LOCAL_ABS_RE = re.compile(r"[A-Za-z]:\\")
+_DRIVE_PREFIX_RE = re.compile(r"[A-Za-z]:(?!:)")          # D:\x, D:x - but not a `-W d::Warning` action
+_FILE_ATTRIBUTE_OFFLINE = 0x1000
+_FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+CLOUD_ATTRS = _FILE_ATTRIBUTE_OFFLINE | _FILE_ATTRIBUTE_RECALL_ON_OPEN | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
+
+def drive_is_fixed(letter: str) -> bool:
+    """GetDriveTypeW("X:\\") == DRIVE_FIXED (no disk / network I/O). False off Windows or on any error."""
+    if len(letter) != 1 or not letter.isascii() or not letter.isalpha():
+        return False
+    try:
+        import ctypes
+        return ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(f"{letter.upper()}:\\")) == DRIVE_FIXED
+    except Exception:
+        return False
+
+
+def unsafe_path_reason(path) -> str | None:
+    """Why `path` must not be touched by an automatic scan, or None when it is an absolute path on a local fixed
+    drive. String checks + GetDriveTypeW only: never touches the path itself."""
+    p = str(path or "")
+    if not p:
+        return "empty path"
+    s = p.replace("/", "\\")
+    if "\0" in s:
+        return "invalid path"
+    if s.startswith("\\\\") or s.startswith("\\??\\"):
+        return "network (UNC) or device path"
+    if not _LOCAL_ABS_RE.match(s):
+        return "not an absolute path on a local drive"
+    tail = s[3:]
+    if any(c in tail for c in ':?*"<>|'):
+        return "device, stream or wildcard path"
+    for part in tail.split("\\"):
+        if _RESERVED_RE.fullmatch(part.split(".")[0].rstrip(" ")):
+            return "reserved device name"
+    if not drive_is_fixed(s[0]):
+        return "not on a local fixed drive"
+    return None
+
+
+def is_local_fixed_path(path) -> bool:
+    return unsafe_path_reason(path) is None
+
+
+def _require_safe(path: str, what: str) -> None:
+    reason = unsafe_path_reason(path)
+    if reason:
+        raise LauncherError(f"{what} rejected ({reason}): {path}")
+
+
+def _require_safe_token(tok: str, bat_name: str) -> None:
+    """A free argv element: refuse UNC / device paths and drive paths that are not on a local fixed drive."""
+    for cand in (tok, tok.split("=", 1)[1] if "=" in tok else None):
+        if not cand:
+            continue
+        c = cand.strip('"').replace("/", "\\")
+        if c.startswith("\\\\") or c.startswith("\\??\\"):
+            raise LauncherError(f"{bat_name}: argument rejected (network (UNC) or device path): {tok}")
+        if _DRIVE_PREFIX_RE.match(c) and not drive_is_fixed(c[0]):
+            raise LauncherError(f"{bat_name}: argument rejected (not on a local fixed drive): {tok}")
 
 
 @dataclass(frozen=True)
@@ -313,11 +392,16 @@ def _shim_error(path: str) -> LauncherError:
     return LauncherError(f"The launcher must run python.exe directly, not a .bat/.cmd shim: {path}")
 
 
-def _resolve_interpreter(tok: str, cwd: str) -> str:
-    """Absolute path of the interpreter, always ending in .exe (Popen would run a .bat/.cmd through cmd.exe)."""
+def _resolve_interpreter(tok: str, cwd: str, *, safe: bool = False) -> str:
+    """Absolute path of the interpreter, always ending in .exe (Popen would run a .bat/.cmd through cmd.exe).
+
+    safe: the path / cwd are checked first (LauncherError, nothing touched) and PATH entries that are not on a local
+    fixed drive are ignored."""
     has_exe = tok.lower().endswith(".exe")
     if os.path.isabs(tok) or "\\" in tok or "/" in tok:
         full = _abs(tok, cwd)
+        if safe:
+            _require_safe(full, "Python")
         if has_exe:
             return full
         if not os.path.isfile(full + ".exe"):
@@ -327,6 +411,8 @@ def _resolve_interpreter(tok: str, cwd: str) -> str:
         return full + ".exe"
     exe = tok if has_exe else tok + ".exe"
     local = os.path.normpath(os.path.join(cwd, exe))
+    if safe:
+        return _resolve_bare_safe(tok, exe, has_exe, cwd, local)
     if os.path.isfile(local):                     # cmd looks in the current directory first
         return local
     for d in os.environ.get("PATH", "").split(os.pathsep):    # then PATH - for <name>.exe only
@@ -338,6 +424,26 @@ def _resolve_interpreter(tok: str, cwd: str) -> str:
         if shim and not shim.lower().endswith(".exe"):
             raise _shim_error(shim)
     return local                                  # not on disk: missing_files() reports it
+
+
+def _resolve_bare_safe(tok: str, exe: str, has_exe: bool, cwd: str, local: str) -> str:
+    """_resolve_interpreter for a bare name in safe mode: cwd, then local fixed-drive PATH entries only."""
+    _require_safe(local, "Python")
+    dirs = [cwd]
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        d = d.strip().strip('"')
+        if d and unsafe_path_reason(os.path.normpath(d)) is None:
+            dirs.append(os.path.normpath(d))
+    for d in dirs:
+        if os.path.isfile(os.path.join(d, exe)):
+            return os.path.normpath(os.path.join(d, exe))
+    if not has_exe:                               # the shutil.which() shim check, restricted to the same dirs
+        exts = [e.strip().lower() for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e.strip()]
+        for d in dirs:
+            for ext in exts:
+                if ext != ".exe" and os.path.isfile(os.path.join(d, tok + ext)):
+                    raise _shim_error(os.path.normpath(os.path.join(d, tok + ext)))
+    return local
 
 
 def _next_word(s: str) -> tuple[str, str]:
@@ -448,12 +554,35 @@ def _port_value(text: str, bat_name: str) -> int:
     return port
 
 
-def model_name_for(config_path: str | None, bat_path: str) -> str:
-    """The config json's model name if it has one, else the config / .bat file name."""
+def _config_stat_ok(config_path: str) -> bool:
+    """safe mode: may the config be opened? (local .json, regular file, <= 1 MB, not a cloud-only placeholder)"""
+    if unsafe_path_reason(config_path) or not config_path.lower().endswith(".json"):
+        return False
+    try:
+        st = os.stat(config_path)
+    except (OSError, ValueError):
+        return False
+    return (_stat.S_ISREG(st.st_mode) and st.st_size <= MAX_CONFIG_BYTES
+            and not getattr(st, "st_file_attributes", 0) & CLOUD_ATTRS)
+
+
+def model_name_for(config_path: str | None, bat_path: str, *, safe: bool = False) -> str:
+    """The config json's model name if it has one, else the config / .bat file name.
+
+    safe: the config is only opened when _config_stat_ok() (checked with a stat first); at most 1 MB is read."""
     if config_path:
         try:
-            with open(config_path, "r", encoding="utf-8-sig") as f:
-                data = json.load(f)
+            if safe:
+                if not _config_stat_ok(config_path):
+                    raise OSError("config not read in safe mode")
+                with open(config_path, "rb") as fb:
+                    raw = fb.read(MAX_CONFIG_BYTES + 1)
+                if len(raw) > MAX_CONFIG_BYTES:
+                    raise ValueError("config too large")
+                data = json.loads(raw.decode("utf-8-sig"))
+            else:
+                with open(config_path, "r", encoding="utf-8-sig") as f:
+                    data = json.load(f)
             if isinstance(data, dict):
                 for key in ("model", "model_name"):
                     val = data.get(key)
@@ -467,10 +596,14 @@ def model_name_for(config_path: str | None, bat_path: str) -> str:
     return stem[4:] if stem.lower().startswith("run-") and len(stem) > 4 else stem
 
 
-def parse_bat_text(text: str, bat_path: str) -> LauncherInfo:
-    """Parse the launcher text (bat_path gives %~dp0 and the starting directory). Raises LauncherError."""
+def parse_bat_text(text: str, bat_path: str, *, safe: bool = False) -> LauncherInfo:
+    """Parse the launcher text (bat_path gives %~dp0 and the starting directory). Raises LauncherError.
+
+    safe: see the module docstring - every path is vetted (string checks + GetDriveTypeW) before any is touched."""
     bat_path = os.path.abspath(bat_path)
     bat_name = os.path.basename(bat_path)
+    if safe:
+        _require_safe(bat_path, "Launcher")
     cwd = os.path.dirname(bat_path)
     variables: dict[str, str] = {}
     found: tuple[list[str], int, str] | None = None   # (argv tokens, index of server.py, directory it runs in)
@@ -554,7 +687,15 @@ def parse_bat_text(text: str, bat_path: str) -> LauncherInfo:
         raise LauncherError(f"{bat_name} does not start Strata (no python … serve\\server.py line)")
 
     argv, script_i, cwd = found
-    out = [_resolve_interpreter(argv[0], cwd)] + argv[1:script_i] + [_abs(argv[script_i], cwd)]
+    if safe:                                           # string-only checks first; resolved further down
+        _require_safe(cwd, "Working folder")
+        for tok in argv:
+            _require_safe_token(tok, bat_name)
+        _require_safe(_abs(argv[script_i], cwd), "server.py")
+        interp = argv[0]
+    else:
+        interp = _resolve_interpreter(argv[0], cwd)
+    out = [interp] + argv[1:script_i] + [_abs(argv[script_i], cwd)]
     port, config_path = DEFAULT_PORT, None
     rest = argv[script_i + 1:]
     i = 0
@@ -588,21 +729,48 @@ def parse_bat_text(text: str, bat_path: str) -> LauncherInfo:
         i += 1
     script = out[script_i]
     strata_dir = os.path.dirname(os.path.dirname(script))
+    if safe:
+        if config_path is not None:
+            _require_safe(config_path, "Config")
+            if not config_path.lower().endswith(".json"):
+                raise LauncherError(f"{bat_name}: --config must be a .json file: {config_path}")
+        _require_safe(strata_dir, "Strata folder")
+        # every path has passed the string checks: only now touch the filesystem
+        out[0] = _resolve_interpreter(interp, cwd, safe=True)
+        if config_path is not None:
+            try:
+                size = os.stat(config_path).st_size
+            except (OSError, ValueError):
+                size = 0                               # missing: missing_files() reports it
+            if size > MAX_CONFIG_BYTES:
+                raise LauncherError(f"{bat_name}: --config is too large ({size} bytes): {config_path}")
     return LauncherInfo(bat_path=bat_path, argv=tuple(out), cwd=cwd, strata_dir=strata_dir, port=port,
-                        config_path=config_path, model_name=model_name_for(config_path, bat_path))
+                        config_path=config_path, model_name=model_name_for(config_path, bat_path, safe=safe))
 
 
-def parse_bat(path: str) -> LauncherInfo:
-    """Read + parse a launcher .bat. Raises LauncherError with a message fit for inline display."""
+def parse_bat(path: str, *, safe: bool = False) -> LauncherInfo:
+    """Read + parse a launcher .bat. Raises LauncherError with a message fit for inline display.
+
+    safe: the .bat path itself is vetted before it is read (see the module docstring)."""
     if not str(path).lower().endswith((".bat", ".cmd")):
         raise LauncherError("Choose a .bat file")
-    return parse_bat_text(read_bat_text(path), path)
+    if safe:
+        _require_safe(os.path.abspath(path), "Launcher")
+    return parse_bat_text(read_bat_text(path), path, safe=safe)
 
 
-def missing_files(info: LauncherInfo) -> str | None:
-    """A short message when something the launcher needs is not on disk, else None."""
+def missing_files(info: LauncherInfo, *, safe: bool = False) -> str | None:
+    """A short message when something the launcher needs is not on disk, else None.
+
+    safe: a path that is not a local fixed-drive path is reported (never touched); --config must be a .json."""
     for label, p in (("Python", info.argv[0]), ("server.py", next(t for t in info.argv[1:] if _is_server_script(t))),
                      ("Config", info.config_path)):
+        if p and safe:
+            reason = unsafe_path_reason(p)
+            if reason:
+                return f"{label} path not allowed ({reason}): {p}"
+            if label == "Config" and not p.lower().endswith(".json"):
+                return f"Config is not a .json file: {p}"
         if p and not os.path.isfile(p):
             return f"{label} not found: {p}"
     return None

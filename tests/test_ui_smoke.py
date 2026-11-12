@@ -257,7 +257,9 @@ def _free_port() -> int:
 # Strata port. The port is free (nothing listens), and the URL is only ever displayed.
 TEST_PORT = _free_port()
 CFG = {"endpoint_url": f"http://127.0.0.1:{TEST_PORT}/v1", "port": TEST_PORT, "model_name": "swift-1.5-iq3_s",
-       "user_whitelist": [], "game_dirs": ["steamapps"]}
+       "user_whitelist": [], "game_dirs": ["steamapps"],
+       # a launcher is configured (Turn on without one opens Settings); StubEndpoint never runs it
+       "launch_cmd": ["python.exe", "serve\\server.py", "--port", str(TEST_PORT)]}
 
 
 class FakeVram:

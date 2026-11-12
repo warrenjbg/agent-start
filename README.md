@@ -13,6 +13,8 @@ and makes sure it gets the RAM it needs to run at full speed.
 - **Turn off**: unloads the model, stops only Strata's own processes, checks the port is free, shows a toast, and
   reopens the apps it closed (games as a one-click *Reopen*).
 - Notices a Strata you started yourself and adopts it. Warns when Strata fell back to its slower Low-RAM (SSD) mode.
+- Lives in the system tray (X hides the window; the tray icon's dot shows the state, right-click for Turn on/off and
+  Quit), finds your Strata folder on first start, and offers new versions from GitHub with one-click install.
 
 Requires Windows 10/11 x64 and a Strata install. Not affiliated with the Strata project.
 
@@ -22,8 +24,20 @@ Download `AgentStart-Setup-<version>.exe` from [Releases](../../releases) and ru
 only (no admin prompt) to `%LOCALAPPDATA%\Programs\Agent Start`, with a Start-menu shortcut (desktop shortcut
 optional) and an uninstaller. The exe is unsigned, so Windows SmartScreen may ask once: *More info → Run anyway*.
 
-**First start:** open Settings (gear) and pick your Strata `run-*.bat` (the dropdown lists the ones in your Strata
-folder; *Browse…* for any other). The app reads the `.bat` and starts the same command itself; it never runs it.
+**First start:** the app looks for Strata in Downloads, Desktop, Documents, your home folder and the top levels of
+your drives (a few seconds, read-only: folders with `serve\server.py` and a working `run-*.bat`). If it finds one,
+the idle line says *Strata found · click to set up*, which opens Settings with that folder's launchers. Otherwise
+(or to change it later) open Settings (gear) and pick your Strata `run-*.bat` (*Browse…* for any `.bat`). The app
+reads the `.bat` and starts the same command itself; it never runs it.
+
+**Tray:** closing the window (X) keeps the app running in the system tray; the icon's dot has the status colour.
+Click the icon to open the window; right-click for *Turn on / Turn off* and **Quit**. Windows 11 puts new tray icons
+in the hidden-icons (^) area: drag it onto the taskbar to keep it visible.
+
+**Updates:** once a day the app asks GitHub for the latest release (one small request, no data about you). When a
+newer version exists, the idle line says *Update to x.y.z available · click to install*. Click → confirm → it
+downloads the installer from this repo's Releases, checks its size and SHA-256 against what GitHub lists, closes,
+upgrades silently and starts again. A running Strata keeps running. Nothing is downloaded without your click.
 
 Settings and logs live in `%APPDATA%\AgentStart` (`config.json`, `logs\`, `state.json`); the first launch copies
 the bundled default config there. Uninstalling keeps that folder. Upgrading from the earlier name *Hermes
@@ -53,7 +67,7 @@ script); the Settings dialog and the log show the same number.
 |---|---|
 | Status line | LED + state + a short summary: Idle (grey) *2 apps to close · 6.8 GB* · Starting (amber) *Loading experts into RAM* + timer · Serving (green) *model* · Low-RAM (amber) · Error (red) *what failed*. While Strata works on a request it shows the model state, like Strata's Monitor: **Reading** (blue) *12% · 10,752 / 87,072* with a thin progress bar under the line, **Generating** (green) *412 tokens · 98.4 tok/s*, **Queued** (amber) *2 waiting*; then back to Serving. Read from `/metrics` once a second while serving (paused while minimised). Click it to show or hide the detail line (remembered) |
 | ⇄ (left of ⚙) | **Switch model**: shown when your Strata folder has two or more `run-*.bat`. Pick one: while idle it becomes the launcher for the next Turn on; while serving, Strata stops and starts again with the new model (the apps closed for the old one stay closed). Disabled while starting/stopping |
-| ⚙ | **Settings**: Strata launcher, the Strata dashboard link + API address, Protected apps (see below). Disabled while starting/stopping |
+| ⚙ | **Settings**: Strata launcher, the Strata dashboard link + API address, Protected apps, *Reopen closed apps after Turn off* (see below). Disabled while starting/stopping |
 | Detail line | Optional: idle = which apps would be closed; serving = *Up 12 min · last reply 85 tok/s*. Always shown when it matters: loading (phase, *usually 0:58*, progress bar), Low-RAM mode, errors (click opens the log), notes such as *Stopped · freed 47 GB*, and the one-click *Reopen …* offer |
 | Button | **Turn on** · **Cancel** (while starting) · **Turn off** |
 | Panels | **Memory** (bar + legend of physical RAM: other apps · Strata · free; "Freed" total for the session), **VRAM**, **Decode**, **Prompt reading** (see Stats). Each has a pin (shown on hover; filled when pinned): pinned panels stay visible while collapsed, in this order. Default: Memory pinned. Nothing pinned = just the status line and the button |
@@ -75,6 +89,8 @@ script); the Settings dialog and the log show the same number.
   its settings) in your browser; greyed out with *not running* while Strata is off. Below it the API address
   (`…/v1`) with **Copy**, for pasting into Hermes or other clients.
 - **Protected apps…** — the whitelist: apps that are never offered for closing.
+- **Reopen closed apps after Turn off** — on by default; the same choice as the checkbox in the start dialog.
+  Turning it off also forgets the apps currently waiting to be reopened.
 
 ## Stats section
 
@@ -134,7 +150,7 @@ so the numbers are estimates (shown with "~"). Code: `engine_log.py`, `ram_plan.
 
 ### Reopening closed apps
 
-The start dialog has **Reopen these when Strata stops** (ticked by default, remembered). Before the sweep closes an
+The start dialog has **Reopen these when Strata stops** (ticked by default, remembered; also a switch in Settings). Before the sweep closes an
 app it records how that app was started (program, arguments, folder; Store apps by their app ID). After **Turn off**
 releases the memory, those apps are started again one at a time, a second apart: *Reopening apps 1/3 · Spotify
 started*, then *Reopened 3 apps*.
@@ -169,7 +185,7 @@ To serve another Strata model, pick its `run-*.bat` in ⚙ Settings — no hand-
   pre-ticked. Untick them or add them to the whitelist.
 - **VRAM per app is an estimate.** NVIDIA's NVML reports nothing per process on Windows; the app uses Windows' GPU
   memory counters, capped at the card's real usage. *VRAM freed* after a sweep is measured on the whole card.
-- **Stopping during a reply**: while Strata is reading or writing a reply, Turn off (and a model switch) asks first: *Turn off when it's done* waits until the model has been idle for 6 s (the toggle then reads *Stop now*, and the line under the status says *Turns off after this reply · click to cancel*), *Turn off now* cuts the reply off, *Keep running* does nothing. An agent working through tool calls sends its next request within a few seconds, so *when it's done* means after the current request, not after the whole task. Stopping Strata ends any
+- **Stopping during a reply**: while Strata is reading or writing a reply, Turn off (and a model switch) asks first: *Turn off when it's done* waits until the model has been idle for 6 s (the toggle then reads *Stop now*, and the line under the status says *Turns off after this reply · click to cancel*), *Turn off now* cuts the reply off, *Keep running* does nothing. Agents (Hermes and others) answer in several requests: when a request ends with a tool call (web search, file read…), the app knows the agent will come back with the result and keeps waiting (*Agent running web_search*), for up to 10 minutes per tool. It turns off after a request that ends with an answer. Stopping Strata ends any
   chat session that is using it.
 - **First scan** after launch takes ~2 s (later ~0.3 s); it runs in the background.
 - **Launcher is parsed when you save it.** If you later edit that `.bat` (or Strata's updater rewrites it), open
@@ -194,6 +210,10 @@ Run from this folder with `.venv\Scripts\python.exe`:
 | `tests\test_e2e_fake.py` | The real app + real manager/detector/NVML against a fake Strata started from a parsed `.bat`: ON → graphs fill → change launcher → OFF → ON |
 | `tests\test_identity.py` | Strict Strata identity for the stop path (a process that merely *mentions* `serve\server.py` is never killed) |
 | `tests\test_load_progress.py` | Strata log → phase/progress (incl. the newest real log) |
+| `tests\test_app_extras.py` | Tool-call-aware safe Turn off, tray wiring, update offer/install flow (stubbed), first-start Strata search, the reopen switch |
+| `tests\test_updater.py` | GitHub release check + download against a local server: size/SHA-256, redirects, cancel, path checks, installer argv (never runs it) |
+| `tests\test_strata_finder.py` | The Strata search: depth/time limits, decoys, skipped folders, junctions |
+| `tests\test_tray.py` | Tray icon on its own thread: status icon, menu model, callbacks, no GDI leaks |
 | `tests\run_real_idle.py` | Real backends, IDLE only, no clicks |
 | `tests\run_real_onoff.py` | **Real** Strata ON → OFF (only with your OK; closes no apps) |
 

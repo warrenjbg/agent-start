@@ -83,6 +83,8 @@ STATE_SAVE_DEBOUNCE_MS = 300
 REOPEN_STAGGER_S = 1.0                   # pause between two reopened apps
 IDLE_GRACE_S = 6.0                       # "when it's done": stop after the model has been idle this long (an agent
                                          # usually sends its next request within a few seconds of a tool call)
+TOOL_WAIT_S = 600.0                      # after a request that ended in a tool call the agent comes back with the tool's
+                                         # result; "when it's done" waits up to this long for that next request
 SWITCH_GLYPH = "\uE8AB"                  # Segoe Fluent Icons "Switch"
 LIVE_POLL_S = 1.0                        # /metrics poll while serving (model state on the status line), as Strata's
                                          # own Monitor; stopped while the window is minimised
@@ -119,6 +121,12 @@ def _gb(mb: float | None, digits: int = 1) -> str:
     return f"{(mb or 0.0) / 1024.0:.{digits}f} GB"
 
 
+def _tail(path: str, n: int) -> str:
+    """The end of a path, which is the informative part ("…\\Strata-main\\Strata-0.2.10")."""
+    path = str(path or "")
+    return path if len(path) <= n else "…" + path[-(n - 1):]
+
+
 def _short(name: str, limit: int = 22) -> str:
     """Keep the preview to two lines: long exe names (EOSOverlayRenderer-Win64-Shipping.exe) get an ellipsis."""
     if name.lower().endswith(".exe"):
@@ -149,6 +157,72 @@ def format_preview(res: dict) -> str:
     if len(names) > len(shown):
         line2 += f" +{len(names) - len(shown)} more"
     return f"{line1}\n{line2}" if line2 else line1
+
+
+def _check_update_worker(current: str, post: Callable, done: Callable) -> None:
+    """Worker: one GitHub check. Posts (status, UpdateInfo as dict or None); status 'newer' | 'current' | 'error'."""
+    from dataclasses import asdict
+    status, info = "error", None
+    try:
+        import updater
+        status, info = updater.check(current)
+    except Exception:  # noqa: BLE001
+        log.debug("update check failed", exc_info=True)
+    post(done, status, asdict(info) if info is not None else None)
+
+
+def _download_update_worker(current: str, post: Callable, progress: Callable, done: Callable, stop_evt) -> None:
+    """Worker: re-check GitHub (the URL and digest used are this minute's, not a cached copy), download, verify."""
+    from dataclasses import asdict
+    try:
+        import updater
+        status, info = updater.check(current)
+        if status != "newer" or info is None:
+            post(done, None, None, "GitHub did not confirm the update" if status == "error" else "no newer version")
+            return
+        last = [0.0]
+
+        def prog(n: int, total: int) -> None:
+            now = time.monotonic()
+            if now - last[0] > 0.25 or n >= total:
+                last[0] = now
+                post(progress, n, total)
+
+        path = updater.download(info, updater.default_download_dir(), progress=prog, stop_evt=stop_evt)
+        post(done, path, asdict(info), None)
+    except Exception as exc:  # noqa: BLE001
+        post(done, None, None, str(exc) or exc.__class__.__name__)
+
+
+def _cleanup_updates_worker(current: str) -> None:
+    try:
+        import updater
+        n = updater.cleanup_old(updater.default_download_dir(), current)
+        if n:
+            log.info("removed %d old update file(s)", n)
+    except Exception:  # noqa: BLE001
+        log.debug("update cleanup failed", exc_info=True)
+
+
+def _release_singleton() -> None:
+    global _SINGLETON_MUTEX
+    m, _SINGLETON_MUTEX = _SINGLETON_MUTEX, None
+    if m is not None:
+        try:
+            import win32api
+            win32api.CloseHandle(m)
+        except Exception:  # noqa: BLE001
+            log.debug("mutex release failed", exc_info=True)
+
+
+def _find_strata_worker(post: Callable, done: Callable, stop_evt) -> None:
+    found = []
+    try:
+        import strata_finder
+        found = strata_finder.find_strata(strata_finder.default_roots(), time_budget_s=8.0, stop_evt=stop_evt)
+    except Exception:  # noqa: BLE001
+        log.exception("searching for Strata failed")
+    post(done, found)
 
 
 def _save_reopen_records(records: list[dict]) -> None:
@@ -190,8 +264,13 @@ def _build_real_deps(cfg: dict) -> tuple[Any, Any]:
 
 class AgentStartApp(ctk.CTk):
     def __init__(self, detector=None, endpoint=None, config: dict | None = None,
-                 metrics_fetcher: Callable[[str], dict | None] | None = None, vram_sampler=None) -> None:
-        """metrics_fetcher(root_url) and vram_sampler are test seams (defaults: Strata /metrics over HTTP, NVML)."""
+                 metrics_fetcher: Callable[[str], dict | None] | None = None, vram_sampler=None,
+                 extras: bool | None = None, status_fetcher: Callable[[str], dict | None] | None = None) -> None:
+        """metrics_fetcher(root_url) and vram_sampler are test seams (defaults: Strata /metrics over HTTP, NVML).
+        extras: tray icon, daily GitHub update check, first-start Strata search. Default: on for the real app, off
+        when test stubs are passed (no network, no disk scan, no tray icon from a test run)."""
+        if extras is None:
+            extras = detector is None and endpoint is None
         # Tk + threads: closed dialogs leave Tk objects (CTkFont, images) in reference cycles. If the automatic
         # collector fires on a worker thread (any allocation can trigger it), their __del__ makes a Tk call off the
         # main thread, which can block that worker forever - observed: the log reader stalled mid re.compile, and a
@@ -246,6 +325,9 @@ class AgentStartApp(ctk.CTk):
         self._panel_hover: str | None = None
         self._pending_launcher: launcher_bat.LauncherInfo | None = None   # saved while Strata runs
         self._fetch_metrics = metrics_fetcher or metrics_store.fetch_metrics
+        # GET /status after a request ended (how it ended). Tests with a fake /metrics pass their own or get none.
+        self._fetch_status = status_fetcher or (metrics_store.fetch_status if metrics_fetcher is None
+                                                else (lambda _root: None))
         self.metrics = MetricsStore()
         self._metrics_fails = 0
         self._metrics_epoch = 0                  # bumped per start: a late poll of the old server is dropped
@@ -268,8 +350,27 @@ class AgentStartApp(ctk.CTk):
         # Safe Turn off / model switch while Strata answers a request
         self._stop_pending: tuple[str, Any] | None = None     # ("off", None) | ("switch", LauncherInfo)
         self._idle_since: float | None = None
+        self._req_phase: str | None = None       # phase of the request running now ("writing a tool call: x", ...)
+        self._was_busy = False
+        self._tool_wait: tuple[str, float] | None = None   # (tool, since): last request ended in a tool call
         self._switching = False                  # a model switch is stopping Strata: no reopen, start again after
         self._launchers: list[tuple[str, str]] = []           # (label, bat path) for the switch menu
+        self.tray = None                         # tray.TrayIcon once started (None: X quits as before)
+        self._no_tray = self._no_finder = not extras
+        # the updater replaces the installed app: only offered by the packaged build, not when run from source
+        self._no_update_check = not extras or not config_store.FROZEN
+        self._tray_hint_shown = bool(saved.get("tray_hint_shown"))
+        self._tray_last: tuple | None = None
+        self._update = None                      # updater.UpdateInfo of a newer release
+        self._updating = False
+        self._update_checking = False
+        self._update_next_at = 0.0               # monotonic: no GitHub check before this
+        _uc = saved.get("update_checked_at")
+        self._update_checked_at = float(_uc) if isinstance(_uc, (int, float)) else None
+        self._box_open = False                   # a native message box is up (tray input must not act under it)
+        self._installing = False                 # the update installer runs; we are exiting
+        self._found_strata = None                # strata_finder.Found offered on first start
+        self._finder_ran = False
         self._summary_text = ""
         self._detail_text = ""
         self._detail_color = T.TEXT_2
@@ -496,6 +597,7 @@ class AgentStartApp(ctk.CTk):
                 head, rest = "", self.error_text
             self._set_status(head, rest, color=T.RED_TEXT, link=bool(self._error_log))
         self._layout()
+        self._sync_tray()
 
     def _show_serving(self) -> None:
         """ACTIVE: the status line shows what the model is doing (Strata's Monitor "Model state": Reading with the
@@ -510,6 +612,8 @@ class AgentStartApp(ctk.CTk):
             title, led = LOW_RAM_STATUS
         act = self.metrics.activity() if self.loaded is not False else None
         summary, detail, color, frac = model, self._serving_line(), T.TEXT_2, None
+        if act is None and self._tool_wait is not None:
+            summary = f"Agent running {_short(self._tool_wait[0], 20)}"
         if act is not None:
             title, led = ACT_STATUS[act["kind"]]
             summary, detail, frac = self._activity_texts(act, model)
@@ -521,7 +625,11 @@ class AgentStartApp(ctk.CTk):
         if self._stop_pending is not None:
             kind, info = self._stop_pending
             what = "Turns off" if kind == "off" else "Switches model"     # the model is named in the dialog
-            detail, link = f"{what} after this reply · click to cancel", True
+            if self._tool_wait is not None and self.metrics.activity() is None:
+                detail = f"{what} after the agent's reply · click to cancel"   # the status names the tool
+            else:
+                detail = f"{what} after this reply · click to cancel"
+            link = True
         elif self.loaded is False:
             detail = "Still loading the model"
         elif self._pending_launcher is not None:      # a launcher saved while running waits for the next start
@@ -534,6 +642,7 @@ class AgentStartApp(ctk.CTk):
         self.led.configure(fg_color=led)
         self._set_act_bar(frac)
         self._set_status(summary, detail, color=color, link=link)
+        self._sync_tray()
 
     @staticmethod
     def _activity_texts(act: dict, model: str) -> tuple[str, str, float | None]:
@@ -692,8 +801,9 @@ class AgentStartApp(ctk.CTk):
         T.dark_caption(self)
 
     # ------------------------------------------------------------------ reopen swept apps
-    def _reopen_worker(self) -> None:
-        """Worker, after Turn off: relaunch the auto apps one by one; games stay pending as a one-click offer."""
+    def _reopen_worker(self, auto_reopen: bool = True) -> None:
+        """Worker, after Turn off: relaunch the auto apps one by one; games stay pending as a one-click offer.
+        auto_reopen False (Settings switch off): nothing starts by itself; every app is offered as one click."""
         try:
             records = reopen.load_pending()
             if not records:
@@ -702,6 +812,15 @@ class AgentStartApp(ctk.CTk):
             auto, manual, skipped = reopen.classify(records)
             for r in skipped:
                 log.info("reopen: skipping %s (%s)", r.name, r.reason_skip)
+            if not auto_reopen:
+                offer = list(auto) + list(manual)
+                if offer:
+                    reopen.save_pending(offer)
+                else:
+                    reopen.clear_pending()
+                log.info("reopen after Turn off is off: offering %d app(s) as one click", len(offer))
+                self.post(self._reopen_done, [], [r.to_dict() for r in offer])
+                return
             results = reopen.reopen(records, stagger_s=REOPEN_STAGGER_S, stop_evt=self._stop_evt,
                                     on_progress=lambda d, t, n: self.post(self._reopen_progress, d, t, n))
             if manual:
@@ -764,6 +883,13 @@ class AgentStartApp(ctk.CTk):
     def _on_preview_click(self, _event=None) -> None:
         if self.state_name == ACTIVE and self._stop_pending is not None:
             self.cancel_pending_stop()
+            return
+        if self.state_name == IDLE and self._detail_link and "Strata found" == self._summary_text:
+            self.open_settings(found=self._found_strata)
+            return
+        if self.state_name == IDLE and self._detail_link and self._update is not None and \
+                self._detail_text.startswith("Update to"):
+            self.install_update()
             return
         if self.state_name == IDLE and self._reopen_offer and self._detail_link:
             self._click_reopen_offer()
@@ -846,6 +972,7 @@ class AgentStartApp(ctk.CTk):
             self.metrics.reset()
         if st != ACTIVE:
             self._stop_pending, self._idle_since = None, None
+            self._tool_wait, self._req_phase, self._was_busy = None, None, False
         self.state_name = st
         self._state_seq += 1
         self._note_until = 0.0                   # a note belongs to the state it was shown in
@@ -1115,12 +1242,14 @@ class AgentStartApp(ctk.CTk):
         """Worker: poll Strata's /metrics every 2 s, only while it is serving AND the stats section is open."""
         last_poll = 0.0
         last_epoch = None
+        done_n = None                            # Strata's finished-request count at the previous poll
         while not self._stop_evt.is_set():
             try:
                 # Every LIVE_POLL_S while serving: the status line shows what the model is doing (reading /
                 # generating / queued) and the stats graphs use the same documents.
-                # minimised: paused, except while a stop waits for the reply to finish (it needs the idle signal)
-                if (not self._iconic or self._stop_pending is not None) and self.state_name in (ACTIVE, STOPPING):
+                # Also while minimised / hidden in the tray: Turn off from the tray must still know whether a reply
+                # or an agent's tool call is running (the request phases are only seen by polling).
+                if self.state_name in (ACTIVE, STOPPING):
                     epoch = self._metrics_epoch
                     root = config_store.server_root(str(self.cfg.get("endpoint_url") or ""))
                     # /metrics returns only the newest 12 requests: after a gap (section collapsed, window minimised,
@@ -1131,6 +1260,21 @@ class AgentStartApp(ctk.CTk):
                     if root:
                         data = (self._fetch_metrics(root, all_requests=True) if catch_up
                                 else self._fetch_metrics(root))
+                    if epoch != last_epoch:
+                        done_n = None
+                    if isinstance(data, dict):
+                        # A request finished since the last poll: ask /status how it ended. Strata keeps the last
+                        # request's final phase there while idle ("tool call complete" = the agent comes back),
+                        # which a 1 s sample of the short tool-call phase misses most of the time.
+                        n = (data.get("totals") or {}).get("requests")
+                        live = data.get("live") or {}
+                        if isinstance(n, int) and done_n is not None and n > done_n and not live.get("parallel") \
+                                and live.get("state") == "idle" and root:
+                            st = self._fetch_status(root)
+                            if isinstance(st, dict) and not st.get("busy"):
+                                data["_last_end"] = {"phase": st.get("phase"), "tool": st.get("tool")}
+                        if isinstance(n, int):
+                            done_n = n
                     last_poll, last_epoch = now, epoch
                     self.post(self._apply_metrics, epoch, data)
             except Exception:  # noqa: BLE001
@@ -1148,12 +1292,15 @@ class AgentStartApp(ctk.CTk):
             self.metrics.ingest(data, now=time.monotonic())
             if self.metrics.hw_vram is not None:          # fallback VRAM source when NVML is unavailable
                 self.vram.push_external(*self.metrics.hw_vram)
+        if isinstance(data, dict):
+            self._track_request_end(data.get("_last_end"))
         if self.state_name == ACTIVE:
             self._show_serving()                          # model state on the status line
             if isinstance(self.dialog, BusyDialog) and isinstance(data, dict):
-                self.dialog.update_activity(self.metrics.activity())
+                self.dialog.update_activity(self._busy_activity())
             self._check_pending_stop(data_ok=isinstance(data, dict))
-        self._refresh_stats()
+        if not self._iconic:                              # hidden / minimised: no graph redraws
+            self._refresh_stats()
 
     # ================================================================== progress / memory
     def _progress_tick(self) -> None:
@@ -1358,6 +1505,12 @@ class AgentStartApp(ctk.CTk):
     # ================================================================== periodic
     def _first_refresh(self) -> None:
         self._first_id = None
+        self._start_tray()
+        self._report_update_result()
+        if not self._no_update_check:
+            self._run_worker("hc-update-clean", _cleanup_updates_worker, __version__)
+        self._maybe_check_update()
+        self._maybe_find_strata()
         self._refresh_launchers()
         self._request_preview()
         self._run_worker("hc-reopen-load", self._load_reopen_offer)
@@ -1365,11 +1518,13 @@ class AgentStartApp(ctk.CTk):
     def _tick(self) -> None:
         try:
             try:
-                self._iconic = self.state() == "iconic"
+                self._iconic = self.state() in ("iconic", "withdrawn")   # minimised or hidden in the tray
             except Exception:  # noqa: BLE001
                 self._iconic = False
             self._update_telemetry()
             self._request_preview()
+            self._sync_tray()
+            self._maybe_check_update()
             if self.state_name == ACTIVE and not self._detail_forced():
                 self._show_serving()             # uptime / last reply speed
             # Collect garbage HERE, on the Tk thread: closed dialogs leave Tk objects (CTkFont, images) in reference
@@ -1387,7 +1542,7 @@ class AgentStartApp(ctk.CTk):
         if time.monotonic() < max(self._error_hold_until, self._note_until):
             return
         try:
-            if self.state() == "iconic":
+            if self.state() in ("iconic", "withdrawn"):     # minimised / hidden in the tray: no dry-run scans
                 return
         except Exception:
             return
@@ -1408,9 +1563,17 @@ class AgentStartApp(ctk.CTk):
             return
         if "_error" in res:
             self._set_preview(f"Scan failed: {res['_error']}")
+        elif self._found_strata is not None and not self.cfg.get("launch_cmd"):
+            self._set_status("Strata found", f"{_tail(self._found_strata.strata_dir, 30)} · click to set up",
+                             color=T.TEXT_2, link=True)
         elif self._reopen_offer and not self._reopening:
             head = format_preview(res).partition("\n")[0]
             self._set_status(head if self._fits_summary(head) else "", self._offer_text(), color=T.TEXT_2, link=True)
+        elif self._update is not None and not self._updating:
+            head = format_preview(res).partition("\n")[0]
+            self._set_status(head if self._fits_summary(head) else "",
+                             f"Update to {self._update.version} available · click to install", color=T.TEXT_2,
+                             link=True)
         else:
             self._set_preview(format_preview(res))
 
@@ -1441,6 +1604,12 @@ class AgentStartApp(ctk.CTk):
             self.cancel_start()
 
     def turn_on(self) -> None:
+        if self._updating:
+            self._set_note("Installing an update · try again after the restart")
+            return
+        if not self.cfg.get("launch_cmd") and self._pending_launcher is None:
+            self.open_settings(found=self._found_strata)     # nothing to start yet: pick the Strata launcher first
+            return
         self._sweep_note = ""
         self._reopen_this = False
         if self._reopen_offer:                   # starting again: the old "Reopen …" offer is stale
@@ -1489,6 +1658,8 @@ class AgentStartApp(ctk.CTk):
     def _after_scan(self, token: int, cands: list[dict], plan=None) -> None:
         if not self._token_live(token):
             return
+        if cands:
+            self.show_window()                   # the start dialog needs a visible parent (switch from the tray)
         if not cands:
             if plan is not None and not plan.enough_now:
                 self._sweep_note = LOW_RAM_NOTE
@@ -1537,7 +1708,8 @@ class AgentStartApp(ctk.CTk):
     def _after_sweep(self, token: int, res: dict) -> None:
         self.add_freed(res.get("ram_freed_mb"))
         records = list(res.get("launch_records") or [])
-        if records and self._reopen_this:
+        if records:
+            # saved whatever the reopen choice: Turn off decides with the preference at that moment (Settings)
             self._run_worker("hc-reopen-save", _save_reopen_records, records)
         failed = res.get("failed") or []
         if failed:
@@ -1666,7 +1838,7 @@ class AgentStartApp(ctk.CTk):
     def request_stop(self, action: tuple[str, Any]) -> None:
         """Turn off / switch: straight away when the model is idle, else ask (BusyDialog) - stopping mid-reply cuts
         off whatever chat is using Strata."""
-        act = self.metrics.activity() if self._metrics_fails == 0 else None
+        act = self._busy_activity() if self._metrics_fails == 0 else None
         if act is None:
             self._execute(action, force=False)
             return
@@ -1678,9 +1850,10 @@ class AgentStartApp(ctk.CTk):
             self.dialog = None
         if self.state_name != ACTIVE:
             return                               # Strata stopped while the dialog was open
-        if decision in ("now", "idle"):
-            self._execute(action, force=decision == "now")
-        elif decision == "when_idle":
+        if decision == "now":
+            self._execute(action, force=True)
+        elif decision in ("when_idle", "idle"):
+            # "idle": the model went quiet while the box was open - still wait the grace (and for an agent's tool)
             self._stop_pending, self._idle_since = action, None
             log.info("%s when the model is idle", "turn off" if action[0] == "off" else "switch model")
             self._apply_state()
@@ -1692,12 +1865,53 @@ class AgentStartApp(ctk.CTk):
         log.info("pending stop cancelled")
         self._apply_state()                      # the line goes, the toggle reads "Turn off" again
 
+    def _track_request_end(self, last_end: dict | None = None) -> None:
+        """Remember how the last request ended. An agent turn is several requests: the model writes a tool call,
+        the request ends, the agent runs the tool (Strata idle meanwhile), then sends the result as a new request.
+        A request that ended in a tool call therefore means 'more is coming'.
+        last_end: {"phase", "tool"} from GET /status right after a request finished (authoritative). Without it
+        (Strata with an API key, parallel mode) the phase sampled while generating is used."""
+        act = self.metrics.activity()
+        if act is not None:
+            if act.get("kind") == "reading":
+                self._req_phase = None           # a new request: the previous one's phase says nothing about it
+            elif act.get("kind") == "generating" and act.get("phase"):
+                self._req_phase = str(act["phase"])
+            self._was_busy = True
+            return
+        if last_end is not None or self._was_busy:          # a request just finished
+            ph = str((last_end or {}).get("phase") or "") if last_end is not None else (self._req_phase or "")
+            if ph.startswith("writing a tool call") or ph == "tool call complete":
+                tool = (last_end or {}).get("tool") or (ph.split(":", 1)[1].strip() if ":" in ph else "")
+                if not tool and (self._req_phase or "").startswith("writing a tool call:"):
+                    tool = self._req_phase.split(":", 1)[1].strip()
+                self._tool_wait = (tool or "a tool", time.monotonic())
+                log.info("request ended in a tool call (%s): the agent should send another", tool or "?")
+            else:
+                self._tool_wait = None
+            self._req_phase, self._was_busy = None, False
+        wait_s = float(self.cfg.get("tool_wait_s") or TOOL_WAIT_S)
+        if self._tool_wait is not None and time.monotonic() - self._tool_wait[1] > wait_s:
+            log.info("the agent did not come back within %.0f s after %s", wait_s, self._tool_wait[0])
+            self._tool_wait = None               # the agent never came back
+
+    def _busy_activity(self) -> dict | None:
+        """What makes stopping now cut something off: a running request, or an agent between tool calls."""
+        act = self.metrics.activity()
+        if act is not None:
+            return act
+        if self._tool_wait is not None:
+            return {"kind": "tool", "tool": self._tool_wait[0], "queued": 0, "frac": None, "tokens": None,
+                    "rate": None, "phase": None}
+        return None
+
     def _check_pending_stop(self, data_ok: bool) -> None:
-        """Every /metrics poll while a stop waits: run it once the model has been idle for IDLE_GRACE_S."""
+        """Every /metrics poll while a stop waits: run it once the model has been idle for IDLE_GRACE_S after a
+        request that ended in an answer (not a tool call)."""
         if self._stop_pending is None or not data_ok:
             return
-        if self.metrics.activity() is not None:
-            self._idle_since = None              # busy (again): wait for this request too
+        if self._busy_activity() is not None:
+            self._idle_since = None              # busy (again) / the agent is running a tool: keep waiting
             return
         now = time.monotonic()
         if self._idle_since is None:
@@ -1822,7 +2036,7 @@ class AgentStartApp(ctk.CTk):
 
     def _on_stopped(self, result: dict) -> None:
         if not result.get("ok") and result.get("unload") == "busy":
-            if messagebox.askyesno(APP_TITLE, "Model is mid-turn — force stop?", parent=self):
+            if self._ask(messagebox.askyesno, "Model is mid-turn — force stop?"):
                 self.turn_off(force=True)
             else:
                 self._exit_pending = False
@@ -1853,7 +2067,7 @@ class AgentStartApp(ctk.CTk):
                 self.after(300, self._switch_start)
             elif not self._exit_pending:
                 self._reopening = True
-                self._run_worker("hc-reopen", self._reopen_worker)
+                self._run_worker("hc-reopen", self._reopen_worker, self._reopen_pref)
         else:
             self.show_error(result.get("error") or "Stop failed — port still in use")
             return
@@ -1861,15 +2075,223 @@ class AgentStartApp(ctk.CTk):
             self._finish_exit()
 
     # ================================================================== dialogs / exit
-    def open_settings(self) -> None:
-        """Gear: launcher choice + protected apps. Not while STARTING/STOPPING (the launch config is in use)."""
+    def open_settings(self, found=None) -> None:
+        """Gear: launcher choice + protected apps. Not while STARTING/STOPPING (the launch config is in use).
+        found: a strata_finder.Found to offer (first start, no launcher configured yet)."""
         if self.state_name in (STARTING, STOPPING) or self._dialog_open():
             return
+        self.show_window()
         pending = self._pending_launcher
+        cfg, current = self.cfg, pending.bat_path if pending is not None else None
+        if found is not None and not self.cfg.get("launch_cmd"):
+            import strata_finder
+            cfg = dict(self.cfg, strata_dir=found.strata_dir)
+            current = strata_finder.best_launcher(found)
         self.dialog = SettingsDialog(
-            self, self.cfg, self.detector, on_save=self.save_launcher, on_closed=self._on_settings_closed,
-            current_bat=pending.bat_path if pending is not None else None,
-            running=self.state_name == ACTIVE, on_whitelist_saved=self._request_preview)
+            self, cfg, self.detector, on_save=self.save_launcher, on_closed=self._on_settings_closed,
+            current_bat=current,
+            running=self.state_name == ACTIVE, on_whitelist_saved=self._request_preview,
+            reopen_after=self._reopen_pref, on_reopen_changed=self.set_reopen_pref,
+            update_version=self._update.version if self._update is not None and not self._updating else None,
+            on_update=self.install_update)
+
+    # ------------------------------------------------------------------ system tray
+    def _start_tray(self) -> None:
+        if self.tray is not None or self._no_tray:
+            return
+        try:
+            import tray as tray_mod
+            icon = str(config_store.APP_DIR / "assets" / "app.png")
+            post = self.post                       # tray callbacks run on the tray thread: marshal to Tk
+            t = tray_mod.TrayIcon(APP_TITLE, icon, on_open=lambda: post(self.show_window),
+                                  on_toggle=lambda: post(self._tray_toggle), on_quit=lambda: post(self.quit_app),
+                                  on_lost=lambda: post(self._tray_lost))
+            self.tray = t                          # X keeps quitting until the icon is really there (is_running)
+            t.start_async(lambda ok: post(self._tray_started, t, ok))
+        except Exception:  # noqa: BLE001
+            self.tray = None
+            log.exception("tray start failed; the window X quits instead")
+
+    def _tray_started(self, t, ok: bool) -> None:
+        if self._destroyed or self.tray is not t:
+            return
+        if not ok:
+            log.warning("tray icon could not be added; the window X quits instead")
+            self.tray = None
+            return
+        self._tray_last = None
+        self._sync_tray()
+
+    def _tray_lost(self) -> None:
+        """The icon is gone (Explorer did not come back): the tray is no way back to a hidden window - show it."""
+        log.warning("tray icon lost; showing the window")
+        self.show_window()
+
+    def _tray_toggle(self) -> None:
+        self.show_window()                       # Turn on may open the start dialog; Turn off may ask first
+        if self._box_open or self._dialog_open():
+            return                               # a question is up: answer that first (the window is in front)
+        self.on_toggle()
+
+    def _sync_tray(self) -> None:
+        t = self.tray
+        if t is None or self._destroyed:
+            return
+        try:
+            led = self.led.cget("fg_color")
+            tip = f"{APP_TITLE} · {self.pill.cget('text')}" + (f" · {self._summary_text}" if self._summary_text else "")
+            label = self.toggle.cget("text")
+            enabled = str(self.toggle.cget("state")) == "normal" and not label.endswith("…")
+            key = (led, tip, label, enabled)
+            if key != self._tray_last:
+                self._tray_last = key
+                t.set_status(led if isinstance(led, str) else None, tip, label, enabled)
+        except Exception:  # noqa: BLE001
+            log.debug("tray sync failed", exc_info=True)
+
+    # ------------------------------------------------------------------ updates (GitHub releases)
+    def _maybe_check_update(self) -> None:
+        """Once a day (and an hour after a failed check): ask GitHub for the latest release, on a worker. The time
+        is kept in memory too, so an unwritable state.json cannot turn this into a request every tick."""
+        if self._no_update_check or self._updating or self._update_checking:
+            return
+        now_m = time.monotonic()
+        if now_m < self._update_next_at:
+            return
+        import updater
+        last = self._update_checked_at
+        if not updater.due(last, time.time()):
+            self._update_next_at = now_m + 600.0          # look again in 10 min (cheap: no disk, no network)
+            return
+        self._update_checking = True
+        self._update_next_at = now_m + updater.RETRY_AFTER_ERROR_S   # until the result says otherwise
+        self._run_worker("hc-update-check", _check_update_worker, __version__, self.post, self._on_update_checked)
+
+    def _on_update_checked(self, status: str, info_dict: dict | None) -> None:
+        self._update_checking = False
+        import updater
+        if status == "error":                    # offline / rate limited: keep what we knew, retry in an hour
+            log.info("update check failed; retrying in %d min", updater.RETRY_AFTER_ERROR_S // 60)
+            return
+        self._update_checked_at = time.time()
+        self._update_next_at = time.monotonic() + updater.CHECK_INTERVAL_S
+        new = updater.UpdateInfo(**info_dict) if info_dict else None
+        known = self._update.version if self._update is not None else None
+        self._update = new
+        self._save_state_later("update_checked_at", self._update_checked_at)
+        if new is not None and new.version != known:
+            log.info("update available: %s", new.version)
+            if self.tray is not None:
+                try:
+                    self.tray.notify(APP_TITLE, f"Version {new.version} is available. Install it from Settings, "
+                                                f"or click the update line while Strata is off.")
+                except Exception:  # noqa: BLE001
+                    pass
+        self._request_preview()
+
+    def install_update(self) -> None:
+        """Settings / the idle line: confirm, then re-check GitHub (fresh URL + digest), download, verify, run the
+        installer and exit. Strata keeps running."""
+        info = self._update
+        if info is None or self._updating or self._box_open:
+            return
+        if self.state_name in (STARTING, STOPPING):
+            self._set_note("Update waits until Strata has started or stopped")
+            return
+        msg = (f"Install Agent Start {info.version}?\n\nIt downloads the installer from GitHub "
+               f"(about {info.size / 1e6:.0f} MB), checks it, closes this app, upgrades it and starts it again.")
+        if self.state_name == ACTIVE:
+            msg += "\n\nStrata keeps running; the new version picks it up."
+        if not self._ask(messagebox.askyesno, msg):
+            return
+        if self.state_name in (STARTING, STOPPING) or self._updating:
+            return
+        self._updating = True
+        self._set_note(f"Downloading update {info.version}…")
+        self._run_worker("hc-update-download", _download_update_worker, __version__, self.post,
+                         self._update_progress, self._update_downloaded, self._stop_evt)
+
+    def _update_progress(self, done: int, total: int) -> None:
+        if self._updating and total:
+            self._set_note(f"Downloading update · {100 * done / total:.0f}%")
+
+    def _update_downloaded(self, path: str | None, info_dict: dict | None, err: str | None) -> None:
+        if err or not path or not info_dict:
+            self._updating = False
+            log.warning("update download failed: %s", err)
+            self._set_note(f"Update failed\n{_short(err or 'download failed', 40)}")
+            return
+        # never exit mid-start / mid-stop / with a dialog waiting for an answer: try again in a second
+        if self.state_name in (STARTING, STOPPING) or self._dialog_open() or self._box_open:
+            self.after(1000, lambda: self._update_downloaded(path, info_dict, err))
+            return
+        import updater
+        info = updater.UpdateInfo(**info_dict)
+        log_path = os.path.join(updater.default_download_dir(), "install.log")
+        install_dir = os.path.dirname(sys.executable) if config_store.FROZEN else None
+        config_store.save_state({"update_pending": {"version": info.version, "from": __version__,
+                                                    "at": time.time(), "log": log_path}})
+        _release_singleton()                     # the installer's AppMutex check must not see us; it waits for our pid
+        try:
+            updater.launch_installer(path, info.sha256, install_dir=install_dir, log_path=log_path,
+                                     wait_pid=os.getpid())
+        except Exception as exc:  # noqa: BLE001
+            self._updating = False
+            config_store.save_state({"update_pending": None})
+            log.exception("could not start the installer")
+            self._set_note(f"Update failed\n{_short(str(exc), 40)}")
+            return
+        self._installing = True
+        log.info("update installer started (%s); exiting so it can replace the app", path)
+        self._set_note("Installing update · Agent Start restarts in a moment")
+        self.after(400, self._finish_exit)       # Strata (if running) keeps running; the installer waits for us
+
+    def _report_update_result(self) -> None:
+        """First tick after a start: did the update the previous run started go in?"""
+        pend = config_store.load_state().get("update_pending")
+        if not isinstance(pend, dict):
+            return
+        config_store.save_state({"update_pending": None})
+        if pend.get("version") == __version__:
+            log.info("updated from %s to %s", pend.get("from"), __version__)
+            self._set_note(f"Updated to {__version__}")
+        elif time.time() - float(pend.get("at") or 0) < 7 * 86400:
+            log.warning("the update to %s did not install (log: %s)", pend.get("version"), pend.get("log"))
+            self._set_note(f"Update to {pend.get('version')} did not install\nDetails: updates\\install.log")
+
+    def _ask(self, fn, msg: str):
+        """A native message box. While one is open the tray must not change state under it."""
+        self._box_open = True
+        try:
+            return fn(APP_TITLE, msg, parent=self)
+        finally:
+            self._box_open = False
+
+    # ------------------------------------------------------------------ first start: find Strata
+    def _maybe_find_strata(self) -> None:
+        if self._finder_ran or self.cfg.get("launch_cmd") or getattr(self, "_no_finder", False):
+            return
+        self._finder_ran = True
+        self._set_note("Looking for Strata on this PC…")
+        self._run_worker("hc-find-strata", _find_strata_worker, self.post, self._on_strata_found, self._stop_evt)
+
+    def _on_strata_found(self, found) -> None:
+        self._found_strata = found[0] if found else None
+        if found:
+            log.info("found Strata: %s", [f.strata_dir for f in found])
+        else:
+            log.info("no Strata found on this PC")
+        self._note_until = 0.0
+        if self._found_strata is None and self.state_name == IDLE:
+            self._set_note("No Strata found\nOpen Settings (gear) and pick your run-*.bat")
+        self._request_preview()
+
+    def set_reopen_pref(self, on: bool) -> None:
+        """Settings switch / start-dialog checkbox: reopen the apps closed for Strata after Turn off. Only the
+        preference is stored; Turn off decides (off: the closed apps are offered as a one-click Reopen instead)."""
+        self._reopen_pref = bool(on)
+        self._save_state_later("reopen_after", self._reopen_pref)
+        log.info("reopen closed apps after Turn off: %s", "on" if on else "off")
 
     def _on_settings_closed(self) -> None:
         if isinstance(self.dialog, SettingsDialog):   # only the dialog that closed
@@ -1944,6 +2366,44 @@ class AgentStartApp(ctk.CTk):
         self._request_preview()
 
     def on_close_request(self) -> None:
+        """Window X: hide to the tray (Quit is in the tray menu). Without a tray icon: quit as before."""
+        if self.tray is not None and getattr(self.tray, "is_running", False) and not self._updating:
+            self.hide_to_tray()
+            return
+        self.quit_app()
+
+    def hide_to_tray(self) -> None:
+        if self._dialog_open():                  # a dialog waits for an answer: keep it visible
+            try:
+                self.dialog.lift()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self.withdraw()
+        self._iconic = True
+        if not self._tray_hint_shown:
+            self._tray_hint_shown = True
+            self._save_state_later("tray_hint_shown", True)
+            try:
+                self.tray.notify(APP_TITLE, "Still running in the tray. Right-click the icon for Turn off and Quit.")
+            except Exception:  # noqa: BLE001
+                log.debug("tray notify failed", exc_info=True)
+
+    def show_window(self) -> None:
+        try:
+            if self.state() in ("withdrawn", "iconic"):
+                self.deiconify()
+            self._iconic = False
+            self.lift()
+            self.focus_force()
+        except Exception:  # noqa: BLE001
+            log.debug("show_window failed", exc_info=True)
+
+    def quit_app(self) -> None:
+        """Quit (tray menu, or X without a tray): asks about a running Strata as before."""
+        self.show_window()
+        if self._box_open or self._installing:   # a question is already up / the installer is about to replace us
+            return
         if self._dialog_open():
             try:
                 child = getattr(self.dialog, "_child", None)   # Protected apps opened from Settings holds the grab
@@ -1958,10 +2418,10 @@ class AgentStartApp(ctk.CTk):
             self._set_preview("Stopping — please wait before closing…")
             return
         if st == STARTING:
-            if not messagebox.askyesno(APP_TITLE, "Cancel start and exit?", parent=self):
+            if not self._ask(messagebox.askyesno, "Cancel start and exit?"):
                 return
             if self.state_name != STARTING:     # the start finished while the box was open: ask again
-                return self.on_close_request()
+                return self.quit_app()
             self._exit_pending = True
             if self._start_phase == "sweep":
                 self._set_preview("Finishing app sweep, then exiting…")
@@ -1972,11 +2432,11 @@ class AgentStartApp(ctk.CTk):
             self._finish_exit()
             return
         if st == ACTIVE:
-            ans = messagebox.askyesnocancel(APP_TITLE, "Stop Strata before exit?", parent=self)
+            ans = self._ask(messagebox.askyesnocancel, "Stop Strata before exit?")
             if ans is None:
                 return
             if self.state_name != ACTIVE:       # state changed under the modal box (monitor/pump kept running)
-                return self.on_close_request()
+                return self.quit_app()
             if ans:
                 self._exit_pending = True
                 self.turn_off()
@@ -1998,6 +2458,12 @@ class AgentStartApp(ctk.CTk):
             return
         self._destroyed = True
         self._stop_evt.set()
+        tray, self.tray = self.tray, None
+        if tray is not None:
+            try:
+                tray.stop()
+            except Exception:  # noqa: BLE001
+                log.debug("tray stop failed", exc_info=True)
         try:
             self.vram.stop()
         except Exception:  # noqa: BLE001
@@ -2087,14 +2553,62 @@ def _check_config() -> None:
         APP_TITLE, 0x30)
 
 
+SHOW_EVENT = "AgentStart.Show"                   # a second launch sets it: the running app shows its window
+
+
+def _selftest() -> int:
+    """`AgentStart.exe --selftest` (run by build.bat on the frozen build): every lazily imported module loads and the
+    tray icon renders. Exit code 0 = OK. No window, no mutex, no network, no disk scan."""
+    try:
+        import PIL.Image  # noqa: F401
+        import strata_finder  # noqa: F401
+        import tray
+        import updater  # noqa: F401
+        import win32gui  # noqa: F401
+        import detector  # noqa: F401
+        import server_manager  # noqa: F401
+        icon = config_store.APP_DIR / "assets" / "app.png"
+        if not icon.is_file():
+            return 3
+        t = tray.TrayIcon(APP_TITLE, str(icon), on_open=lambda: None, on_toggle=lambda: None, on_quit=lambda: None)
+        img = t._render(T.ACCENT)
+        return 0 if img is not None and img.size[0] >= 16 else 4
+    except Exception:  # noqa: BLE001
+        return 2
+
+
+def _watch_show_event(app: "AgentStartApp") -> None:
+    """Daemon thread: a second launch (Start menu, desktop shortcut) sets SHOW_EVENT; bring this window back, also
+    from the tray (FindWindow + ShowWindow from outside would leave Tk thinking it is still withdrawn)."""
+    import win32event
+    try:
+        ev = win32event.CreateEvent(None, False, False, SHOW_EVENT)
+    except Exception:  # noqa: BLE001
+        log.debug("show event unavailable", exc_info=True)
+        return
+    while not app._destroyed:
+        if win32event.WaitForSingleObject(ev, 1000) == win32event.WAIT_OBJECT_0 and not app._destroyed:
+            app.post(app.show_window)
+
+
 def main() -> None:
     global _SINGLETON_MUTEX
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
     import win32api
     import win32event
     import winerror
 
     _SINGLETON_MUTEX = win32event.CreateMutex(None, False, "AgentStart.Singleton")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        try:                                         # the running app shows itself (also when hidden in the tray)
+            ev = win32event.OpenEvent(win32event.EVENT_MODIFY_STATE, False, SHOW_EVENT)
+            win32event.SetEvent(ev)
+            sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception:  # noqa: BLE001          # an older version is running: the old way
+            pass
         user32 = ctypes.windll.user32
         # class + title: an Explorer window of a folder called "Agent Start" has the same title
         hwnd = user32.FindWindowW("TkTopLevel", APP_TITLE)
@@ -2117,6 +2631,7 @@ def main() -> None:
     except Exception:
         log.exception("startup failed")
         raise
+    threading.Thread(target=_watch_show_event, args=(app,), name="hc-show-event", daemon=True).start()
     app.mainloop()
     log.info("Agent Start exited")
 

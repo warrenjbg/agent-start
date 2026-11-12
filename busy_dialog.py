@@ -25,6 +25,9 @@ def describe(act: dict | None) -> str:
         return "Strata is working on a request."
     q = act.get("queued") or 0
     queued = f" · {q} more waiting" if q else ""
+    if act.get("kind") == "tool":
+        tool = str(act.get("tool") or "a tool")
+        return f"Agent is running {tool if len(tool) <= 24 else tool[:23] + '…'}"   # fits the 316 px line
     if act.get("kind") == "reading":
         frac = act.get("frac")
         total = act.get("total")

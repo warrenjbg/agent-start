@@ -21,6 +21,10 @@ if not exist build mkdir build
 copy /y config.default.json build\config.default.json >nul || goto :fail
 echo [4/5] PyInstaller
 "%PY%" -m PyInstaller --noconfirm --clean --log-level WARN AgentStart.spec || goto :fail
+rem the frozen app must load every lazily imported module (tray, updater, finder, PIL) - see main._selftest
+start "" /wait dist\AgentStart\AgentStart.exe --selftest
+if errorlevel 1 (echo Frozen self-test failed: exit %errorlevel% & goto :fail)
+echo       frozen self-test OK
 echo [5/5] installer
 if not exist "%ISCC%" (echo Inno Setup not found at "%ISCC%" & goto :fail)
 "%ISCC%" /Q installer\AgentStart.iss || goto :fail
