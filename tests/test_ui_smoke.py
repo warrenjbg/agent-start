@@ -362,10 +362,19 @@ def detail_shown(app) -> bool:
 
 
 def expected_h(app) -> int:
-    """Logical window height for what is currently laid out (the window sizes itself to its content)."""
-    h = main.HEIGHT + (main.DETAIL_H if detail_shown(app) else 0)
+    """Logical window height for what is currently laid out (the window sizes itself to its content):
+    status + button, optional detail / progress, the visible panels (pinned, or all while expanded), the bar."""
+    h = main.BASE_H + (main.DETAIL_H if detail_shown(app) else 0)
     h += main.PROGRESS_H if app.progress.winfo_manager() == "grid" else 0
-    return h + (main.STATS_GAP + main.STATS_H if app.expanded else 0)
+    vis = list(main.PANELS) if app.expanded else [p for p in main.PANELS if p in app.pinned]
+    first = True
+    if "memory" in vis:
+        h += main.CARD_TOP + main.MEM_CARD_H
+        first = False
+    rows = sum(1 for p in ("vram", "decode", "prompt") if p in vis)
+    if rows:
+        h += (main.CARD_TOP if first else main.STATS_GAP) + rows * 82 + rows - 1
+    return h + (16 if all(p in app.pinned for p in main.PANELS) else main.BAR_BLOCK)
 
 
 def pill(app):
@@ -1101,6 +1110,69 @@ def test_model_state(app, det, ep) -> None:
         main.LIVE_POLL_S = old_poll
 
 
+def test_pins(app, det, ep) -> None:
+    """Pin buttons: pinned panels stay while collapsed; none pinned = status + button + bar; all pinned = no bar."""
+    scale = ctk.ScalingTracker.get_window_scaling(app)
+    if app.expanded:
+        app.chevron.invoke()
+    app.detail_open = False
+    app._set_state("IDLE")
+    app._apply_expanded()
+    pump(app, 0.3)
+    check(app.pinned == ["memory"], f"default pins ({app.pinned})")
+    # hover shows the outline pin of an unpinned panel only
+    app.chevron.invoke(); pump(app, 0.3)
+    check(app._pin_btns["vram"].cget("text") == "", "unpinned pin hidden until hover")
+    app._set_panel_hover("vram"); pump(app, 0.05)
+    check(app._pin_btns["vram"].cget("text") == main.PIN_GLYPH, "hover shows the pin")
+    app._set_panel_hover(None)
+    check(app._pin_btns["vram"].cget("text") == "", "leaving hides it again")
+    # pin decode, collapse: memory + decode stay
+    app._pin_btns["decode"].invoke(); pump(app, 0.2)
+    app.chevron.invoke(); pump(app, 0.4)
+    vis = (app.mem_card.winfo_ismapped(), app.row_vram.winfo_ismapped(), app.row_decode.winfo_ismapped(),
+           app.row_prompt.winfo_ismapped())
+    check(not app.expanded and vis == (True, False, True, False), f"collapsed shows memory + decode ({vis})")
+    check(abs(app.winfo_height() - expected_h(app) * scale) <= 2, f"height fits ({app.winfo_height()} vs {expected_h(app)})")
+    check(app.stats.winfo_height() <= 84 * scale, f"graph card holds one row ({app.stats.winfo_height()})")
+    shot(app, "pins_memory_decode")
+    check(pump_until(app, lambda: load_state_file().get("pinned") == ["memory", "decode"], 3), "pins saved")
+    # unpin everything: compact look
+    app._pin_btns["memory"].invoke(); app._pin_btns["decode"].invoke(); pump(app, 0.4)
+    check(app.pinned == [] and not app.mem_card.winfo_ismapped() and not app.stats.winfo_ismapped()
+          and app.chevron.winfo_ismapped(), "nothing pinned: no panels, only the bar")
+    check(abs(app.winfo_height() - (main.BASE_H + main.BAR_BLOCK) * scale) <= 2,
+          f"compact height {app.winfo_height()} == {main.BASE_H + main.BAR_BLOCK}")
+    gap = app.chevron.winfo_rooty() - (app.toggle.winfo_rooty() + app.toggle.winfo_height())
+    check(0 <= gap <= 8 * scale, f"bar right under the button ({gap})")
+    shot(app, "pins_none")
+    app.chevron.invoke(); pump(app, 0.4)
+    check(app.expanded and all(f.winfo_ismapped() for f in (app.mem_card, app.row_vram, app.row_decode, app.row_prompt)),
+          "bar expands to every panel")
+    gap = app.mem_card.winfo_rooty() - (app.toggle.winfo_rooty() + app.toggle.winfo_height())
+    check(abs(gap - main.CARD_TOP * scale) <= 2, f"memory card {main.CARD_TOP} px under the button ({gap})")
+    app.chevron.invoke(); pump(app, 0.3)
+    # pin a graph alone: it takes the first slot, CARD_TOP under the button
+    app._pin_btns["vram"].invoke(); pump(app, 0.4)
+    gap = app.stats.winfo_rooty() - (app.toggle.winfo_rooty() + app.toggle.winfo_height())
+    check(app.stats.winfo_ismapped() and not app.mem_card.winfo_ismapped() and abs(gap - main.CARD_TOP * scale) <= 2,
+          f"VRAM alone sits where memory was ({gap})")
+    shot(app, "pins_vram")
+    # everything pinned: no bar, 16 px margin
+    for k in ("memory", "decode", "prompt"):
+        app._pin_btns[k].invoke()
+    pump(app, 0.4)
+    check(not app.chevron.winfo_ismapped() and abs(app.winfo_height() - expected_h(app) * scale) <= 2,
+          f"all pinned: no bar ({app.winfo_height()} vs {expected_h(app)})")
+    check(abs((app.winfo_rooty() + app.winfo_height()) - (app.stats.winfo_rooty() + app.stats.winfo_height())
+              - 16 * scale) <= 4, "all pinned: 16 px bottom margin")
+    # back to the default for later tests
+    for k in ("vram", "decode", "prompt"):
+        app._pin_btns[k].invoke()
+    pump(app, 0.3)
+    check(app.pinned == ["memory"] and abs(app.winfo_height() - main.HEIGHT * scale) <= 2, "restored default")
+
+
 def test_reopen_flow(app, det, ep) -> None:
     """After Turn off: auto apps relaunch (faked launch), games stay as a one-click offer that relaunches them."""
     py = os.path.join(sys.base_prefix, "python.exe")
@@ -1190,9 +1262,12 @@ def check_stats_fit(app, label: str) -> None:
           f"{label}: expanded window {w}x{h} != 360x{expected_h(app)}*{scale}")
     bottom = app.winfo_rooty() + h
     card_bottom = app.stats.winfo_rooty() + app.stats.winfo_height()
-    # same bottom margin as the collapsed v1.0 layout (16 px; its fixed-height rows round up to 3 px slack at 150 %)
-    check(-2 <= (bottom - card_bottom) - 16 * wscale <= 4, f"{label}: stats card ends 16 px above the window edge "
+    # the expand bar below the card (its fixed-height rows round up to 3 px slack at 150 %)
+    check(-2 <= (bottom - card_bottom) - main.BAR_BLOCK * wscale <= 4, f"{label}: stats card, then the expand bar "
           f"({bottom - card_bottom})")
+    bar_top = app.chevron.winfo_rooty()
+    check(app.chevron.winfo_ismapped() and bar_top >= card_bottom and abs(app.chevron.winfo_width()
+          - app.stats.winfo_width()) <= 2, f"{label}: expand bar under the card, as wide as it")
     gap = app.stats.winfo_rooty() - (app.mem_card.winfo_rooty() + app.mem_card.winfo_height())
     check(abs(gap - 8 * wscale) <= 2, f"{label}: 8 px between memory card and stats card ({gap})")
     for name, row in (("vram", app.row_vram), ("decode", app.row_decode), ("prompt", app.row_prompt)):
@@ -1227,9 +1302,10 @@ def test_stats_section(app, det, ep) -> None:
           f"collapsed height fits the content ({app.winfo_height()} vs {expected_h(app)})")
     check(vram.started == 1, "VRAM sampler started with the app")
     cx = app.chevron.winfo_rootx() + app.chevron.winfo_width()
-    check(cx <= app.mem_card.winfo_rootx() + app.mem_card.winfo_width() - 8 * scale
-          and app.chevron.winfo_height() <= app.mem_title.winfo_height() + 1,
-          "chevron sits inside the memory card header without growing it")
+    card_bottom = app.mem_card.winfo_rooty() + app.mem_card.winfo_height()
+    check(cx <= app.mem_card.winfo_rootx() + app.mem_card.winfo_width() + 1 and app.chevron.winfo_rooty() >= card_bottom
+          and app.pinned == ["memory"] and app._pin_btns["memory"].cget("text") == main.PINNED_GLYPH,
+          "default: memory pinned, expand bar under it")
     pump(app, 2.6)
     check(fetch.calls == [], f"IDLE: /metrics is never polled ({len(fetch.calls)})")
 
@@ -1317,7 +1393,8 @@ def test_stats_section(app, det, ep) -> None:
           f"collapse -> 360x{expected_h(app)} ({app.winfo_width()}x{app.winfo_height()})")
     check(pump_until(app, lambda: load_state_file().get("stats_expanded") is False, 3), "collapsed state persisted")
     card_bottom = app.mem_card.winfo_rooty() + app.mem_card.winfo_height()
-    check(abs((app.winfo_rooty() + app.winfo_height() - card_bottom) - 16 * scale) <= 2, "memory card margin restored")
+    check(abs((app.winfo_rooty() + app.winfo_height() - card_bottom) - main.BAR_BLOCK * scale) <= 2,
+          "memory card, then the expand bar")
     pump(app, 0.3)
     n = len(fetch.calls)
     pump(app, 2.6)
@@ -1675,7 +1752,8 @@ def run() -> int:
                              (test_load_progress_view, (app, det, ep)), (test_strata_estimate, (app, det, ep)),
                              (test_stats_section, (app, det, ep)), (test_notes_and_stale_status, (app, det, ep)),
                              (test_low_ram, (app, det, ep)), (test_review_fixes, (app, det, ep)),
-                             (test_model_state, (app, det, ep)), (test_reopen_flow, (app, det, ep))):
+                             (test_model_state, (app, det, ep)), (test_pins, (app, det, ep)),
+                             (test_reopen_flow, (app, det, ep))):
                 print(f"-- {fn.__name__}")
                 try:
                     fn(*args)

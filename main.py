@@ -37,10 +37,19 @@ from whitelist_modal import WhitelistModal
 log = logging.getLogger("hermes_controller")
 
 APP_TITLE = "Hermes Controller"
-WIDTH, HEIGHT = 360, 213                 # compact: status line, button, memory card (detail line hidden)
+# Logical layout heights. BASE: status line + button (detail hidden). Panels below: the memory card (MEM_CARD_H) and
+# the graph card (82 px per row + 1 px hairlines), then the expand bar (BAR_BLOCK) or, with everything pinned, a 16 px
+# margin. HEIGHT = the default look: memory pinned, collapsed.
+BASE_H = 110
+MEM_CARD_H = 73
+BAR_BLOCK = 24                           # BAR_PAD + BAR_H + BAR_PAD
+WIDTH, HEIGHT = 360, BASE_H + 14 + MEM_CARD_H + BAR_BLOCK
 DETAIL_H = 18                            # added while the detail line shows (16 px line + spacing)
 PROGRESS_H = 14                          # added while the load progress bar shows
 STATS_H = 3 * 82 + 2                     # three StatRows + two hairlines (logical px)
+PANELS = ("memory", "vram", "decode", "prompt")   # top to bottom; pinned ones stay visible while collapsed
+DEFAULT_PINNED = ("memory",)                       # = the v1.x collapsed look
+PIN_GLYPH, PINNED_GLYPH = "\uE718", "\uE842"    # Segoe Fluent Icons "Pin" (outline) / "PinnedFill"
 STATS_GAP = 8                            # between the memory card and the stats card when expanded
 HEIGHT_EXPANDED = HEIGHT + STATS_GAP + STATS_H
 
@@ -65,7 +74,9 @@ DETAIL_WRAP = 360 - DETAIL_INDENT - 16
 GAP_HEAD_BUTTON = 12                     # status line -> button when no detail is shown
 GAP_DETAIL_TOP = 4                       # status row (28 px, title centred) -> detail line
 GAP_AFTER_DETAIL = 10                    # detail line -> button / progress bar
-CARD_TOP = 14                            # button -> memory card
+CARD_TOP = 14                            # button -> first panel
+BAR_H = 14                               # the expand bar at the bottom
+BAR_PAD = 5                              # above and below the bar
 STATE_SAVE_DEBOUNCE_MS = 300
 REOPEN_STAGGER_S = 1.0                   # pause between two reopened apps
 LIVE_POLL_S = 1.0                        # /metrics poll while serving (model state on the status line), as Strata's
@@ -223,6 +234,11 @@ class HermesControllerApp(ctk.CTk):
         except (TypeError, ValueError):           # a hand-edited state.json must not stop the app
             self._expected_s = 0.0
         self.expanded = bool(saved.get("stats_expanded"))
+        pins = saved.get("pinned")
+        self.pinned: list[str] = ([p for p in PANELS if p in pins] if isinstance(pins, list)
+                                  else list(DEFAULT_PINNED))
+        self._pin_btns: dict[str, Any] = {}
+        self._panel_hover: str | None = None
         self._pending_launcher: launcher_bat.LauncherInfo | None = None   # saved while Strata runs
         self._fetch_metrics = metrics_fetcher or metrics_store.fetch_metrics
         self.metrics = MetricsStore()
@@ -354,7 +370,6 @@ class HermesControllerApp(ctk.CTk):
         self.toggle.grid(row=3, column=0, pady=(GAP_HEAD_BUTTON, 0))
 
         card = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=T.R_CARD)
-        card.grid(row=4, column=0, sticky="ew", padx=16, pady=(CARD_TOP, 16))
         card.grid_columnconfigure(0, weight=1)
         self.mem_card = card
         head = ctk.CTkFrame(card, fg_color="transparent")
@@ -366,13 +381,7 @@ class HermesControllerApp(ctk.CTk):
         self.telemetry = ctk.CTkLabel(head, text="", font=self._mono(11), text_color=T.TEXT_3, anchor="e",
                                       height=16)
         self.telemetry.grid(row=0, column=1, sticky="e")
-        # Chevron: expands the window downward to the stats section. Same height as the header row, so the
-        # collapsed layout is pixel-identical to v1.0.
-        self.chevron = ctk.CTkButton(head, text=T.CHEVRON_DOWN, width=20, height=16, corner_radius=4,
-                                     font=ctk.CTkFont(family=T.icon_family(), size=10),
-                                     fg_color="transparent", hover_color=T.RAISED, text_color=T.TEXT_3,
-                                     command=self.toggle_stats)
-        self.chevron.grid(row=0, column=2, padx=(6, 0))
+        self._add_pin(head, "memory", column=2)
 
         self.gauge = ctk.CTkFrame(card, height=8, corner_radius=4, fg_color=T.RAISED)
         self.gauge.grid(row=1, column=0, sticky="ew", padx=12)
@@ -400,11 +409,21 @@ class HermesControllerApp(ctk.CTk):
         self.row_vram = StatRow(self.stats, "VRAM · 5 min", lambda m: LineGraph(m, window_s=self.vram.window_s))
         self.row_decode = StatRow(self.stats, "Decode · per request", BarGraph)
         self.row_prompt = StatRow(self.stats, "Prompt reading · per request", BarGraph)
-        for i, row in enumerate((self.row_vram, self.row_decode, self.row_prompt)):
-            if i:
-                ctk.CTkFrame(self.stats, height=1, fg_color=T.HAIRLINE, bg_color=T.HAIRLINE, corner_radius=0).grid(
-                    row=2 * i - 1, column=0, sticky="ew", padx=12)
-            row.grid(row=2 * i, column=0, sticky="ew", padx=12)
+        self._rows = {"vram": self.row_vram, "decode": self.row_decode, "prompt": self.row_prompt}
+        self._hairs = [ctk.CTkFrame(self.stats, height=1, fg_color=T.HAIRLINE, bg_color=T.HAIRLINE, corner_radius=0)
+                       for _ in range(2)]
+        for key, row in self._rows.items():
+            self._add_pin(row.head_frame(), key, column=3)
+        self._panel_frames = {"memory": self.mem_card, **self._rows}
+        for key, frame in self._panel_frames.items():
+            self._bind_hover(frame, key)
+
+        self._bottom_pad = ctk.CTkFrame(self, fg_color="transparent", height=1, width=1)
+        # Bottom bar: shows / hides the panels that are not pinned (hidden when everything is pinned).
+        self.chevron = ctk.CTkButton(self, text=T.CHEVRON_DOWN, height=BAR_H, corner_radius=6,
+                                     font=ctk.CTkFont(family=T.icon_family(), size=9),
+                                     fg_color="transparent", hover_color=T.SURFACE, text_color=T.TEXT_3,
+                                     command=self.toggle_stats)
 
     def _style_toggle(self, text: str, colors: tuple[str, str, str], state: str) -> None:
         fg, hover, txt = colors
@@ -857,27 +876,116 @@ class HermesControllerApp(ctk.CTk):
         if pending:
             self._run_worker("hc-state", config_store.save_state, pending)
 
+    def _visible_panels(self) -> list[str]:
+        return list(PANELS) if self.expanded else [p for p in PANELS if p in self.pinned]
+
+    def _graphs_shown(self) -> bool:
+        return any(p in self._visible_panels() for p in ("vram", "decode", "prompt"))
+
     def _apply_expanded(self) -> None:
-        """Grow the window downward to show the stats card, or shrink back to the exact v1.0 size."""
+        """Lay out the panels: pinned ones always, the rest while expanded; the bottom bar toggles between the two.
+        The window grows / shrinks downward to fit."""
+        vis = self._visible_panels()
+        everything_pinned = all(p in self.pinned for p in PANELS)
         self.chevron.configure(text=T.CHEVRON_UP if self.expanded else T.CHEVRON_DOWN)
+        top = CARD_TOP
+        if "memory" in vis:
+            self.mem_card.grid(row=4, column=0, sticky="ew", padx=16, pady=(top, 0))  # .grid() is DPI-scaled
+            top = STATS_GAP
+        else:
+            self.mem_card.grid_remove()
+        rows = [k for k in ("vram", "decode", "prompt") if k in vis]
+        if rows:
+            for h in self._hairs:
+                h.grid_remove()
+            for k, row in self._rows.items():
+                row.grid_remove()
+            for i, k in enumerate(rows):
+                if i:
+                    self._hairs[i - 1].grid(row=2 * i - 1, column=0, sticky="ew", padx=12)
+                self._rows[k].grid(row=2 * i, column=0, sticky="ew", padx=12)
+            self.stats.configure(height=len(rows) * 82 + len(rows) - 1)
+            self.stats.grid(row=5, column=0, sticky="ew", padx=16, pady=(top, 0))
+        else:
+            self.stats.grid_remove()
+        if everything_pinned:
+            self.chevron.grid_remove()
+            self._bottom_pad.grid(row=6, column=0, pady=(0, 16 - 1))
+        else:
+            self._bottom_pad.grid_remove()
+            self.chevron.grid(row=6, column=0, sticky="ew", padx=16, pady=(BAR_PAD, BAR_PAD))
+        for key in PANELS:
+            self._style_pin(key)
+        self._fit_height(force=True)
         if self.expanded:
-            self.mem_card.grid(pady=(CARD_TOP, STATS_GAP))   # .grid(), not grid_configure(): only .grid() is DPI-scaled
-            self.stats.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 16))
-            self._fit_height(force=True)
             self._keep_on_screen()
+        if rows:
             self._refresh_stats()
             if self._stats_id is None and not self._destroyed:
                 self._stats_id = self.after(STATS_MS, self._stats_tick)
+        elif self._stats_id is not None:
+            try:
+                self.after_cancel(self._stats_id)
+            except Exception:  # noqa: BLE001
+                log.debug("after_cancel failed", exc_info=True)
+            self._stats_id = None
+
+    # ------------------------------------------------------------------ pins
+    def _add_pin(self, parent, key: str, column: int) -> None:
+        btn = ctk.CTkButton(parent, text="", width=16, height=16, corner_radius=4,
+                            font=ctk.CTkFont(family=T.icon_family(), size=10), fg_color="transparent",
+                            hover_color=T.RAISED, text_color=T.TEXT_3, command=lambda k=key: self.toggle_pin(k))
+        btn.grid(row=0, column=column, padx=(6, 0))
+        self._pin_btns[key] = btn
+
+    def _style_pin(self, key: str) -> None:
+        """Pinned: a filled pin, always shown. Not pinned: an outline pin, only while the pointer is on the panel."""
+        btn = self._pin_btns.get(key)
+        if btn is None:
+            return
+        if key in self.pinned:
+            btn.configure(text=PINNED_GLYPH, text_color=T.TEXT_2)
+        elif self._panel_hover == key:
+            btn.configure(text=PIN_GLYPH, text_color=T.TEXT_3)
         else:
-            self.stats.grid_remove()
-            self.mem_card.grid(pady=(CARD_TOP, 16))
-            self._fit_height(force=True)
-            if self._stats_id is not None:
-                try:
-                    self.after_cancel(self._stats_id)
-                except Exception:  # noqa: BLE001
-                    log.debug("after_cancel failed", exc_info=True)
-                self._stats_id = None
+            btn.configure(text="")
+
+    def toggle_pin(self, key: str) -> None:
+        if key in self.pinned:
+            self.pinned.remove(key)
+        else:
+            self.pinned = [p for p in PANELS if p in self.pinned or p == key]
+        self._save_state_later("pinned", list(self.pinned))
+        self._apply_expanded()
+
+    def _bind_hover(self, frame, key: str) -> None:
+        def walk(w):
+            yield w
+            for c in w.winfo_children():
+                yield from walk(c)
+        for w in walk(frame):
+            w.bind("<Enter>", lambda _e, k=key: self._set_panel_hover(k), add="+")
+            w.bind("<Leave>", lambda _e, k=key: self.after(40, self._check_panel_leave, k), add="+")
+
+    def _set_panel_hover(self, key: str | None) -> None:
+        if self._panel_hover != key:
+            old, self._panel_hover = self._panel_hover, key
+            for k in {old, key} - {None}:
+                self._style_pin(k)
+
+    def _check_panel_leave(self, key: str) -> None:
+        """<Leave> also fires when the pointer moves onto a child widget: hide only once it is really outside."""
+        if self._destroyed or self._panel_hover != key:
+            return
+        frame = self._panel_frames[key]
+        try:
+            x, y = self.winfo_pointerxy()
+            fx, fy = frame.winfo_rootx(), frame.winfo_rooty()
+            inside = frame.winfo_ismapped() and fx <= x < fx + frame.winfo_width() and fy <= y < fy + frame.winfo_height()
+        except Exception:  # noqa: BLE001
+            inside = False
+        if not inside:
+            self._set_panel_hover(None)
 
     def _keep_on_screen(self) -> None:
         """Expanding near the bottom of the screen would push the graphs under the taskbar: slide the window up."""
@@ -912,18 +1020,18 @@ class HermesControllerApp(ctk.CTk):
 
     def _stats_tick(self) -> None:
         self._stats_id = None
-        if self._destroyed or not self.expanded:
+        if self._destroyed or not self._graphs_shown():
             return
         try:
             if not self._iconic:
                 self._refresh_stats()
         finally:
-            if not self._destroyed and self.expanded:
+            if not self._destroyed and self._graphs_shown():
                 self._stats_id = self.after(STATS_MS, self._stats_tick)
 
     def _refresh_stats(self) -> None:
         """Main thread: redraw the three graphs from the sampler / metrics store."""
-        if not self.expanded:
+        if not self._graphs_shown():
             return
         polling = self.state_name in (ACTIVE, STOPPING)
         if not polling:

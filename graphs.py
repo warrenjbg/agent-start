@@ -261,10 +261,14 @@ class StatRow(ctk.CTkFrame):
                                   text_color=T.TEXT_3, anchor="e", height=16)
         self.value.grid(row=0, column=2, sticky="e", pady=(10, 6))
         self._wrap = ctk.CTkFrame(self, fg_color=T.SURFACE, height=CANVAS_H, corner_radius=0)
-        self._wrap.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self._wrap.grid(row=1, column=0, columnspan=4, sticky="ew")   # column 3: the owner's pin button
         self._wrap.grid_propagate(False)
         self.graph = graph_factory(self._wrap)
         self.graph.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+    def head_frame(self):
+        """Where the owner adds header controls (row 0, column 3 is free)."""
+        return self
 
     def set_value(self, text: str, color: str = T.TEXT, tag: str = "") -> None:
         if self.value.cget("text") != text or self.value.cget("text_color") != color:

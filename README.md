@@ -44,8 +44,8 @@ script); the Settings dialog and the log show the same number.
 | ⚙ | **Settings**: Strata launcher, the Strata dashboard link + API address, Protected apps (see below). Disabled while starting/stopping |
 | Detail line | Optional: idle = which apps would be closed; serving = *Up 12 min · last reply 85 tok/s*. Always shown when it matters: loading (phase, *usually 0:58*, progress bar), Low-RAM mode, errors (click opens the log), notes such as *Stopped · freed 47 GB*, and the one-click *Reopen …* offer |
 | Button | **Turn on** · **Cancel** (while starting) · **Turn off** |
-| Memory | Bar + legend of physical RAM: other apps · Strata · free; "Freed" total for the session |
-| ⌄ (in the Memory card) | Expands the window downward to the **stats** section; click again to collapse |
+| Panels | **Memory** (bar + legend of physical RAM: other apps · Strata · free; "Freed" total for the session), **VRAM**, **Decode**, **Prompt reading** (see Stats). Each has a pin (shown on hover; filled when pinned): pinned panels stay visible while collapsed, in this order. Default: Memory pinned. Nothing pinned = just the status line and the button |
+| ⌄ bar (bottom) | Shows / hides the panels that are not pinned; the window grows downward. Hidden when every panel is pinned. Pins and the open/closed state are remembered |
 
 ## Settings (⚙)
 
