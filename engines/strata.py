@@ -99,6 +99,20 @@ def strata_scripts(proc: "psutil.Process") -> list[str]:
     return out
 
 
+class TunedLaunch:
+    """A Strata launcher plus the user's context / vision choice for it (Settings). Everything else is the
+    launcher's own (path, file_name, model_name, summary(), ...)."""
+
+    def __init__(self, base: Any, context: int | None, vision: bool | None) -> None:
+        self.base, self.context, self.vision = base, context, vision
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.base, name)
+
+    def summary(self) -> str:
+        return self.base.summary()
+
+
 class StrataEngine(Engine):
     id = "strata"
     name = "Strata"
@@ -307,11 +321,70 @@ class StrataEngine(Engine):
 
     def same_launch(self, cfg: Mapping[str, Any], info: Any) -> bool:
         import launcher_bat
-        return launcher_bat.same_launch(dict(cfg), info)
+        import strata_tuning as st
+        base = getattr(info, "base", info)
+        if not launcher_bat.same_launch(dict(cfg), base):
+            return False
+        if not isinstance(info, TunedLaunch) or not base.config_path:
+            return True
+        trial: dict = {}
+        st.store(trial, base.config_path, st.tuning_of(st.read_json(base.config_path)), info.context, info.vision)
+        return st.stored(trial, base.config_path) == st.stored(cfg, base.config_path)
 
     def apply_launcher(self, cfg: dict, info: Any) -> None:
         import launcher_bat
-        launcher_bat.apply_to_config(cfg, info)
+        import strata_tuning as st
+        base = getattr(info, "base", info)
+        launcher_bat.apply_to_config(cfg, base)
+        if isinstance(info, TunedLaunch) and base.config_path:     # a plain launcher keeps the stored choice
+            st.store(cfg, base.config_path, st.tuning_of(st.read_json(base.config_path)), info.context, info.vision)
+
+    # ---- context length / vision: a tuned COPY of the run config (strata_tuning); Strata's files are only read
+    def launcher_controls(self, info: Any, cfg: Mapping[str, Any]) -> dict | None:
+        try:
+            import strata_tuning as st
+            base = getattr(info, "base", info)
+            path = getattr(base, "config_path", None)
+            if not path:
+                return None
+            ft = st.tuning_of(st.read_json(path))
+            if ft is None or (ft.context is None and not ft.vision_possible):
+                return None
+            if isinstance(info, TunedLaunch):
+                ctx = info.context or ft.context
+                vis = ft.vision_possible and info.vision is not False
+            else:
+                ctx, vis = st.effective(cfg, path, ft)
+            choices = list(st.CONTEXT_CHOICES)
+            for n in (ft.context, ctx):
+                if n and n not in [c for _l, c in choices]:
+                    choices.append((st.context_label(n), n))
+            return {"context_choices": sorted(choices, key=lambda c: c[1]), "context": ctx, "vision": vis,
+                    "vision_possible": ft.vision_possible, "context_file": ft.context}
+        except Exception:  # noqa: BLE001
+            return None
+
+    def with_controls(self, info: Any, context: int | None, vision: bool | None) -> Any:
+        return TunedLaunch(getattr(info, "base", info), context, vision)
+
+    def before_launch(self, cfg: Mapping[str, Any], plan: LaunchPlan) -> LaunchPlan:
+        """A context / vision choice for this run config: write the tuned copy into Agent Start's data folder and
+        start Strata with it. No choice: Strata's own file, as always."""
+        import strata_tuning as st
+        path = self.config_path(cfg)
+        choice = st.stored(cfg, path)
+        if not path or not choice:
+            return plan
+        try:
+            import config_store
+            copy_file = st.write_copy(path, str(config_store.DATA_DIR / "strata"), choice)
+        except (OSError, ValueError) as exc:
+            raise LaunchError(f"Could not prepare Strata's config with your context / vision choice: {exc}") from exc
+        cmd = list(plan.cmd)
+        for i, a in enumerate(cmd[:-1]):
+            if str(a) == "--config":
+                cmd[i + 1] = copy_file
+        return LaunchPlan(cmd=cmd, cwd=plan.cwd, env=dict(plan.env))
 
     def load_progress(self, log_text: str, elapsed_s: float, expected_s: float | None) -> tuple[str, float, str | None]:
         import load_progress

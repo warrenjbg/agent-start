@@ -154,9 +154,12 @@ def test_strata_tabs() -> None:
         pump(app, 0.4)
         check(H.settings_tabs(d) == ["Model", "Behaviour", "About"] and H.settings_tab(d) == "Model",
               f"Strata: three tabs, opens on Model ({H.settings_tabs(d)}, {H.settings_tab(d)})")
-        ok, have = _tab_texts_ok(d, "Model", ["Engine", "Strata launcher", "Browse"])
-        check(ok and not any(t in have for t in ("Context length", "Vision", "Port", SD.ADVANCED_TITLE)),
-              f"Strata Model tab: Engine, the launcher dropdown + Browse and the detail line only ({have})")
+        ok, have = _tab_texts_ok(d, "Model", ["Engine", "Strata launcher", "Browse", "Context length", "Vision"])
+        check(ok and not any(t in have for t in ("Port", "Build", SD.ADVANCED_TITLE)),
+              f"Strata Model tab: Engine, the launcher dropdown + Browse, the detail line, Context length and "
+              f"Vision; no llama.cpp rows ({have})")
+        check(str(d._tune_ctx_menu.cget("state")) == "disabled" and d._tune_ctx.get() == "As in the launcher",
+              "no launcher chosen / nothing to tune: the two rows are greyed out")
         check(H.settings_tab_of(d, d._detail) == "Model" and H.settings_tab_of(d, d._menu) == "Model",
               "Strata: launcher dropdown and its detail line are on Model")
         check(_shown(d._save_btn) and _shown(d._cancel_btn) and not _shown(d._close_btn) and _shown(d._msg),

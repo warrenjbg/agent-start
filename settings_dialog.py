@@ -394,7 +394,20 @@ class SettingsDialog(ctk.CTkToplevel):
             self._browse_btn.grid(row=0, column=1)
             self._detail = ctk.CTkLabel(tab, text="", anchor="nw", justify="left", font=self._mono,
                                         text_color=T.TEXT_2, wraplength=self.WIDTH - 24, height=32)
-            self._detail.grid(row=r + 2, column=0, sticky="ew", pady=(4, 0))
+            self._detail.grid(row=r + 2, column=0, sticky="ew", pady=(4, 4))
+            # context length / vision of the chosen launcher, when the engine offers them (engine.launcher_controls)
+            self._base_info: Any = None
+            self._tune: dict | None = None
+            self._tune_ctx = ctk.StringVar(value="As in the launcher")
+            self._tune_vis = ctk.StringVar(value="As in the launcher")
+            line = self._labelled(tab, r + 3, "Context length")
+            self._tune_ctx_menu = self._option_menu(line, self._tune_ctx, ["As in the launcher"], self._tune_changed)
+            self._tune_ctx_menu.grid(row=0, column=1, sticky="ew")
+            line = self._labelled(tab, r + 4, "Vision")
+            self._tune_vis_menu = self._option_menu(line, self._tune_vis, ["As in the launcher"], self._tune_changed)
+            self._tune_vis_menu.grid(row=0, column=1, sticky="ew")
+            self._tune_ctx_menu.configure(state="disabled")
+            self._tune_vis_menu.configure(state="disabled")
             self._program_entry = ctk.CTkEntry(tab)          # not used with launcher files (never laid out)
             self._args_entry = ctk.CTkEntry(tab)
             return
@@ -782,12 +795,52 @@ class SettingsDialog(ctk.CTkToplevel):
             return
         self._info = info
         self._show_detail(info.summary(), error=False)
+        self._load_tune(info)
         if not self._saving:
             self._enable_save(True)
         changed = not self._same(path, self._initial)
         self._msg.configure(text=f"Applies next start — {self._engine.name} keeps running"
                             if self._running and changed else "",
                             text_color=T.TEXT_2)
+
+    # ---- launcher files: the engine's own controls for the chosen launcher (Strata: context length, vision)
+    def _load_tune(self, info: Any) -> None:
+        """Show what the chosen launcher is set to (the user's saved choice over the file's own values)."""
+        self._base_info, self._tune = info, None
+        try:
+            self._tune = self._engine.launcher_controls(info, self._cfg)
+        except Exception:  # noqa: BLE001 - an engine helper must not take the dialog down
+            log.debug("launcher controls unavailable", exc_info=True)
+        t = self._tune
+        if not t:
+            for var, menu in ((self._tune_ctx, self._tune_ctx_menu), (self._tune_vis, self._tune_vis_menu)):
+                var.set("As in the launcher")
+                menu.configure(values=["As in the launcher"], state="disabled")
+            return
+        labels = [la for la, _n in t.get("context_choices") or []]
+        cur = next((la for la, n in t.get("context_choices") or [] if n == t.get("context")), None)
+        self._tune_ctx_menu.configure(values=labels or ["As in the launcher"],
+                                      state="normal" if labels and t.get("context") else "disabled")
+        self._tune_ctx.set(cur or "As in the launcher")
+        if t.get("vision_possible"):
+            self._tune_vis_menu.configure(values=["On", "Off"], state="normal")
+            self._tune_vis.set("On" if t.get("vision") else "Off")
+        else:
+            self._tune_vis_menu.configure(values=["Not available for this model"], state="disabled")
+            self._tune_vis.set("Not available for this model")
+        self._info = self._engine.with_controls(info, t.get("context"), bool(t.get("vision")))
+
+    def _tune_changed(self, _label: str = "") -> None:
+        t, base = self._tune, self._base_info
+        if not t or base is None or self._saving:
+            return
+        ctx = next((n for la, n in t.get("context_choices") or [] if la == self._tune_ctx.get()), t.get("context"))
+        vis = self._tune_vis.get() == "On" if t.get("vision_possible") else False
+        self._info = self._engine.with_controls(base, ctx, vis)
+        changed = not self._engine.same_launch(self._cfg, self._info)
+        self._enable_save(True)
+        self._msg.configure(text=f"Applies next start — {self._engine.name} keeps running"
+                            if self._running and changed else "", text_color=T.TEXT_2)
 
     def _command_changed(self, initial: bool = False) -> None:
         """Program + arguments (engines without launcher files): ask the engine whether this would launch; only

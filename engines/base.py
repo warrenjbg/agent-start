@@ -442,6 +442,22 @@ class Engine:
         plan_launch like a choice made in Settings. Never raises."""
         return None
 
+    def before_launch(self, cfg: Mapping[str, Any], plan: LaunchPlan) -> LaunchPlan:
+        """Called by the supervisor right before a REAL start, with the plan plan_launch made (never for the
+        checks Settings runs). An engine may prepare files it owns and return an adjusted plan; cmd[0] must stay
+        the same program. Raise LaunchError to refuse the start. Default: the plan as it is."""
+        return plan
+
+    def launcher_controls(self, info: Any, cfg: Mapping[str, Any]) -> dict | None:
+        """CAP_LAUNCHER_FILES: friendly controls Settings shows for one launcher, or None. Keys:
+        context_choices [(label, tokens)], context (tokens in effect | None), vision (bool in effect),
+        vision_possible (bool: the launcher can read pictures at all)."""
+        return None
+
+    def with_controls(self, info: Any, context: int | None, vision: bool | None) -> Any:
+        """The launcher info carrying those choices (saved through apply_launcher). Default: unchanged."""
+        return info
+
     setup_action: str = "Set up"                              # the main button while nothing is configured
 
     def found_summary(self, found: Any) -> tuple[str, str]:

@@ -718,6 +718,10 @@ class EndpointManager:
         name = self._engine.name
         try:
             plan = self._engine.plan_launch(self._cfg)
+            program = str(plan.cmd[0]) if plan.cmd else ""
+            plan = self._engine.before_launch(self._cfg, plan)
+            if not plan.cmd or str(plan.cmd[0]) != program:
+                return "error", "the engine changed the program to start"      # before_launch may only adjust
         except LaunchError as e:
             return "error", str(e)
         cmd, cwd = [str(x) for x in plan.cmd], plan.cwd

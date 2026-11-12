@@ -3306,6 +3306,7 @@ def _selftest() -> int:
         if not {"strata", "llama_cpp"} <= set(engines.available()):   # discovery imports every engine module
             return 5
         import fit_check  # noqa: F401
+        import strata_tuning  # noqa: F401
         import llama_finder  # noqa: F401
         import engine_profiles  # noqa: F401
         import fit_watch  # noqa: F401
