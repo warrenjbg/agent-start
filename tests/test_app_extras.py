@@ -739,7 +739,7 @@ def test_settings_switches() -> None:
         pump(app, 0.4)
         d = app.dialog
         keys = list(getattr(d, "switches", {}))
-        check(keys == ["reopen", "tray", "autostart", "games", "updates"], f"Settings switches ({keys})")
+        check(keys == ["reopen", "tray", "autostart", "games", "memory", "updates"], f"Settings switches ({keys})")
         U.shot(d, "extras_settings_switches")
         if "tray" in keys:
             check(d.switches["tray"][0].get() is True, "tray switch on")
@@ -984,6 +984,126 @@ def test_v181_review() -> None:
     config_store.save_state({"game_alert": None, "game_action": "off"})
 
 
+def test_memory_trigger() -> None:
+    """An app that takes the memory Strata needs (mem_watch report): own setting, same safe turn-off as a game.
+    Asserted on what the user sees: toasts, the pending line, the main button, the Settings row."""
+    import ui_helpers as H
+    app, det, ep = U.new_app()
+    try:
+        app._extras = True
+        mw = FakeWatcher()
+        app.memwatch, app.games = mw, FakeWatcher()
+        check(mw.armed == 0, "idle: the memory check is not armed")
+        U.to_active(app, ep)
+        pump(app, 0.5)
+        check(mw.armed == 1, "armed once Strata serves with the model loaded")
+        # default: Ask me - a toast naming the app and its memory; nothing stops by itself
+        d = H.open_settings(app)
+        row = H.settings_option(d, "When memory runs low")
+        check(row["value"] == "Ask me" and row["choices"] == ["Turn Strata off", "Ask me", "Do nothing"] and row["enabled"],
+              f"Settings row 'When memory runs low': Ask me by default, the same three choices ({row})")
+        games = H.settings_option(d, "When a game starts")
+        check(games["value"] == "Turn Strata off", "the game setting keeps its own value")
+        U.shot(d, "extras_settings_memory")
+        H.close_settings(d)
+        pump(app, 0.3)
+        TOASTS.clear()
+        n = len(ep.stop_calls)
+        app._on_memory_app("Blender", 6349.0, "why")
+        check(pump_until(app, lambda: TOASTS, 3) and TOASTS[-1][0] == "Memory is running low"
+              and TOASTS[-1][1].startswith("Blender is using 6.2 GB while Strata is running."),
+              f"ask: the toast names the app and how much memory it took ({TOASTS[-1:]})")
+        pump(app, main.IDLE_GRACE_S + 0.6)
+        check(len(ep.stop_calls) == n and not H.pending_line_visible(app) and H.main_button_text(app) == "Turn off",
+              "ask: Strata keeps running until the user decides")
+        real_frozen, real_reg = config_store.FROZEN, main._protocol_registered
+        config_store.FROZEN, main._protocol_registered = True, lambda: True
+        try:
+            TOASTS.clear()
+            app._on_memory_app("Blender", 6349.0)
+            pump_until(app, lambda: TOASTS, 3)
+            check(TOASTS and TOASTS[-1][2] == [("Turn off Strata", "agentstart://game-off")],
+                  f"installed: the toast has the Turn off Strata button ({TOASTS[-1:]})")
+        finally:
+            config_store.FROZEN, main._protocol_registered = real_frozen, real_reg
+        # the toast's button: safe turn-off, no dialog, and the stop toast says it was about memory
+        app._fetch_metrics.live = "generating"
+        pump(app, 0.6)
+        app.game_off_requested()
+        check(pump_until(app, lambda: H.pending_line_visible(app), 3) and H.pending_line_text(app).startswith("Turns off after"),
+              f"button during a reply: waits for it ({H.pending_line_text(app)!r})")
+        check(H.open_dialog(app) is None and len(ep.stop_calls) == n, "no dialog, nothing stopped mid-reply")
+        app._fetch_metrics.live = "idle"
+        check(pump_until(app, lambda: len(ep.stop_calls) > n, main.IDLE_GRACE_S + 3), "stops once the reply is done")
+        nt = getattr(ep, "next_toast", None)
+        check(isinstance(nt, tuple) and nt[1].startswith("Blender needed the memory · freed {freed} for it."),
+              f"the stop toast says why ({nt})")
+        ep.status_value = dict(U.IDLE_STATUS)
+        U.fire(ep.stop_calls[-1][0], U.stop_result())
+        pump(app, 0.5)
+        check(mw.disarmed >= 1, "stopped: the memory check is disarmed")
+        # "Turn Strata off": acts by itself, like a game start
+        d = H.open_settings(app)
+        check(H.choose_settings_option(d, "When memory runs low", "Turn Strata off"), "Settings: pick Turn Strata off")
+        H.close_settings(d)
+        check(pump_until(app, lambda: config_store.load_state().get("memory_action") == "off", 3),
+              "the choice is saved (state.json memory_action)")
+        U.to_active(app, ep)
+        pump(app, 0.5)
+        TOASTS.clear()
+        n = len(ep.stop_calls)
+        app._on_memory_app("DaVinci Resolve", 9000.0)
+        check(pump_until(app, lambda: len(ep.stop_calls) > n, main.IDLE_GRACE_S + 3), "off: a safe stop starts by itself")
+        check(not any(t_[0] == "Memory is running low" for t_ in TOASTS) and H.open_dialog(app) is None,
+              "off: no question toast, no dialog")
+        nt = getattr(ep, "next_toast", None)
+        check(isinstance(nt, tuple) and "DaVinci Resolve needed the memory" in nt[1], f"stop toast names the app ({nt})")
+        ep.status_value = dict(U.IDLE_STATUS)
+        U.fire(ep.stop_calls[-1][0], U.stop_result())
+        pump(app, 0.5)
+        # "Do nothing": never armed, a stray report is ignored
+        app.set_memory_action("Do nothing")
+        armed_before = mw.armed
+        U.to_active(app, ep)
+        pump(app, 0.5)
+        TOASTS.clear()
+        n = len(ep.stop_calls)
+        app._on_memory_app("Blender", 9000.0)
+        pump(app, 0.4)
+        check(mw.armed == armed_before and not TOASTS and len(ep.stop_calls) == n and not H.pending_line_visible(app),
+              "Do nothing: not armed, nothing happens")
+        # the game setting on "Do nothing" does not switch the memory check off
+        app.set_memory_action("Ask me")
+        app.set_game_action("Do nothing")
+        pump(app, 0.2)
+        check(mw.armed == armed_before + 1, "memory check armed while the game setting is Do nothing")
+        TOASTS.clear()
+        app._on_memory_app("Blender", 5000.0)
+        check(pump_until(app, lambda: TOASTS, 3) and TOASTS[-1][0] == "Memory is running low", "and it still reports")
+        # a report while a dialog is open waits for it
+        app.set_game_action("Turn Strata off")
+        d = H.open_settings(app)
+        TOASTS.clear()
+        app._on_memory_app("Unreal Editor", 7000.0)
+        pump(app, 0.3)
+        check(not TOASTS, "a report while Settings is open waits")
+        H.close_settings(d)
+        check(pump_until(app, lambda: any("Unreal Editor" in t_[1] for t_ in TOASTS), 6), "delivered after it closes")
+    finally:
+        close(app)
+    # an old state.json without the key, or with junk in it, means Ask me
+    for junk in (None, "", "kill", 3):
+        a2 = None
+        config_store.save_state({"memory_action": junk})
+        try:
+            a2, _d2, _e2 = U.new_app()
+            check(a2._mem_action == "ask", f"state.json memory_action {junk!r} -> Ask me")
+        finally:
+            if a2 is not None:
+                close(a2)
+    config_store.save_state({"memory_action": None})
+
+
 def run() -> int:
     import tempfile
     main.TOGGLE_DEBOUNCE_S = 0.0
@@ -997,7 +1117,7 @@ def run() -> int:
         for fn, args in ((test_tool_gap, ()), (test_tray, ()), (test_update_offer, ()),
                          (test_first_start_search, (tmp,)), (test_reopen_switch, ()),
                          (test_game_alert_and_tray_models, (tmp,)), (test_settings_switches, ()),
-                         (test_review_fixes, ()), (test_v181_review, ())):
+                         (test_review_fixes, ()), (test_v181_review, ()), (test_memory_trigger, ())):
             gc.collect()
             print(f"-- {fn.__name__}", flush=True)
             try:

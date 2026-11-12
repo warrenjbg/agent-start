@@ -12,6 +12,10 @@
   "min_ram_mb": 250,
   "min_vram_mb": 200,
   "min_game_ram_mb": 50,
+  "mem_watch_app_mb": 4096,
+  "mem_watch_sustain_s": 15,
+  "mem_watch_floor_baseline_pct": 50,
+  "mem_watch_floor_total_pct": 6,
   "game_dirs": [
     "steamapps",
     "Epic Games",

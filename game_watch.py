@@ -10,6 +10,10 @@ free its RAM.
   * disarm()  -> no further alerts; the thread then sleeps without scanning until armed again or stopped.
 
 scan_once() is the pure core (fake process lists in tests); GameWatcher is the thread around it.
+
+A co-scanner (mem_watch.MemWatcher, passed as co_scan=) shares the thread and the ONE process snapshot per pass:
+begin(procs, now) -> game check -> decide(now) -> deliver(report) for each. Games reported by either side are kept
+in one registry of install keys (claim_game_keys / game_key_claimed), so a game is reported once per session.
 """
 from __future__ import annotations
 
@@ -18,7 +22,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable, Protocol
 
 import psutil
 
@@ -271,11 +275,23 @@ def _ram_mb(info: dict) -> float | None:
 
 # --------------------------------------------------------------------------------------------- watcher
 
+class CoScanner(Protocol):
+    """A second check on the game-watch thread over the same snapshot (mem_watch.MemWatcher)."""
+
+    @property
+    def armed(self) -> bool: ...
+    def attach(self, watcher: GameWatcher) -> None: ...
+    def begin(self, procs: list[dict], now: float) -> None: ...
+    def decide(self, now: float) -> list[Any]: ...
+    def deliver(self, report: Any) -> None: ...
+
+
 class GameWatcher:
     """Background 'game-watch' thread around scan_once(). Observe only."""
 
     def __init__(self, game_dirs: list[str], game_exclude: Iterable[str] = (), interval_s: float = 3.0,
-                 on_game: Callable[[GameStart], None] | None = None, min_age_s: float = 2.0) -> None:
+                 on_game: Callable[[GameStart], None] | None = None, min_age_s: float = 2.0,
+                 co_scan: CoScanner | None = None) -> None:
         self.game_dirs = [str(d) for d in (game_dirs or []) if d and str(d).strip()]
         self.game_exclude = frozenset(norm(n) for n in (game_exclude or ()) if isinstance(n, str) and n)
         self.interval_s = max(0.2, float(interval_s))
@@ -292,6 +308,12 @@ class GameWatcher:
         self._session_ok = current_session_filter()
         self.last_scan_ms: float | None = None
         self.scans = 0
+        # install keys reported this serving session, by this watcher or claimed by the co-scanner. Cleared when a
+        # session starts from fully idle (arm() / co_armed() while the other side is not armed).
+        self._claimed: set[str] = set()
+        self.co_scan = co_scan
+        if co_scan is not None:
+            co_scan.attach(self)
 
     # ---- public API ---------------------------------------------------------------------------------
 
@@ -319,7 +341,10 @@ class GameWatcher:
 
     def arm(self) -> None:
         """Start alerting on games started from now on; anything running now never alerts. O(1)."""
+        co_on = self._co_on()
         with self._lock:
+            if not co_on and not self._armed:
+                self._claimed.clear()                   # a new serving session
             self._gen += 1
             self._armed = True
             self._arm_time = time.time()
@@ -337,12 +362,36 @@ class GameWatcher:
         if was:
             log.info("game_watch: disarmed")
 
+    # ---- co-scanner support --------------------------------------------------------------------------
+
+    def _co_on(self) -> bool:
+        co = self.co_scan
+        try:
+            return co is not None and bool(co.armed)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def co_armed(self) -> None:
+        """The co-scanner was armed: a fresh registry if games are not armed either (new session); wake the thread."""
+        with self._lock:
+            if not self._armed:
+                self._claimed.clear()
+            self._wake.set()
+
+    def claim_game_keys(self, keys: Iterable[str]) -> None:
+        with self._lock:
+            self._claimed.update(k for k in keys if k)
+
+    def game_key_claimed(self, key: str) -> bool:
+        with self._lock:
+            return key in self._claimed
+
     # ---- thread -------------------------------------------------------------------------------------
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                if not self._armed:
+                if not self._armed and not self._co_on():
                     self._wake.wait()                       # idle: no scanning while disarmed
                     self._wake.clear()
                     continue
@@ -356,35 +405,60 @@ class GameWatcher:
             self._wake.clear()
 
     def _tick(self) -> float:
-        """One armed pass. Returns the delay before the next one."""
+        """One armed pass: ONE snapshot for the game check and the co-scanner. Returns the delay before the next."""
+        co = self.co_scan if self._co_on() else None
         with self._lock:
-            if not self._armed:
-                return 0.0
+            games_on = self._armed
             gen, arm_time, seen = self._gen, self._arm_time, self._seen
+        if not games_on and co is None:
+            return 0.0
         t0 = time.perf_counter()
         procs = snapshot()
-        if seen is None:
-            seen = baseline_keys(self.game_dirs, self.game_exclude, before=arm_time, procs=procs,
-                                 session_ok=self._session_ok)
-            with self._lock:
-                if self._gen != gen:
-                    return 0.0
-                self._seen = seen
-            log.info("game_watch: baseline %d game install(s)", len(seen))
+        if co is not None:
+            try:
+                co.begin(procs, time.time())            # groups apps; re-claims games inside apps it reported
+            except Exception:
+                log.exception("game_watch: co-scanner pass failed")
         pending: list[str] = []
-        found = scan_once(seen, self.game_dirs, self.game_exclude, time.time(), self.min_age_s, procs,
-                          session_ok=self._session_ok, pending=pending)
+        games: list[GameStart] = []
+        if games_on:
+            if seen is None:
+                seen = baseline_keys(self.game_dirs, self.game_exclude, before=arm_time, procs=procs,
+                                     session_ok=self._session_ok)
+                with self._lock:
+                    if self._gen != gen:
+                        return 0.0
+                    self._seen = seen
+                log.info("game_watch: baseline %d game install(s)", len(seen))
+            found = scan_once(seen, self.game_dirs, self.game_exclude, time.time(), self.min_age_s, procs,
+                              session_ok=self._session_ok, pending=pending)
+            for g in found:
+                key = install_of(g.exe, self.game_dirs)
+                with self._lock:
+                    if self._gen != gen or not self._armed or self._stop.is_set() or self._seen is None:
+                        games = []                      # disarmed / re-armed meanwhile: no game alerts this pass
+                        break
+                    if key is not None:
+                        if key[0] in self._seen:
+                            continue
+                        self._seen.add(key[0])
+                        if key[0] in self._claimed:     # inside an app the memory check already reported
+                            log.info("game_watch: %s already reported by the memory check", g.title)
+                            continue
+                        self._claimed.add(key[0])
+                games.append(g)
+        reports: list[Any] = []
+        if co is not None:
+            try:
+                reports = list(co.decide(time.time()))  # after the game claims: a reported game is not reported again
+            except Exception:
+                log.exception("game_watch: co-scanner decision failed")
         self.last_scan_ms = (time.perf_counter() - t0) * 1000.0
         self.scans += 1
-        for g in found:
-            key = install_of(g.exe, self.game_dirs)
+        for g in games:
             with self._lock:
                 if self._gen != gen or not self._armed or self._stop.is_set():
-                    return 0.0
-                if key is not None:
-                    if key[0] in self._seen:
-                        continue
-                    self._seen.add(key[0])
+                    break
             log.info("game_watch: game started: %s (%s, pid %d, %.0f MB)", g.title, g.name, g.pid, g.ram_mb)
             cb = self.on_game
             if cb is not None:
@@ -392,6 +466,14 @@ class GameWatcher:
                     cb(g)
                 except Exception:
                     log.exception("game_watch: on_game callback failed")
+        if co is not None:
+            for r in reports:
+                if self._stop.is_set():
+                    break
+                try:
+                    co.deliver(r)                       # checks its own arm generation
+                except Exception:
+                    log.exception("game_watch: co-scanner report failed")
         if pending:                                         # re-check young candidates as soon as they age
             return max(0.25, min(self.interval_s, self.min_age_s + 0.1))
         return self.interval_s

@@ -167,6 +167,11 @@ def format_preview(res: dict) -> str:
     return f"{line1}\n{line2}" if line2 else line1
 
 
+def _stop_info(title: str, reason: str = "game") -> dict:
+    """What a pending stop carries when an app caused it: the app's name, plus why when it was not a game start."""
+    return {"game": title} if reason == "game" else {"game": title, "reason": reason}
+
+
 def _toast_worker(title: str, msg: str, buttons: list[tuple[str, str]] | None = None) -> None:
     """A Windows toast. buttons: (label, protocol URL), e.g. agentstart://game-off. toasts.py keeps every text as
     data (a game folder named $(...) must not run PowerShell)."""
@@ -374,12 +379,20 @@ class AgentStartApp(ctk.CTk):
             ga = "none" if saved.get("game_alert") is False else "off"
         self._game_action = ga
         self._game_pref = ga != "none"
+        # Settings "When memory runs low": an app started while serving that takes the memory Strata needs
+        # (mem_watch; any app, not only games in known folders). New key: a state.json without it means "ask".
+        ma = saved.get("memory_action")
+        self._mem_action = ma if ma in GAME_ACTIONS else "ask"
+        self.memwatch = None                     # mem_watch.MemWatcher (extras only); runs inside the game scan
+        self._mem_armed = False
+        self._mem_queued: tuple[str, float] | None = None   # reported while a dialog / box was open
         self._no_tray = not extras or not self._tray_pref
         self._no_finder = not extras
         self.games = None                        # game_watch.GameWatcher (extras only)
         self._games_armed = False
         self._game_alert: tuple | None = None    # (monotonic, start token, title) of the last "Ask me" game toast
         self._last_stop_game: str | None = None  # title of the game the running stop is for
+        self._last_stop_reason = "game"          # "game" | "memory": why that stop was asked for (toast wording)
         self._game_queued: tuple[str, float] | None = None  # a game started while Strata was still loading
         self._skip_reopen_once = False           # Turn off from the game alert: offer the closed apps, don't relaunch
         self._stop_toast: tuple[str, str] | None = None     # wording for the next stop's toast (safe Turn off)
@@ -639,7 +652,8 @@ class AgentStartApp(ctk.CTk):
             self._refresh_launchers()            # the ✓ / tray submenu follow a switch made while serving
         # watch from Turn on (a game started during the load alerts once Strata is ready)
         self._arm_games(st in (STARTING, ACTIVE))
-        if st == ACTIVE and self.loaded is not False and self._game_queued is not None:
+        self._arm_memory(st == ACTIVE and self.loaded is True)
+        if st == ACTIVE and self.loaded is not False and (self._game_queued is not None or self._mem_queued is not None):
             self.after_idle(self._deliver_queued_game)
         if st == ACTIVE:
             if self._ready_mono is None:
@@ -1599,6 +1613,7 @@ class AgentStartApp(ctk.CTk):
             self._update_telemetry()
             self._request_preview()
             self._sync_tray()
+            self._arm_memory(self.loaded is True)   # the model finished loading after the state changed
             self._deliver_queued_game()          # a game that started while a dialog / box was open
             if self.tray is None and not self._no_tray and time.monotonic() < self._tray_retry_until:
                 self._start_tray()               # the icon failed at start: try again (every tick, ~5 s)
@@ -2021,8 +2036,10 @@ class AgentStartApp(ctk.CTk):
         game = action[1].get("game") if action[0] == "off" and isinstance(action[1], dict) else None
         if game:                                 # a stop because a game started: say so, don't relaunch over it
             self._skip_reopen_once, self._last_stop_game = True, game
+            self._last_stop_reason = why = str(action[1].get("reason") or "game")
             closed = bool(reopen.load_pending())
-            self._stop_toast = ("Strata turned off", f"{_short(game, 40)} started · freed {{freed}} for it."
+            what = "needed the memory" if why == "memory" else "started"
+            self._stop_toast = ("Strata turned off", f"{_short(game, 40)} {what} · freed {{freed}} for it."
                                 + (" The apps closed for Strata are in Agent Start (Reopen)." if closed else ""))
         self._execute(("off", None) if game else action, force=force)
 
@@ -2142,7 +2159,7 @@ class AgentStartApp(ctk.CTk):
             if game and not self._exit_pending:  # a request arrived just now: wait for it, no box over the game
                 self._skip_reopen_once = False
                 self._set_state(ACTIVE)
-                self._stop_pending, self._idle_since = ("off", {"game": game}), None
+                self._stop_pending, self._idle_since = ("off", _stop_info(game, self._last_stop_reason)), None
                 log.info("game stop: the model got busy again; waiting for it")
                 self._apply_state()
                 return
@@ -2341,13 +2358,14 @@ class AgentStartApp(ctk.CTk):
             self.show_window()                   # a question is open: answer it; the button works again after
             return
         self._game_alert = None
-        self._stop_for_game(alert[2])
+        self._stop_for_game(alert[2], reason=alert[3] if len(alert) > 3 else "game")
 
     def _game_blocked(self) -> bool:
         return self._box_open or self.updates.updating or self._dialog_open()
 
-    def _stop_for_game(self, title: str) -> None:
-        """Safe Turn off because a game started: the current reply (or an agent's tool call) finishes first, no
+    def _stop_for_game(self, title: str, reason: str = "game") -> None:
+        """Safe Turn off because a game started (reason "game") or an app took the memory Strata needs (reason
+        "memory"): the current reply (or an agent's tool call) finishes first, no
         dialog (the user is in the game); the closed apps become a one-click Reopen instead of starting over it.
         The game rides in the pending action, so nothing of it outlives that action."""
         if self.state_name != ACTIVE:
@@ -2357,21 +2375,28 @@ class AgentStartApp(ctk.CTk):
             return
         if self._stop_pending is not None:
             if self._stop_pending == ("off", None):
-                self._stop_pending = ("off", {"game": title})   # the user's own "when it's done" stop: don't reopen
+                # the user's own "when it's done" stop: don't reopen
+                self._stop_pending = ("off", _stop_info(title, reason))
             return                               # a pending model switch is the user's explicit choice
-        self._stop_pending, self._idle_since = ("off", {"game": title}), None
-        log.info("game started (%s): turning Strata off when the model is idle", title)
+        self._stop_pending, self._idle_since = ("off", _stop_info(title, reason)), None
+        log.info("%s (%s): turning Strata off when the model is idle",
+                 "memory needed" if reason == "memory" else "game started", title)
         if self._metrics_fails:                  # no idle signal to wait for
             self._run_pending(force=False)
             return
         self._apply_state()
 
     def _deliver_queued_game(self) -> None:
-        if self._game_queued is None or self.state_name != ACTIVE or self.loaded is False or self._game_blocked():
+        if self.state_name != ACTIVE or self.loaded is False or self._game_blocked():
             return
-        title, ram = self._game_queued
-        self._game_queued = None
-        self._on_game_started(title, ram)
+        if self._game_queued is not None:
+            title, ram = self._game_queued
+            self._game_queued = None
+            self._on_game_started(title, ram)
+        if self._mem_queued is not None and not self._game_blocked():
+            title, ram = self._mem_queued
+            self._mem_queued = None
+            self._on_memory_app(title, ram)
 
     # ------------------------------------------------------------------ game launch alert
     def _start_game_watch(self) -> None:
@@ -2380,14 +2405,27 @@ class AgentStartApp(ctk.CTk):
         try:
             import game_watch
             post = self.post
+            try:
+                # the memory check rides on the game watcher's thread and its one process snapshot per pass
+                import mem_watch
+                self.memwatch = mem_watch.MemWatcher(
+                    self.cfg,                          # the dict the detector reads: protected-list edits apply live
+                    on_app=lambda r: post(self._on_memory_app, r.title, r.ram_mb, r.why()),
+                    protected_pids=self.endpoint.protected_pids)
+            except Exception:  # noqa: BLE001
+                self.memwatch = None
+                log.exception("memory watcher unavailable")
             self.games = game_watch.GameWatcher(list(self.cfg.get("game_dirs") or []),
                                                 list(self.cfg.get("game_exclude") or []),
-                                                on_game=lambda g: post(self._on_game_started, g.title, g.ram_mb))
+                                                on_game=lambda g: post(self._on_game_started, g.title, g.ram_mb),
+                                                co_scan=self.memwatch)
             self.games.start()
         except Exception:  # noqa: BLE001
             self.games = None
+            self.memwatch = None
             log.exception("game watcher unavailable")
         self._arm_games(self.state_name in (STARTING, ACTIVE))
+        self._arm_memory(self.state_name == ACTIVE and self.loaded is True)
 
     def _arm_games(self, want: bool) -> None:
         """Watch for game launches only while Strata serves (games already running when it started never alert)."""
@@ -2404,6 +2442,52 @@ class AgentStartApp(ctk.CTk):
                 self.games.disarm()
         except Exception:  # noqa: BLE001
             log.debug("game watcher arm/disarm failed", exc_info=True)
+
+    def _arm_memory(self, want: bool) -> None:
+        """Watch for memory pressure from READY (model loaded) until the stop: the baseline of available memory is
+        taken then, and only apps started after it can be reported."""
+        want = bool(want and self._mem_action != "none" and self.memwatch is not None and self.games is not None)
+        if want == self._mem_armed:
+            return
+        self._mem_armed = want
+        if not want:
+            self._mem_queued = None
+        try:
+            if want:
+                self.memwatch.arm()
+            elif self.memwatch is not None:
+                self.memwatch.disarm()
+        except Exception:  # noqa: BLE001
+            log.debug("memory watcher arm/disarm failed", exc_info=True)
+
+    def _on_memory_app(self, title: str, ram_mb: float = 0.0, why: str = "") -> None:
+        """mem_watch reported an app started while serving that holds a lot of memory while the PC runs short.
+        Same safe turn-off as for a game (reply / tool call first, no dialog, closed apps become a Reopen offer),
+        with its own setting."""
+        if self._mem_action == "none" or self._destroyed or self.state_name != ACTIVE or self.loaded is False:
+            return
+        if self._game_blocked():
+            self._mem_queued = (title, ram_mb)
+            return
+        log.info("memory needed while serving: %s, %.0f MB (action: %s) %s", title, ram_mb, self._mem_action, why)
+        if self._mem_action == "off":
+            self._stop_for_game(title, reason="memory")   # the stop's own toast says why
+            return
+        self._game_alert = (time.monotonic(), self._start_token, title, "memory")
+        buttons = [("Turn off Strata", f"{PROTOCOL}://game-off")] if config_store.FROZEN and _protocol_registered() \
+            else []
+        self._run_worker("hc-toast", _toast_worker, "Memory is running low",
+                         f"{_short(title, 40)} is using {ram_mb / 1024:.1f} GB while Strata is running."
+                         + ("" if buttons else " Open Agent Start to turn it off."), buttons)
+
+    def set_memory_action(self, action: str) -> bool:
+        if action not in GAME_ACTIONS:
+            action = {v: k for k, v in GAME_ACTION_LABELS.items()}.get(action, "ask")
+        self._mem_action = action
+        self._save_state_later("memory_action", action)
+        self._arm_memory(self.state_name == ACTIVE and self.loaded is True)
+        log.info("when memory runs low: %s", action)
+        return True
 
     def _on_game_started(self, title: str, ram_mb: float = 0.0) -> None:
         if not self._game_pref or self._destroyed:
@@ -2500,6 +2584,9 @@ class AgentStartApp(ctk.CTk):
              "on_change": self.set_autostart_pref, "enabled": frozen and self._extras},
             {"key": "games", "label": "When a game starts", "choices": [GAME_ACTION_LABELS[a] for a in GAME_ACTIONS],
              "value": GAME_ACTION_LABELS[self._game_action], "on_change": self.set_game_action,
+             "enabled": self._extras},
+            {"key": "memory", "label": "When memory runs low", "choices": [GAME_ACTION_LABELS[a] for a in GAME_ACTIONS],
+             "value": GAME_ACTION_LABELS[self._mem_action], "on_change": self.set_memory_action,
              "enabled": self._extras},
             {"key": "updates", "label": "Check for updates daily" if frozen
              else "Check for updates daily (installed app only)", "value": self.updates.daily,
@@ -2789,6 +2876,7 @@ def _selftest() -> int:
         import PIL.Image  # noqa: F401
         import autostart  # noqa: F401
         import game_watch  # noqa: F401
+        import mem_watch  # noqa: F401
         import toasts  # noqa: F401
         import strata_finder  # noqa: F401
         import tray
