@@ -58,8 +58,11 @@ def test_rates() -> None:
     check(ms.prompt_rate(req(0, prompt_read=None, prompt_total=3000, reused=2990)) is None,
           "fallback cache hit (10 tokens read) skipped")
     check(ms.prompt_rate(req(0, prompt_read=12, prompt_ms=9.0)) is None, "cache hit: tiny read + tiny time skipped")
-    check(ms.prompt_rate(req(0, prompt_read=63)) is None and ms.prompt_rate(req(0, prompt_read=64)) == 128.0,
-          "threshold: < 64 tokens read skipped, 64 kept")
+    check(ms.MIN_PROMPT_TOKENS == 256 and ms.prompt_rate(req(0, prompt_read=255)) is None
+          and ms.prompt_rate(req(0, prompt_read=256)) == 512.0, "threshold: < 256 tokens read skipped, 256 kept")
+    check(ms.prompt_rate(req(0, prompt_read=120, prompt_ms=80.0)) is None
+          and ms.prompt_rate(req(0, prompt_read=None, prompt_total=2400, reused=2200)) is None,
+          "small fresh reads (overhead-dominated) skipped, also via the prompt_total - reused fallback")
     check(ms.prompt_rate(req(0, prompt_ms=None)) is None and ms.prompt_rate(req(0, prompt_ms=0)) is None
           and ms.prompt_rate(req(0, prompt_ms=3.0)) is None, "missing / zero / tiny prompt_ms skipped (no spike)")
     check(ms.prompt_rate(req(0, prompt_read=None, prompt_total=None)) is None, "no token counts -> None")
@@ -68,6 +71,15 @@ def test_rates() -> None:
     check(ms.decode_rate(req(3)) == 103.0 and ms.decode_rate(req(0, decode_tok_s=None)) is None
           and ms.decode_rate(req(0, decode_tok_s=0)) is None and ms.decode_rate(req(0, decode_tok_s=float("nan"))) is None,
           "decode rate: Strata's figure; None / 0 / NaN skipped")
+    check(ms.MIN_DECODE_TOKENS == 16 and ms.decode_rate(req(0, engine_generated=2, output_tokens=2, decode_tok_s=1250.0))
+          is None and ms.decode_rate(req(0, engine_generated=15, decode_tok_s=400.0)) is None
+          and ms.decode_rate(req(0, engine_generated=16, decode_tok_s=96.0)) == 96.0,
+          "decode: tiny answers (< 16 generated, e.g. title generation) skipped, 16 kept")
+    check(ms.decode_rate(req(0, engine_generated=None, output_tokens=8, decode_tok_s=300.0)) is None
+          and ms.decode_rate(req(0, engine_generated=None, output_tokens=40, decode_tok_s=97.0)) == 97.0
+          and ms.decode_rate(req(0, engine_generated=40, output_tokens=8, decode_tok_s=97.0)) == 97.0,
+          "decode: engine_generated preferred, output_tokens as fallback")
+    check(ms.decode_rate({"decode_tok_s": 88.0}) == 88.0, "decode: unknown token count keeps Strata's figure")
 
 
 # ------------------------------------------------------------------------------------------ accumulation
@@ -95,7 +107,7 @@ def test_accumulation() -> None:
     st.ingest(doc(mixed))
     check(st.decode_series() == [100.0, 102.0, 103.0] and st.prompt_series() == [4000.0, 4000.0, 4000.0],
           "per-series skipping: no-decode answers and cache hits leave no gap")
-    st.ingest(doc(mixed + [req(4), {"time": 7.0, "output_tokens": 5, "decode_tok_s": 50.0}, "junk", {"x": 1}]))
+    st.ingest(doc(mixed + [req(4), {"time": 2000.0, "output_tokens": 50, "decode_tok_s": 50.0}, "junk", {"x": 1}]))
     check(len(st) == 4 and st.decode_series()[-1] == 50.0, "id-less record keyed by time; junk entries ignored")
     check(st.ingest(None) == 0 and st.ingest("nope") == 0 and st.ingest({"requests": "x"}) == 0,
           "malformed documents never raise")
@@ -113,7 +125,11 @@ def test_live() -> None:
     st.ingest(doc([], live={"state": "idle", "tok_s": 55.0}))
     check(st.live_decode is None, "tok_s ignored unless state == generating")
     st.ingest(doc([], live={"state": "reading", "prefill_tok_s_mean": 3650.0, "prompt_read": 900, "prompt_total": 2400}))
-    check(st.live_prompt == 3650.0 and st.live_decode is None, "reading: prefill_tok_s_mean")
+    check(st.live_prompt is None and st.live_decode is None, "reading, first poll: the mean may be stale -> blank")
+    st.ingest(doc([], live={"state": "reading", "prefill_tok_s_mean": 3650.0, "prompt_read": 1800, "prompt_total": 2400}))
+    check(st.live_prompt == 3650.0 and st.live_decode is None, "reading, progress moved: prefill_tok_s_mean")
+    st.ingest(doc([], live={"state": "reading", "prefill_tok_s_mean": 3640.0, "prompt_read": 1800, "prompt_total": 2400}))
+    check(st.live_prompt == 3640.0, "reading, progress stalled but already fresh: mean still shown")
     st = MetricsStore()
     st.ingest(doc([], live={"state": "reading", "prefill_tok_s_mean": None, "prompt_read": 1000, "prompt_total": 9000}),
               now=10.0)
@@ -131,6 +147,92 @@ def test_live() -> None:
     check(st.hw_vram == (8192.0, 16384.0) and st.model == "m", "hardware block -> VRAM fallback in MB; model")
     st.clear_live()
     check(st.hw_vram is None and st.live_state is None, "clear_live()")
+
+
+def test_stale_prefill_mean() -> None:
+    """Batched path: the engine keeps the previous request's prefill_tok_s_mean and progress until the new prompt's
+    first progress line - ignore the mean until prompt_read/total moved between two reading polls."""
+    st = MetricsStore()
+    gen = {"state": "generating", "tok_s": 98.0, "tok_s_mean": 97.0}
+    stale = {"state": "reading", "prefill_tok_s_mean": 5100.0, "prompt_read": 3000, "prompt_total": 3000}
+    st.ingest(doc([], live=gen), now=1.0)
+    st.ingest(doc([], live=stale), now=3.0)
+    check(st.live_prompt is None, "new request, stale progress + mean from the previous request: blank")
+    st.ingest(doc([], live=stale), now=5.0)
+    check(st.live_prompt is None, "progress unchanged since the previous poll: still blank")
+    st.ingest(doc([], live={"state": "reading", "prefill_tok_s_mean": 3300.0, "prompt_read": 2000,
+                            "prompt_total": 9000}), now=7.0)
+    check(st.live_prompt == 3300.0, f"first real progress line of the new prompt: mean shown ({st.live_prompt})")
+    st.ingest(doc([], live=gen), now=9.0)
+    st.ingest(doc([], live={"state": "reading", "prefill_tok_s_mean": 3300.0, "prompt_read": None,
+                            "prompt_total": None}), now=11.0)
+    st.ingest(doc([], live={"state": "reading", "prefill_tok_s_mean": 3300.0, "prompt_read": None,
+                            "prompt_total": None}), now=13.0)
+    check(st.live_prompt is None, "leaving 'reading' re-arms the check; no progress at all -> mean never trusted")
+
+
+def test_parallel_live() -> None:
+    """Strata --parallel: live.state is forced to 'generating' while tok_s / tok_s_mean are None."""
+    st = MetricsStore()
+    par = {"state": "generating", "queued": 0, "phase": None, "tok_s": None, "tok_s_mean": None,
+           "prefill_tok_s_mean": None, "prompt_read": None, "prompt_total": None, "parallel": 4, "running": 2,
+           "slots": [{"state": "decode"}, {"state": "prefill"}, {"state": "idle"}], "outside_slots": 0,
+           "waiting": 0, "admitting": 0}
+    try:
+        added = st.ingest(doc([req(1)], live=par), now=1.0)
+        st.ingest(doc([req(1)], live=dict(par, tok_s="n/a", tok_s_mean=float("nan"))), now=3.0)
+        ok = True
+    except Exception as exc:  # noqa: BLE001
+        ok, added = False, repr(exc)
+    check(ok and added == 1, f"parallel live block ingests without raising ({added})")
+    check(st.live_state == "generating" and st.live_decode is None and st.live_prompt is None,
+          "parallel: live decode stays blank when tok_s and tok_s_mean are None / junk")
+
+
+def test_catchup_and_model_change() -> None:
+    allr = [req(i) for i in range(100)]
+    st = MetricsStore()
+    st.ingest(doc(allr[:40]))                                  # the newest 12 of the first 40: r28..r39
+    long = doc(allr)
+    long["requests"] = allr[::-1]                              # ?requests=all: every kept request, newest first
+    added = st.ingest(long)
+    series = st.decode_series()
+    check(len(st) == 30 and series == [100.0 + i for i in range(70, 100)],
+          f"catch-up list of 100: the newest 30 kept, oldest -> newest ({series[0]}..{series[-1]})")
+    check(added == 30, f"added counts only the new requests that stayed in the window ({added})")
+    check(st.ingest(long) == 0 and len(st) == 30 and st.decode_series() == series,
+          "the same long list again: no duplicates, evicted old ones not re-added")
+
+    st = MetricsStore()
+    st.ingest(doc([req(i) for i in range(20, 30)]))           # polled the newest; r0..r19 fell out meanwhile
+    shuffled = doc(allr[:30])
+    shuffled["requests"] = [allr[i] for i in (5, 29, 0, 17, 22, 3, 11, 28, 8, 14, 1, 26, 19, 9, 2, 25, 13, 7, 21,
+                                              16, 4, 27, 10, 18, 12, 24, 6, 23, 15, 20)]
+    added = st.ingest(shuffled)
+    check(added == 20 and st.decode_series() == [100.0 + i for i in range(30)],
+          f"older requests from a catch-up slot in by time, any input order ({added})")
+    st = MetricsStore(max_requests=5)
+    ties = [{"id": "b", "time": 50.0, "output_tokens": 99, "decode_tok_s": 2.0},
+            {"id": "a", "time": 50.0, "output_tokens": 99, "decode_tok_s": 1.0},
+            {"id": "c", "time": 40.0, "output_tokens": 99, "decode_tok_s": 0.5}]
+    st.ingest({"engine": {"model": "m"}, "requests": ties})
+    check(st.decode_series() == [0.5, 1.0, 2.0], "equal start times ordered by id")
+
+    st = MetricsStore()
+    st.ingest(doc(allr[:12]))
+    check(len(st) == 12 and st.model == "m", "model m: 12 bars")
+    other = doc([req(i, decode_tok_s=50.0) for i in range(3)])
+    other["engine"] = {"model": "other-model"}
+    added = st.ingest(other)
+    check(st.model == "other-model" and len(st) == 3 and added == 3 and st.decode_series() == [50.0] * 3
+          and st.polls == 1, f"engine.model changed: history reset before ingesting ({len(st)} bars)")
+    no_model = doc([req(5, decode_tok_s=60.0)])
+    no_model["engine"] = {"model": None}
+    st.ingest(no_model)
+    check(st.model == "other-model" and len(st) == 4, "engine.model missing (unloaded): no reset")
+    st.reset()
+    st.ingest(doc(allr[:2]))
+    check(len(st) == 2 and st.model == "m", "after reset() the next model is just recorded (no spurious reset)")
 
 
 # ------------------------------------------------------------------------------------------ HTTP against the fake
@@ -182,8 +284,23 @@ def test_fetch() -> None:
         with opener.open(root + "/_fake/live?state=reading", timeout=2) as r:
             r.read()
         st.ingest(ms.fetch_metrics(root, timeout=1.0))
-        check(st.live_state == "reading" and st.live_prompt == 3650.0 and st.live_decode is None, "live reading value")
+        check(st.live_state == "reading" and st.live_prompt is None, "live reading: first poll blank (mean unproven)")
+        st.ingest(ms.fetch_metrics(root, timeout=1.0))
+        check(st.live_state == "reading" and st.live_prompt == 3650.0 and st.live_decode is None,
+              "live reading value once prompt_read advanced")
         check(st.hw_vram is not None and abs(st.hw_vram[1] - 16384.0) < 1, "hardware GPU memory parsed")
+        full = ms.fetch_metrics(root, timeout=1.0, all_requests=True)
+        check(isinstance(full, dict) and len(full["requests"]) == full["requests_kept"] == 52
+              and full["requests"][0]["id"] == "req000000051", "all_requests=True: ?requests=all returns every kept "
+              f"request as JSON ({len(full['requests']) if full else None})")
+        with opener.open(root + "/_fake/add?n=20", timeout=2) as r:     # 20 finish while 'collapsed'
+            r.read()
+        before = st.decode_series()
+        added = st.ingest(ms.fetch_metrics(root, timeout=1.0, all_requests=True))
+        check(added == 20 and len(st) == 30, f"catch-up fetch recovers all 20 missed requests, not just 12 ({added})")
+        ids = [k for k in st._reqs]
+        check(ids[-1] == "req000000071" and ids[0] == "req000000042" and len(set(ids)) == 30 and before,
+              f"catch-up keeps the newest 30 by time, no duplicates ({ids[0]}..{ids[-1]})")
     finally:
         proc.kill()                                            # our own child only
         proc.wait(5)
@@ -330,6 +447,53 @@ def test_graph_helpers() -> None:
           "nice_ceil of nothing -> 1")
     check([graphs.fmt_scale(v) for v in (120, 4000, 1500, 0.8, 50)] == ["120", "4k", "1.5k", "0.8", "50"], "fmt_scale")
     check([graphs.fmt_rate(v) for v in (101.34, 3712.4, 9.96)] == ["101.3", "3,712", "10.0"], "fmt_rate")
+    rp = graphs.robust_peak
+    check(rp([95, 97, 92, 300, 96]) == 97 and rp([95, 97, 92, 96, 1250]) == 97, "robust_peak drops a single spike")
+    check(rp([1000, 1000, 1000, 4000, 4000]) == 4000 and rp([100, 300]) == 300 and rp([]) == 0.0
+          and rp([0, -3, float("nan")]) == 0.0, "robust_peak: a real spread / < 4 values / nothing -> plain max")
+    many = [100.0] * 28 + [900.0, 950.0]
+    check(rp(many) == 100.0 and rp([100.0] * 17 + [900.0, 950.0, 990.0]) == 990.0,
+          "robust_peak: up to 1 outlier per 10 values excluded, more are a real spread")
+
+
+def test_bar_graph_render() -> None:
+    """Probe the drawn bars: one spike must not squash the others; off-scale bars are capped at full height."""
+    import tkinter as tk
+    import graphs
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        print(f"[SKIP] no Tk display ({exc})")
+        return
+    try:
+        root.withdraw()
+        g = graphs.BarGraph(root)
+
+        def heights(values, live=None):
+            g.set_data(values, live=live)
+            g.delete("all")
+            g._paint(330, 40, 1.0)
+            bars = [g.coords(i) for i in g.find_withtag("bar")]
+            caps = [g.coords(i) for i in g.find_withtag("cap")]
+            return [round(c[3] - c[1], 1) for c in bars], caps
+
+        normal, caps0 = heights([95, 97, 92, 96])
+        h, caps = heights([95, 97, 92, 300, 96])
+        check(g.scale_max == 100.0 and g._max_label == "100" and g.clipped == 1,
+              f"spike: scale = nice(robust peak 97) = 100, label '100', 1 bar clipped ({g.scale_max}, {g._max_label})")
+        check(min(h[0], h[1], h[2], h[4]) > 25 and h[:3] == normal[:3],
+              f"normal bars keep their height next to a spike ({h}; without spike {normal})")
+        full = max(h)
+        check(h[3] == full and len(caps) == 1 and not caps0 and abs(caps[0][1] - (40 - 1 - full)) < 0.01
+              and caps[0][3] - caps[0][1] == 2, f"the spike is drawn full height with a 2 px cap ({caps})")
+        h, caps = heights([95, 97, 92, 96, 98], live=1250.0)
+        check(g.scale_max == 100.0 and len(caps) == 1 and h[-1] == max(h), "a live spike is capped too")
+        h, caps = heights([1000, 1000, 1000, 4000, 4000])
+        check(g.scale_max == 4000.0 and not caps and g.clipped == 0, "a genuine spread is not clipped")
+        g.set_data([])
+        check(g._max_label == "" and g.clipped == 0, "empty series: no label, nothing clipped")
+    finally:
+        root.destroy()
     import theme
     check(theme.mix("#FFFFFF", "#000000", 0.5) == "#808080" and theme.mix(theme.ACCENT, theme.SURFACE, 0) == theme.SURFACE
           and theme.mix(theme.ACCENT, theme.SURFACE, 1) == theme.ACCENT, "theme.mix blends two tokens")
@@ -355,8 +519,9 @@ def test_version_consistency() -> None:
 
 
 def main() -> int:
-    for fn in (test_rates, test_accumulation, test_live, test_fetch, test_vram_sampler, test_real_nvml_smoke,
-               test_graph_helpers, test_version_consistency):
+    for fn in (test_rates, test_accumulation, test_live, test_stale_prefill_mean, test_parallel_live,
+               test_catchup_and_model_change, test_fetch, test_vram_sampler, test_real_nvml_smoke,
+               test_graph_helpers, test_bar_graph_render, test_version_consistency):
         print(f"-- {fn.__name__}")
         try:
             fn()

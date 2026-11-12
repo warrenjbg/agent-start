@@ -182,6 +182,7 @@ class WhitelistModal(ctk.CTkToplevel):
                 for b in (self._save_btn, self._add_btn, self._cancel_btn):
                     b.configure(state="normal")
             return
+        self._saving = False
         self.close()
         if self._on_saved is not None:
             try:
@@ -190,6 +191,8 @@ class WhitelistModal(ctk.CTkToplevel):
                 log.exception("WhitelistModal on_saved callback failed")
 
     def close(self) -> None:
+        if self._saving:                          # X / Escape mid-save: wait, so a failure is still shown
+            return
         if self._closed:
             return
         self._closed = True

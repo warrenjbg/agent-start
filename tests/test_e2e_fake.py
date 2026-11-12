@@ -147,7 +147,8 @@ def run() -> None:
         lp = [p for p in psutil.process_iter() if MARK in os.path.normcase(" ".join(_cmd(p)))]
         check(lp and all("--open" not in _cmd(p) for p in lp), f"server processes run without --open ({len(lp)})")
         check(pump_until(app, lambda: app.model_id == "e2e-model-a", 10), f"model id from the server ({app.model_id})")
-        check(pump_until(app, lambda: len(app.metrics) == 12, 10), f"real HTTP /metrics poll: 12 requests "
+        # the first poll of a new server is a catch-up (?requests=all): every kept request, not just the newest 12
+        check(pump_until(app, lambda: len(app.metrics) == 20, 10), f"real HTTP /metrics catch-up poll: all 20 requests "
               f"({len(app.metrics)})")
         check(app.row_decode.tag.cget("text") == "live" and app.row_decode.value.cget("text") == "101.3 tok/s",
               f"live decode from the fake ({app.row_decode.value.cget('text')})")

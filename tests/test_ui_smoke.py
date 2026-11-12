@@ -6,6 +6,7 @@ Exit code 0 = all checks passed. Screenshots land in tests\\ui_<state>.png.
 from __future__ import annotations
 
 import ctypes
+import gc
 import json
 import math
 import os
@@ -311,17 +312,21 @@ class FakeMetrics:
                 "prompt_ms": 9.0 if hit else round(read / (3150.0 + 130 * (i % 5)) * 1000, 1),
                 "decode_ms": round(gen / tok_s * 1000, 1) if tok_s else None, "decode_tok_s": tok_s, "hit_rate": 0.93})
 
-    def __call__(self, root_url: str) -> dict | None:
+    def __call__(self, root_url: str, all_requests: bool = False) -> dict | None:
         self.calls.append(root_url)
+        self.all_calls = getattr(self, "all_calls", 0) + (1 if all_requests else 0)
         if self.fail:
             return None
         st = self.live
         busy = st in ("generating", "reading")
+        # a real read advances between polls (the app ignores a stale prefill mean until it does)
+        self._read = min(2400, getattr(self, "_read", 0) + 900) if st == "reading" else 0
         live = {"state": st, "queued": 0, "tok_s": 101.3 if st == "generating" else None,
                 "tok_s_mean": 99.8 if st == "generating" else None,
-                "prefill_tok_s_mean": 3650.0 if busy else None, "prompt_read": 900 if st == "reading" else None,
+                "prefill_tok_s_mean": 3650.0 if busy else None, "prompt_read": self._read if st == "reading" else None,
                 "prompt_total": 2400 if st == "reading" else None}
-        return {"engine": {"model": "swift-test-1"}, "live": live, "requests": self.requests[::-1][:12],
+        return {"engine": {"model": "swift-test-1"}, "live": live,
+                "requests": self.requests[::-1] if all_requests else self.requests[::-1][:12],
                 "requests_kept": len(self.requests), "totals": {},
                 "hardware": {"gpu_mem_used": 11 * 1024 ** 3, "gpu_mem_total": 16 * 1024 ** 3}, "time": time.time()}
 
@@ -900,6 +905,72 @@ def test_low_ram(app, det, ep) -> None:
         det.cands = [dict(c) for c in CANDS]
 
 
+def test_review_fixes(app, det, ep) -> None:
+    """v1.1 review: double-click debounce, launcher behind a foreign port, stale sweep note, metrics catch-up."""
+    from types import SimpleNamespace
+    # 1) double-click on Turn on must not cancel the start it just began
+    main.TOGGLE_DEBOUNCE_S = 0.4
+    try:
+        ep.status_value = dict(IDLE_STATUS)
+        app._set_state("IDLE")
+        app._toggle_at = 0.0
+        det.cands = [dict(c) for c in CANDS]
+        app.on_toggle()
+        app.on_toggle()                              # 2nd click of a double-click, same instant
+        pump(app, 0.2)
+        check(app.state_name == "STARTING" and "cancelled" not in app.preview.cget("text").lower(),
+              f"double-click keeps the start ({app.state_name}, {app.preview.cget('text')!r})")
+        if pump_until(app, lambda: isinstance(app.dialog, SweepDialog), 3):
+            app.dialog._decide("cancel")
+        pump_until(app, lambda: app.state_name == "IDLE", 3)
+    finally:
+        main.TOGGLE_DEBOUNCE_S = 0.0
+    # 2) a launcher saved while ANOTHER program holds the old port is applied (not stuck forever)
+    applied = []
+    real_apply = main.launcher_bat.apply_to_config
+    main.launcher_bat.apply_to_config = lambda cfg, info: applied.append(info.bat_name)
+    info = SimpleNamespace(bat_name="run-x.bat", bat_path=r"C:\x\run-x.bat", model_name="m", port=8081,
+                           summary=lambda: "m · port 8081")
+    try:
+        ep.status_value = {**IDLE_STATUS, "state": "active"}          # port answers...
+        real_prot = ep.protected_pids
+        ep.protected_pids = lambda: set()                               # ...but it is not Strata
+        app.state_name = "ERROR"
+        app._pending_launcher = info
+        check(app._apply_pending_launcher(note=True) and applied == ["run-x.bat"] and app._pending_launcher is None,
+              f"foreign listener does not block the new launcher ({applied})")
+        ep.protected_pids = lambda: {4242}                              # Strata itself holds the old port
+        app.state_name = "IDLE"
+        app._pending_launcher = info
+        check(not app._apply_pending_launcher(note=True) and app._pending_launcher is info,
+              "Strata on the old port: the launcher waits")
+        check("applies when Strata on port" in app.preview.cget("text"), f"and says so ({app.preview.cget('text')!r})")
+    finally:
+        main.launcher_bat.apply_to_config = real_apply
+        ep.protected_pids = real_prot
+        app._pending_launcher = None
+        ep.status_value = dict(IDLE_STATUS)
+        app._set_state("IDLE")
+    # 3) a cancelled start's late sweep result does not leak "Could not close" into the next start
+    app._sweep_note = ""
+    app._after_sweep(app._start_token - 1, {"failed": [{"name": "stuck.exe"}], "ram_freed_mb": 0.0})
+    check(app._sweep_note == "", f"stale sweep result ignored ({app._sweep_note!r})")
+    # 4) the first poll after a gap asks Strata for ALL kept requests
+    fm = app._fetch_metrics
+    before = getattr(fm, "all_calls", 0)
+    was = app.expanded
+    to_active(app, ep)
+    if not app.expanded:
+        app.toggle_stats()
+    pump(app, 2.6)
+    check(getattr(fm, "all_calls", 0) > before, f"catch-up fetch with all_requests ({getattr(fm, 'all_calls', 0)})")
+    if app.expanded != was:
+        app.toggle_stats()
+    ep.status_value = dict(IDLE_STATUS)
+    app.on_status(ep.status()); app.on_status(ep.status())
+    pump(app, 0.2)
+
+
 def test_strata_estimate(app, det, ep) -> None:
     """Memory bar attribution (Fable final #3-#5): live while loading, latched when serving, shrinks on stop."""
     keep = (app.state_name, app._avail_at_launch, app._strata_est)
@@ -997,7 +1068,8 @@ def test_stats_section(app, det, ep) -> None:
     pump(app, 0.3)
     check(app.expanded and app.stats.winfo_ismapped() and app.chevron.cget("text") == T.CHEVRON_UP,
           "chevron expands the window downward")
-    check(load_state_file().get("stats_expanded") is True, "expanded state persisted in state.json")
+    check(pump_until(app, lambda: load_state_file().get("stats_expanded") is True, 3),
+          "expanded state persisted in state.json (debounced save)")
     check_stats_fit(app, "empty")
     check(graph_texts(app.row_vram) == ["VRAM unavailable"], f"NVML missing -> 'VRAM unavailable' "
           f"({graph_texts(app.row_vram)})")
@@ -1072,7 +1144,7 @@ def test_stats_section(app, det, ep) -> None:
     pump(app, 0.3)
     check(not app.expanded and not app.stats.winfo_ismapped() and abs(app.winfo_height() - 268 * scale) <= 2
           and abs(app.winfo_width() - 360 * scale) <= 2, f"collapse -> 360x268 ({app.winfo_width()}x{app.winfo_height()})")
-    check(load_state_file().get("stats_expanded") is False, "collapsed state persisted")
+    check(pump_until(app, lambda: load_state_file().get("stats_expanded") is False, 3), "collapsed state persisted")
     card_bottom = app.mem_card.winfo_rooty() + app.mem_card.winfo_height()
     check(abs((app.winfo_rooty() + app.winfo_height() - card_bottom) - 16 * scale) <= 2, "memory card margin restored")
     pump(app, 0.3)
@@ -1404,6 +1476,7 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
 
 
 def run() -> int:
+    main.TOGGLE_DEBOUNCE_S = 0.0                 # tests click on purpose faster than a human; test_review_fixes re-enables it
     dialogs = Dialogs()
     dialogs.install()
     try:
@@ -1415,18 +1488,20 @@ def run() -> int:
                              (test_sweep_dialog_close_x, (app, det, ep)), (test_whitelist_modal, (app, det, ep)),
                              (test_load_progress_view, (app, det, ep)), (test_strata_estimate, (app, det, ep)),
                              (test_stats_section, (app, det, ep)), (test_notes_and_stale_status, (app, det, ep)),
-                             (test_low_ram, (app, det, ep))):
+                             (test_low_ram, (app, det, ep)), (test_review_fixes, (app, det, ep))):
                 print(f"-- {fn.__name__}")
                 try:
                     fn(*args)
                 except Exception:
                     FAILS.append(f"{fn.__name__} raised:\n{traceback.format_exc()}")
                     print(FAILS[-1])
+                gc.collect()                     # Tk garbage of closed dialogs: finalize on THIS (the Tk) thread
         finally:
             if not app._destroyed:
                 app.destroy()
         for fn, args in ((test_delete_window, (dialogs,)), (test_settings_dialog, (dialogs,)),
                          (test_stats_persist_and_scaling, ())):
+            gc.collect()                         # the previous app's Tk objects die on the Tk thread, not a worker
             print(f"-- {fn.__name__}")
             try:
                 fn(*args)

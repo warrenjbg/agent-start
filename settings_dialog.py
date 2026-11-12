@@ -303,6 +303,9 @@ class SettingsDialog(ctk.CTkToplevel):
         self.close()
 
     def close(self) -> None:
+        # X / Escape during a save would drop the save's error (the user would think it saved): wait for it.
+        if self._saving or getattr(self._child, "_saving", False):
+            return
         if self._closed:
             return
         self._closed = True

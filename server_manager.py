@@ -100,6 +100,61 @@ def _is_strata_proc(proc: psutil.Process) -> bool:
         return False
 
 
+def _norm_name(name: str | None) -> str:
+    """casefold + strip ONE trailing '.exe' (same normalisation as detector.norm / user_whitelist entries)."""
+    n = (name or "").casefold()
+    return n[:-4] if n.endswith(".exe") else n
+
+
+def _dir_prefix(d: str | None) -> str:
+    """normcase(abspath(d)) + sep, or '' when d is empty/unusable - for whole-segment `startswith` checks."""
+    d = str(d or "").strip()
+    if not d:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(d)).rstrip(os.sep) + os.sep
+    except (OSError, ValueError):
+        return ""
+
+
+def _path_under(path: str | None, prefix: str) -> bool:
+    if not path or not prefix:
+        return False
+    try:
+        full = os.path.normcase(os.path.realpath(str(path).strip('"')))
+        plain = os.path.normcase(os.path.abspath(str(path).strip('"')))
+    except (OSError, ValueError):
+        return False
+    real_prefix = _dir_prefix(os.path.realpath(prefix.rstrip(os.sep)))
+    return any(x.startswith(pre) for x in (full, plain) for pre in (prefix, real_prefix) if pre)
+
+
+def _strata_scripts(proc: psutil.Process) -> list[str]:
+    """Absolute paths of the serve\\server.py tokens in proc's argv (relative ones resolved against its cwd)."""
+    try:
+        cmd = proc.cmdline() or []
+    except (psutil.Error, OSError):
+        return []
+    out = []
+    cwd = None
+    for tok in cmd[1:]:
+        t = str(tok).strip('"')
+        nt = os.path.normcase(t)
+        if not (nt == _STRATA_MARK or nt.endswith(os.sep + _STRATA_MARK)):
+            continue
+        if not os.path.isabs(t):
+            if cwd is None:
+                try:
+                    cwd = proc.cwd() or ""
+                except (psutil.Error, OSError):
+                    cwd = ""
+            if not cwd:
+                continue
+            t = os.path.join(cwd, t)
+        out.append(t)
+    return out
+
+
 def _avail_mb() -> float | None:
     try:
         return psutil.virtual_memory().available / (1024 * 1024)
@@ -445,6 +500,92 @@ class EndpointManager:
             pass
         return procs
 
+    def _whitelist(self) -> set[str]:
+        return {_norm_name(n) for n in (self._cfg.get("user_whitelist") or []) if isinstance(n, str) and n.strip()}
+
+    def _kill_targets(self, root: psutil.Process, log_skips: bool = True) -> list[psutil.Process]:
+        """The part of root's tree that OFF may kill. `root` (already identified as Strata) is always kept; a
+        descendant is kept only if it is Strata: a python running serve\\server.py, an exe under strata_dir
+        (engine\\strata.exe, strata-vision.exe, the venv python), or a conhost.exe whose parent is kept.
+        Everything else - e.g. the browser that `--open` / webbrowser.open() starts as a child of Strata's python -
+        is left running, and so is any process whose name is in user_whitelist (unless its cmdline identifies it
+        as the Strata server itself). The unfiltered _tree() stays in use where processes are only PROTECTED."""
+        tree = self._tree(root)
+        prefix = _dir_prefix(self._cfg.get("strata_dir"))
+        wl = self._whitelist()
+        kept: set[int] = {root.pid}
+        pending: list[tuple[psutil.Process, str]] = []
+        skipped: list[tuple[str, int, str]] = []
+        for p in tree[1:]:
+            try:
+                name = p.name()
+            except psutil.NoSuchProcess:
+                continue
+            except (psutil.Error, OSError):
+                name = ""
+            if _is_strata_proc(p):
+                kept.add(p.pid)
+                continue
+            if _norm_name(name) in wl:
+                skipped.append((name, p.pid, "user_whitelist"))
+                continue
+            exe = ""
+            if prefix:
+                try:
+                    exe = p.exe() or ""
+                except (psutil.Error, OSError):
+                    exe = ""
+            if exe and _path_under(exe, prefix):
+                kept.add(p.pid)
+                continue
+            pending.append((p, name))
+        changed = True
+        while changed and pending:                      # conhost.exe of a kept process (any depth of kept chain)
+            changed = False
+            for item in list(pending):
+                p, name = item
+                if _norm_name(name) != "conhost":
+                    continue
+                try:
+                    ppid = p.ppid()
+                except (psutil.Error, OSError):
+                    continue
+                if ppid in kept:
+                    kept.add(p.pid)
+                    pending.remove(item)
+                    changed = True
+        skipped.extend((name or "unknown process", p.pid, "not Strata") for p, name in pending)
+        if log_skips:
+            for name, pid, why in skipped:
+                log.info("stop: leaving %s (pid %s) running - %s", name, pid, why)
+        return [p for p in tree if p.pid in kept]
+
+    def _is_own_spawn(self, proc: psutil.Process | None) -> bool:
+        sp = self._spawn_proc
+        try:
+            return proc is not None and sp is not None and proc == sp   # psutil eq = pid + create time
+        except psutil.Error:
+            return False
+
+    def _script_in_strata_dir(self, proc: psutil.Process) -> bool:
+        prefix = _dir_prefix(self._cfg.get("strata_dir"))
+        return bool(prefix) and any(_path_under(s, prefix) for s in _strata_scripts(proc))
+
+    def _verified_strata(self, root: psutil.Process, health: dict | None = None,
+                         probe_health: bool = True) -> bool:
+        """Kill/unload-grade identity for a process _locate_root() matched by cmdline: the server we spawned,
+        OR its serve\\server.py lives under strata_dir, OR GET /health on the port says service == 'strata'.
+        A different project's serve/server.py on the port passes none of these."""
+        if self._is_own_spawn(root) or self._script_in_strata_dir(root):
+            return True
+        if health is None and probe_health:
+            health = self._health()
+        return health is not None and health.get("service") == "strata"
+
+    @staticmethod
+    def _not_strata_msg(port: int, proc: psutil.Process) -> str:
+        return f"port {port} held by {_proc_label(proc)} (pid {proc.pid}), not Strata"
+
     def _launcher_cmd(self, root: psutil.Process) -> psutil.Process | None:
         """cmd.exe /c "<strata_dir>\\run-*.bat" (or the configured launcher .bat) that launched `root`, else None."""
         sdir = str(self._cfg.get("strata_dir") or "").strip()
@@ -580,7 +721,7 @@ class EndpointManager:
             outcome = ("error", f"start failed: {e}")
             try:
                 if not abort.is_set() and self._our_spawn_alive() and self._spawn_proc is not None:
-                    killed, errs = self._kill(self._tree(self._spawn_proc))
+                    killed, errs = self._kill(self._kill_targets(self._spawn_proc))
                     log.warning("start failure: killed spawned tree %s %s", killed, errs)
             except Exception:  # noqa: BLE001
                 log.exception("cleanup after start failure failed")
@@ -605,6 +746,10 @@ class EndpointManager:
         cmd = [str(x) for x in (self._cfg.get("launch_cmd") or [])]
         if not cmd:
             return "error", "launch_cmd is empty in config.json"
+        if not cmd[0].strip().casefold().endswith(".exe"):
+            # never hand a .bat/.cmd/script to CreateProcess: that runs it through cmd.exe (hand-edited config.json)
+            return "error", (f"Launch command must start with python.exe (the Strata venv interpreter), "
+                             f"not {os.path.basename(cmd[0]) or cmd[0]!r} - re-select the run-*.bat in Settings")
         if not os.path.isfile(cmd[0]):
             return "error", f"launcher not found: {cmd[0]}"
         sdir = str(self._cfg.get("strata_dir") or "")
@@ -675,7 +820,7 @@ class EndpointManager:
                 if abort.is_set():
                     return None
                 if self._spawn_proc is not None:
-                    killed, errs = self._kill(self._tree(self._spawn_proc))
+                    killed, errs = self._kill(self._kill_targets(self._spawn_proc))
                     log.warning("ready timeout: killed %s %s", killed, errs)
                 return "error", f"Strata not ready after {timeout:g} s — see {log_path}"
             abort.wait(self._poll_s)
@@ -697,6 +842,9 @@ class EndpointManager:
             root, foreign = self._locate_root(fallback=False)
             if foreign and not health_strata:
                 return "error", foreign
+            if root is not None and h is not None and not health_strata \
+                    and not self._verified_strata(root, h, probe_health=False):
+                return "error", self._not_strata_msg(port, root)   # another project's serve/server.py
             if root is not None:
                 with self._lock:
                     self._last_pid = root.pid
@@ -754,7 +902,7 @@ class EndpointManager:
         sp = self._spawn_proc
         errors: list[str] = []
         if sp is not None and self._our_spawn_alive():
-            procs = self._tree(sp)
+            procs = self._kill_targets(sp)
             result["ram_freed_mb"] = self._rss_mb(procs)
             killed, errors = self._kill(procs)
             result["killed_pids"] = killed
@@ -776,8 +924,15 @@ class EndpointManager:
         if foreign:
             result["error"] = foreign
             return
+        if root is not None and not self._verified_strata(root):
+            # a python running SOME serve\\server.py that is not under strata_dir and whose /health is not Strata:
+            # never /unload or kill it
+            result["error"] = self._not_strata_msg(self._port, root)
+            result["port_released"] = not self.is_running()
+            log.warning("stop refused: %s (cmdline %s)", result["error"], _strata_scripts(root))
+            return
         # measure BEFORE /unload: the unload itself releases the model, so a post-unload RSS reads ~0.2 GB
-        pre_unload_mb = self._rss_mb(self._tree(root)) if root is not None else 0.0
+        pre_unload_mb = self._rss_mb(self._kill_targets(root, log_skips=False)) if root is not None else 0.0
         avail_before = _avail_mb()
         if root is None:
             # No Strata process found for the port (listener PID hidden / not ours). Only talk to the port if
@@ -797,7 +952,7 @@ class EndpointManager:
         stop_timeout = self._timeout_cfg("stop_timeout_s", 20)
         errors: list[str] = []
         if root is not None:
-            procs = self._tree(root)
+            procs = self._kill_targets(root)
             cmd = self._launcher_cmd(root)
             result["ram_freed_mb"] = max(pre_unload_mb, self._rss_mb(procs))
             if cmd is not None:
@@ -882,7 +1037,8 @@ class EndpointManager:
     def _identity_probe_body(self) -> None:
         h = self._health(_PROBE_TIMEOUT_S)
         root, _foreign = self._locate_root(fallback=False)
-        strata = (h is not None and h.get("service") == "strata") or root is not None
+        health_strata = h is not None and h.get("service") == "strata"
+        strata = health_strata or (root is not None and self._verified_strata(root, h, probe_health=False))
         with self._probe_lock:
             if strata:
                 self._confirmed_at = time.monotonic()

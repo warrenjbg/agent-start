@@ -2,7 +2,9 @@
 
 `StatRow` = header (title · tag · current value) + one graph canvas. Two graph kinds:
   LineGraph  rolling time series against a fixed maximum (VRAM used vs total, last 5 minutes)
-  BarGraph   one bar per finished request (last 30) plus an optional live bar in the accent colour
+  BarGraph   one bar per finished request (last 30) plus an optional live bar in the accent colour; scaled to a
+             robust peak (`robust_peak`), so one spike cannot squash the other bars - an off-scale bar is drawn at
+             full height with a light cap
 
 tk.Canvas is not scaled by CustomTkinter, so every pixel size and font here is multiplied by the widget scaling at
 draw time; the canvas fills a CTkFrame wrapper that CTk does scale, so 100 % and 150 % DPI lay out identically.
@@ -34,6 +36,30 @@ def nice_ceil(v: float) -> float:
         if m * base >= v * 0.999999:
             return m * base
     return 10.0 * base
+
+
+OUTLIER_FACTOR = 2.0   # a value above this x the median is an outlier candidate ...
+OUTLIER_SHARE = 10     # ... and at most 1 per this many values (min 1) may be excluded from the scale
+
+
+def robust_peak(values) -> float:
+    """The scale peak of a bar series, ignoring a few extreme outliers.
+
+    Values above OUTLIER_FACTOR x the median are left out of the peak when they are at most max(1, n // OUTLIER_SHARE)
+    of n >= 4 values (a spike, e.g. a tiny answer's inflated rate); more of them are a real spread and count. Fewer
+    than 4 values: plain max. Non-positive / non-finite values are ignored; nothing left -> 0.
+    """
+    vals = sorted(float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(v) and v > 0)
+    if not vals:
+        return 0.0
+    n = len(vals)
+    if n < 4:
+        return vals[-1]
+    med = vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2.0
+    inliers = [v for v in vals if v <= OUTLIER_FACTOR * med]
+    if inliers and n - len(inliers) <= max(1, n // OUTLIER_SHARE):
+        return inliers[-1]
+    return vals[-1]
 
 
 def fmt_scale(v: float) -> str:
@@ -178,12 +204,15 @@ class BarGraph(_Graph):
         self._values: list[float] = []
         self._live: float | None = None
         self.scale_max = 1.0
+        self.clipped = 0                                    # bars above scale_max (drawn full height + cap)
 
     def set_data(self, values, live: float | None = None, empty: str | None = None) -> None:
         self._values = [float(v) for v in values][-self.slots:]
         self._live = float(live) if live is not None and live > 0 else None
-        peak = max(self._values + ([self._live] if self._live else []), default=0.0)
+        shown = self._values[-(self.slots - 1):] + [self._live] if self._live is not None else self._values
+        peak = robust_peak(shown)
         self.scale_max = nice_ceil(peak)
+        self.clipped = sum(1 for v in shown if v > self.scale_max)
         self._max_label = fmt_scale(self.scale_max) if peak > 0 else ""
         self._empty = empty if peak <= 0 else None
         self.redraw()
@@ -201,10 +230,14 @@ class BarGraph(_Graph):
         for i in range(first):                                # empty slots: quiet ticks, so the row reads as a scale
             x = x0 + i * slot + (slot - bar_w) / 2
             self.create_line(x, y_bot - round(2 * s), x + bar_w, y_bot - round(2 * s), fill=T.HAIRLINE)
+        cap = max(2.0, round(2 * s))
         for i, (v, color) in enumerate(bars):
             x = x0 + (first + i) * slot + (slot - bar_w) / 2
             top = y_bot - max(2.0, min(1.0, v / self.scale_max) * (y_bot - y_top))
-            self.create_rectangle(x, top, x + bar_w, y_bot, fill=color, outline="")
+            self.create_rectangle(x, top, x + bar_w, y_bot, fill=color, outline="", tags=("bar",))
+            if v > self.scale_max:                            # off-scale: a light cap says "taller than shown"
+                self.create_rectangle(x, top, x + bar_w, top + cap, fill=T.mix(T.TEXT, color, 0.6), outline="",
+                                      tags=("cap",))
 
 
 class StatRow(ctk.CTkFrame):

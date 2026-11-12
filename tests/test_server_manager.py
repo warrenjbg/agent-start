@@ -8,6 +8,7 @@ The log dir is injected with EndpointManager(..., log_dir=<tempdir>\\logs). One 
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -44,6 +45,12 @@ SERVE.parent.mkdir(parents=True)
 shutil.copy(FIX / "fake_strata_server.py", SERVE)
 shutil.copy(FIX / "fake_launcher.py", LAUNCHER)
 shutil.copy(FIX / "foreign_server.py", FOREIGN)
+KIDS_SERVE = TMP / "kids" / "serve" / "server.py"           # fake Strata that spawns children (under strata_dir)
+KIDS_SERVE.parent.mkdir(parents=True)
+shutil.copy(FIX / "fake_strata_with_children.py", KIDS_SERVE)
+shutil.copy(FIX / "fake_strata_server.py", KIDS_SERVE.parent / "fake_impl.py")
+OUTSIDE = Path(str(TMP) + "-outside")                       # NOT under strata_dir, but still carries MARK
+SYS_PING = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "PING.EXE"
 
 logging.basicConfig(filename=str(TMP / "test.log"), level=logging.DEBUG,
                     format="%(asctime)s %(threadName)s %(levelname)s %(message)s")
@@ -594,6 +601,191 @@ def t_parsed_bat_launch():
         shutil.rmtree(ext, ignore_errors=True)
 
 
+def _start_children_fixture(tag: str) -> tuple[Path, Path, dict]:
+    """children.json for fake_strata_with_children: a NON-Strata ping.exe (the 'browser'), a non-Strata python
+    sleeper, a whitelisted exe under strata_dir, and an engine exe under strata_dir (the only one OFF may kill)."""
+    eng = TMP / "engine"
+    eng.mkdir(exist_ok=True)
+    strata_exe, keep_exe = eng / "strata.exe", eng / "keepme.exe"
+    for dst in (strata_exe, keep_exe):
+        if not dst.exists():
+            shutil.copy(SYS_PING, dst)
+    kids = [[str(SYS_PING), "-n", "90", "127.0.0.1"],
+            [PY, "-c", "import time; time.sleep(90)", str(TMP / "sleeper-marker")],
+            [str(keep_exe), "-n", "90", "127.0.0.1"],
+            [str(strata_exe), "-n", "90", "127.0.0.1"]]
+    cj, pj = TMP / f"children-{tag}.json", TMP / f"pids-{tag}.json"
+    cj.write_text(json.dumps(kids), encoding="utf-8")
+    roles = {"ping": 0, "sleeper": 1, "keepme": 2, "engine": 3}
+    return cj, pj, roles
+
+
+def _child_procs(pj: Path, roles: dict) -> dict[str, list[psutil.Process]]:
+    """role -> [child Process + its descendants], identity-captured (psutil checks create time on kill)."""
+    assert wait_until(pj.exists, 15), "children never started"
+    pairs = json.loads(pj.read_text(encoding="utf-8"))
+    out = {}
+    for role, idx in roles.items():
+        p = psutil.Process(pairs[idx][1])
+        out[role] = [p] + p.children(recursive=True)
+    return out
+
+
+def _kill_captured(groups: dict[str, list[psutil.Process]]) -> None:
+    procs = [p for g in groups.values() for p in g]
+    for q in procs:
+        try:
+            q.kill()
+        except psutil.Error:
+            pass
+    psutil.wait_procs(procs, timeout=5)
+
+
+def _alive_procs(procs: list[psutil.Process]) -> list[psutil.Process]:
+    return [p for p in procs if p.is_running() and p.status() != psutil.STATUS_ZOMBIE]
+
+
+def t_stop_spares_non_strata_children():
+    """OFF kills only Strata: serve\\server.py pythons + exes under strata_dir. A non-Strata child (the browser
+    `--open` starts), a python sleeper, and a user_whitelist'ed exe (even under strata_dir) stay alive."""
+    # (1) adopted external Strata (the double-clicked run-*.bat --open case) -> stop_endpoint
+    port = free_port()
+    cj, pj, roles = _start_children_fixture("adopt")
+    ext = spawn_external(["--port", str(port), "--model", "kids-M", "--children", str(cj), "--pids", str(pj)],
+                         script=KIDS_SERVE)
+    groups: dict = {}
+    try:
+        assert wait_until(lambda: listening(port), 15)
+        groups = _child_procs(pj, roles)
+        assert all(_alive_procs(g) for g in groups.values()), groups
+        strata_tree = tree_pids(ext.pid) - {p.pid for g in groups.values() for p in g}
+        cfg = dict(make_cfg(port), user_whitelist=["KeepMe.EXE"])
+        m = mgr_for(cfg)
+        cb = CB()
+        assert m.start_endpoint(cb.ready, cb.error)
+        assert cb.wait(15)[0] == "ready"
+        cbs = CB()
+        assert m.stop_endpoint(cbs.stopped)
+        _, res = cbs.wait(30)
+        check_result_shape(res)
+        assert res["ok"] and res["port_released"] and res["unload"] == "ok", res
+        killed = set(res["killed_pids"])
+        for role in ("ping", "sleeper", "keepme"):
+            g = groups[role]
+            assert _alive_procs(g) == g, f"{role} was killed: {[(p.pid) for p in g]} res={res}"
+            assert not ({p.pid for p in g} & killed), (role, res)
+        assert not _alive_procs(groups["engine"]), "engine\\strata.exe (under strata_dir) must be killed"
+        assert groups["engine"][0].pid in killed, res
+        assert strata_tree <= killed and not alive(strata_tree), (strata_tree, res)
+        assert not listening(port)
+        note(f"adopted stop: killed {sorted(killed)}; ping/sleeper/whitelisted keepme.exe survived; "
+             f"engine exe killed")
+    finally:
+        kill_own(ext)
+        _kill_captured(groups)
+
+    # (2) our own spawn hitting the ready timeout: the start-path kill is filtered the same way
+    port = free_port()
+    cj, pj, roles = _start_children_fixture("spawn")
+    cfg = make_cfg(port, ["--never-ready", "--children", str(cj), "--pids", str(pj)], ready_timeout=4)
+    cfg["launch_cmd"][1] = str(KIDS_SERVE)
+    cfg["user_whitelist"] = ["keepme"]
+    m = mgr_for(cfg, load_nudge_s=60)
+    groups = {}
+    try:
+        cb = CB()
+        assert m.start_endpoint(cb.ready, cb.error)
+        assert wait_until(lambda: listening(port), 15)
+        groups = _child_procs(pj, roles)
+        spawn_tree = tree_pids(m._popen.pid) - {p.pid for g in groups.values() for p in g}
+        kind, msg = cb.wait(30)
+        assert kind == "error" and "not ready" in msg, (kind, msg)
+        assert wait_until(lambda: not alive(spawn_tree), 10), alive(spawn_tree)
+        assert wait_until(lambda: not _alive_procs(groups["engine"]), 5)
+        for role in ("ping", "sleeper", "keepme"):
+            assert _alive_procs(groups[role]) == groups[role], f"{role} killed by the ready-timeout cleanup"
+        note("ready-timeout cleanup of our spawn: Strata + engine exe killed, non-Strata children spared")
+    finally:
+        if m._popen is not None:
+            kill_own(m._popen)
+        _kill_captured(groups)
+
+
+def t_foreign_serve_py_refused():
+    """Another project's serve\\server.py (outside strata_dir, /health service != strata) on the port: not ACTIVE,
+    start refuses to adopt, stop refuses - no POST /unload, nothing killed. A genuine Strata outside strata_dir
+    (/health service == strata) is still adopted and stopped."""
+    other = OUTSIDE / "proj" / "serve" / "server.py"
+    other.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(FIX / "foreign_serve_server.py", other)
+    port = free_port()
+    rec = TMP / f"rec-foreign-{port}.txt"
+    fp = spawn_external(["--port", str(port), "--record", str(rec)], script=other)
+    try:
+        assert wait_until(lambda: listening(port), 10)
+        fpids = tree_pids(fp.pid)
+        lp = psutil.Process(listener_pid(port))
+        assert server_manager._is_strata_cmd(lp.name(), lp.cmdline()), "fixture must match the cmdline marker"
+        m = mgr_for(make_cfg(port))
+        st = m.status()
+        assert st["state"] == "idle", f"foreign serve/server.py shown as {st}"
+        cb = CB()
+        assert m.start_endpoint(cb.ready, cb.error)
+        kind, msg = cb.wait(15)
+        assert kind == "error" and "not Strata" in msg, (kind, msg)
+        assert m._popen is None
+        cbs = CB()
+        assert m.stop_endpoint(cbs.stopped) is True
+        _, res = cbs.wait(15)
+        check_result_shape(res)
+        assert res["ok"] is False and res["killed_pids"] == [] and res["unload"] == "skipped" \
+            and "not Strata" in (res["error"] or ""), res
+        assert alive(fpids) == fpids and listening(port)
+        assert not any(r.startswith("POST") for r in records(rec)), records(rec)
+        note(f"foreign serve\\server.py: start -> {msg!r}; stop -> {res['error']!r}; no POST, nothing killed")
+    finally:
+        kill_own(fp)
+    # genuine Strata whose server.py is NOT under strata_dir: identified via /health, still adopted + stopped
+    real = OUTSIDE / "strata2" / "serve" / "server.py"
+    real.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(FIX / "fake_strata_server.py", real)
+    port = free_port()
+    ext = spawn_external(["--port", str(port), "--model", "outside-M"], script=real)
+    try:
+        assert wait_until(lambda: listening(port), 10)
+        tree = tree_pids(ext.pid)
+        m = mgr_for(make_cfg(port))
+        cb = CB()
+        assert m.start_endpoint(cb.ready, cb.error)
+        assert cb.wait(15)[0] == "ready"
+        assert m.status()["state"] == "active"
+        cbs = CB()
+        assert m.stop_endpoint(cbs.stopped)
+        _, res = cbs.wait(30)
+        assert res["ok"] and res["unload"] == "ok" and tree <= set(res["killed_pids"]), res
+        note("genuine Strata outside strata_dir (health service=strata): adopted and stopped")
+    finally:
+        kill_own(ext)
+        shutil.rmtree(OUTSIDE, ignore_errors=True)
+
+
+def t_launch_cmd_must_be_exe():
+    """A hand-edited launch_cmd whose argv[0] is a .bat/.cmd/script is refused before anything is spawned."""
+    msgs = []
+    for argv0 in (TMP / "run-evil.bat", TMP / "run-evil.CMD", LAUNCHER):   # LAUNCHER: an EXISTING non-.exe file
+        port = free_port()
+        cfg = make_cfg(port)
+        cfg["launch_cmd"] = [str(argv0), str(SERVE), "--port", str(port)]
+        m = mgr_for(cfg)
+        cb = CB()
+        assert m.start_endpoint(cb.ready, cb.error)
+        kind, msg = cb.wait(5)
+        assert kind == "error" and msg.startswith("Launch command must start with python.exe"), (kind, msg)
+        assert m._popen is None and not listening(port)
+        msgs.append(msg)
+    note(f"non-.exe launch_cmd refused: {msgs[0]!r}")
+
+
 def t_callback_invariant():
     time.sleep(0.5)
     bad = [(c.expected, c.calls) for c in ALL_CBS if len(c.calls) != c.expected]
@@ -604,7 +796,8 @@ def t_callback_invariant():
 
 TESTS = [t_launcher_start_stop_toast_logs, t_early_exit, t_validation_errors, t_ready_timeout_kills_spawned,
          t_lazy_load_and_callback_exception, t_adopt, t_busy_then_force, t_cancel_during_start,
-         t_foreign_listener, t_cmd_bat_launcher, t_parsed_bat_launch, t_callback_invariant]
+         t_foreign_listener, t_cmd_bat_launcher, t_parsed_bat_launch, t_stop_spares_non_strata_children,
+         t_foreign_serve_py_refused, t_launch_cmd_must_be_exe, t_callback_invariant]
 
 
 def leaked_processes() -> list[psutil.Process]:

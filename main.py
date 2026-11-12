@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import gc
 import logging
 import os
 import re
@@ -53,6 +54,8 @@ STATUS = {
 LOADING_STATUS = ("Loading", T.LED["LOADING"])
 LOW_RAM_STATUS = ("Serving · Low-RAM mode", T.AMBER)   # Strata fell back to reading experts from the SSD
 LOW_RAM_NOTE = "Not enough free RAM for full speed: will load slower"
+TOGGLE_DEBOUNCE_S = 0.4
+STATE_SAVE_DEBOUNCE_MS = 300
 # Kept for tests/back-compat: the LED colour per state.
 PILL_COLORS = {k: v[1] for k, v in STATUS.items()}
 LOADING_COLOR = LOADING_STATUS[1]
@@ -128,6 +131,12 @@ class HermesControllerApp(ctk.CTk):
     def __init__(self, detector=None, endpoint=None, config: dict | None = None,
                  metrics_fetcher: Callable[[str], dict | None] | None = None, vram_sampler=None) -> None:
         """metrics_fetcher(root_url) and vram_sampler are test seams (defaults: Strata /metrics over HTTP, NVML)."""
+        # Tk + threads: closed dialogs leave Tk objects (CTkFont, images) in reference cycles. If the automatic
+        # collector fires on a worker thread (any allocation can trigger it), their __del__ makes a Tk call off the
+        # main thread, which can block that worker forever - observed: the log reader stalled mid re.compile, and a
+        # state.json save stalled while holding config_store's lock. So cyclic GC runs ONLY on the Tk thread: off
+        # here, gc.collect() in _tick every TICK_MS. Plain refcount cleanup is unaffected; workers hold no Tk objects.
+        gc.disable()
         cfg = config if config is not None else config_store.load_config()
         if detector is None and endpoint is None:
             detector, endpoint = _build_real_deps(cfg)
@@ -181,6 +190,8 @@ class HermesControllerApp(ctk.CTk):
         # Engine-log verdict for the current run (engine_log.EngineLoad): full-RAM vs slow Low-RAM (SSD) mode.
         # Written by worker threads as one atomic attribute swap, read on the Tk thread.
         self._engine_load: engine_log.EngineLoad | None = None
+        self._toggle_at = 0.0                    # monotonic time of the last accepted ON/OFF click
+        self._state_save_id = None               # pending debounced state.json save (stats_expanded)
         self._engine_checked = False
         self._strata_est: float | None = None    # latched at ready: RAM Strata took (free-RAM drop)
         self._prog_best: tuple[str, float, str | None] = ("Launching", 0.0, None)
@@ -432,6 +443,10 @@ class HermesControllerApp(ctk.CTk):
         self._request_preview()
 
     def _set_state(self, st: str) -> None:
+        if st == ACTIVE and getattr(self, "state_name", None) in (IDLE, ERROR) and hasattr(self, "metrics"):
+            # Adopted a Strata we did not start (or one restarted outside the app): its request history is not ours
+            self._metrics_epoch += 1
+            self.metrics.reset()
         self.state_name = st
         self._state_seq += 1
         self._note_until = 0.0                   # a note belongs to the state it was shown in
@@ -484,7 +499,16 @@ class HermesControllerApp(ctk.CTk):
     def toggle_stats(self) -> None:
         self.expanded = not self.expanded
         self._apply_expanded()
-        self._run_worker("hc-state", config_store.save_state, {"stats_expanded": self.expanded})   # fsync off the UI
+        # Debounced on the Tk thread, then saved off it with the VALUE only. Never hand a worker a closure over
+        # self: if that thread drops the last reference to a destroyed app, tkinter Font.__del__ runs there, and a
+        # Tk call off the main thread can block forever - here while holding config_store's lock (found in tests).
+        if self._state_save_id is not None:
+            self.after_cancel(self._state_save_id)
+        self._state_save_id = self.after(STATE_SAVE_DEBOUNCE_MS, self._save_expanded)
+
+    def _save_expanded(self) -> None:
+        self._state_save_id = None
+        self._run_worker("hc-state", config_store.save_state, {"stats_expanded": bool(self.expanded)})
 
     def _apply_expanded(self) -> None:
         """Grow the window downward to show the stats card, or shrink back to the exact v1.0 size."""
@@ -591,12 +615,22 @@ class HermesControllerApp(ctk.CTk):
 
     def _metrics_loop(self) -> None:
         """Worker: poll Strata's /metrics every 2 s, only while it is serving AND the stats section is open."""
+        last_poll = 0.0
+        last_epoch = None
         while not self._stop_evt.is_set():
             try:
                 if self.expanded and not self._iconic and self.state_name in (ACTIVE, STOPPING):
                     epoch = self._metrics_epoch
                     root = config_store.server_root(str(self.cfg.get("endpoint_url") or ""))
-                    data = self._fetch_metrics(root) if root else None
+                    # /metrics returns only the newest 12 requests: after a gap (section collapsed, window minimised,
+                    # a new server) ask once for all of them so the 30 bars are complete.
+                    now = time.monotonic()
+                    catch_up = epoch != last_epoch or now - last_poll > 3 * STATS_MS / 1000.0
+                    data = None
+                    if root:
+                        data = (self._fetch_metrics(root, all_requests=True) if catch_up
+                                else self._fetch_metrics(root))
+                    last_poll, last_epoch = now, epoch
                     self.post(self._apply_metrics, epoch, data)
             except Exception:  # noqa: BLE001
                 log.debug("metrics poll failed", exc_info=True)
@@ -804,7 +838,7 @@ class HermesControllerApp(ctk.CTk):
                 st = self.endpoint.status()
             except Exception:
                 log.exception("endpoint.status() failed")
-                return
+                st = {}                           # still reconcile: a pending exit must not hang forever
             self.post(self._after_reconcile, st)
 
         self._run_worker("hc-reconcile", work)
@@ -830,6 +864,10 @@ class HermesControllerApp(ctk.CTk):
                 self._iconic = False
             self._update_telemetry()
             self._request_preview()
+            # Collect garbage HERE, on the Tk thread: closed dialogs leave Tk objects (CTkFont, images) in reference
+            # cycles, and if the collector happens to run on a worker instead, their __del__ makes a Tk call off the
+            # main thread (blocks until the main loop services it; forever once it has stopped). Cheap: ~1 ms.
+            gc.collect()
         finally:
             if not self._destroyed:
                 self._tick_id = self.after(TICK_MS, self._tick)
@@ -867,6 +905,19 @@ class HermesControllerApp(ctk.CTk):
 
     # ================================================================== ON flow
     def on_toggle(self) -> None:
+        # CTk fires the command on every ButtonRelease: the 2nd click of a double-click would cancel the start it
+        # just began. Ignore clicks closer than TOGGLE_DEBOUNCE_S.
+        now = time.monotonic()
+        if now - self._toggle_at < TOGGLE_DEBOUNCE_S:
+            return
+        self._toggle_at = now
+        if self._dialog_open() and not isinstance(self.dialog, SweepDialog):
+            try:                                  # a click slipped past a dialog's grab: bring the dialog back
+                self.dialog.lift()
+                self.dialog.focus_force()
+            except Exception:  # noqa: BLE001
+                log.debug("dialog lift failed", exc_info=True)
+            return
         st = self.state_name
         if st in (IDLE, ERROR):
             self.turn_on()
@@ -876,6 +927,7 @@ class HermesControllerApp(ctk.CTk):
             self.cancel_start()
 
     def turn_on(self) -> None:
+        self._sweep_note = ""
         self._apply_pending_launcher()
         self._start_token += 1
         token = self._start_token
@@ -960,19 +1012,19 @@ class HermesControllerApp(ctk.CTk):
         failed = res.get("failed") or []
         if failed:
             log.warning("sweep could not close: %s", failed)
-        self._sweep_note = ""
-        if failed or res.get("error"):
-            names = ", ".join(_short(str(f.get("name", "?")), 18) for f in failed[:2]) or "some apps"
-            if len(failed) > 2:
-                names += f" +{len(failed) - 2}"
-            self._sweep_note = f"Could not close: {names} — starting anyway"
         if self._exit_pending and token == self._start_token and self._start_phase == "sweep":
             self._start_phase = None
             self._set_state(IDLE)
             self._finish_exit()
             return
         if not self._token_live(token):
-            return
+            return                                # a cancelled start's late result must not leak a note into the next
+        self._sweep_note = ""
+        if failed or res.get("error"):
+            names = ", ".join(_short(str(f.get("name", "?")), 18) for f in failed[:2]) or "some apps"
+            if len(failed) > 2:
+                names += f" +{len(failed) - 2}"
+            self._sweep_note = f"Could not close: {names} — starting anyway"
         self._begin_server_start(token)
 
     def _begin_server_start(self, token: int) -> None:
@@ -1126,7 +1178,8 @@ class HermesControllerApp(ctk.CTk):
             running=self.state_name == ACTIVE, on_whitelist_saved=self._request_preview)
 
     def _on_settings_closed(self) -> None:
-        self.dialog = None
+        if isinstance(self.dialog, SettingsDialog):   # only the dialog that closed
+            self.dialog = None
         self._request_preview()
 
     def save_launcher(self, info: launcher_bat.LauncherInfo, done: Callable[[str | None], None]) -> None:
@@ -1168,10 +1221,15 @@ class HermesControllerApp(ctk.CTk):
         if info is None or self.state_name not in (IDLE, ERROR):
             return False
         try:
-            if self.endpoint.is_running():
+            # Wait only while STRATA holds the old port. A foreign program on it (ERROR "port held by X") must not
+            # block the switch forever: the new launcher may well use another port. (Review finding, v1.1.)
+            if self.endpoint.is_running() and self.endpoint.protected_pids():
+                if note:                          # at save time; never over an ERROR message
+                    self._set_note(f"{_short(info.bat_name, 28)} applies when Strata on port "
+                                   f"{self.cfg.get('port', '?')} has stopped")
                 return False
         except Exception:  # noqa: BLE001
-            log.debug("is_running failed", exc_info=True)
+            log.debug("is_running/protected_pids failed", exc_info=True)
             return False
         launcher_bat.apply_to_config(self.cfg, info)
         self._pending_launcher = None
@@ -1193,8 +1251,10 @@ class HermesControllerApp(ctk.CTk):
     def on_close_request(self) -> None:
         if self._dialog_open():
             try:
-                self.dialog.lift()
-                self.dialog.focus_force()
+                child = getattr(self.dialog, "_child", None)   # Protected apps opened from Settings holds the grab
+                target = child if child is not None and child.winfo_exists() else self.dialog
+                target.lift()
+                target.focus_force()
             except Exception:
                 log.debug("dialog lift failed", exc_info=True)
             return
@@ -1247,7 +1307,14 @@ class HermesControllerApp(ctk.CTk):
             self.vram.stop()
         except Exception:  # noqa: BLE001
             log.debug("vram sampler stop failed", exc_info=True)
-        for aid in (self._pump_id, self._tick_id, self._first_id, self._progress_id, self._stats_id, self._note_id):
+        gc.collect()                             # finalize dialog leftovers here, before workers wind down
+        if self._state_save_id is not None:      # a chevron click just before exit: save it now (main thread)
+            try:
+                config_store.save_state({"stats_expanded": bool(self.expanded)})
+            except Exception:  # noqa: BLE001
+                log.debug("final state save failed", exc_info=True)
+        for aid in (self._pump_id, self._tick_id, self._first_id, self._progress_id, self._stats_id, self._note_id,
+                    self._state_save_id):
             if aid:
                 try:
                     self.after_cancel(aid)
