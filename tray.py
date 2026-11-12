@@ -7,9 +7,14 @@ THREADING RULES - READ BEFORE WIRING THIS INTO TK
 * on_open / on_toggle / on_quit / on_lost are called ON THE TRAY THREAD, with no arguments. They must NOT touch Tk.
   Marshal to Tk yourself, e.g. `on_open=lambda: app.post(app.show_from_tray)` (a queue drained by the Tk pump).
   Keep the callbacks short: the tray's menu/clicks are unresponsive while one runs.
+* on_switch(key: str) and on_balloon_click(key: str | None) are called on the tray thread too, with ONE argument
+  (same rules). on_switch gets the key of the model picked in the "Switch model" submenu; on_balloon_click gets the
+  key passed to the notify() whose balloon was clicked, or None (no key given, or the balloon already timed out /
+  was replaced). Without on_balloon_click a balloon click calls on_open instead.
 * set_status() and notify() are thread-safe and non-blocking: they store the wanted state and PostMessage a
   private WM_APP message to the tray thread, which re-renders. Call them from the Tk thread as often as you like;
-  identical states are a no-op and bursts coalesce into one render.
+  identical states are a no-op and bursts coalesce into one render. set_models() is thread-safe too; it only
+  stores the model list (the menu is built from it on each right-click), identical calls are a no-op.
 * stop() is idempotent and joins the thread (<= 2 s). Do NOT call stop() from inside a tray callback expecting a
   join (it is detected and the join is skipped); call it from Tk (e.g. in destroy()). start() refuses (returns
   False) while a previous run's thread is still alive (a stop() whose join timed out).
@@ -24,7 +29,11 @@ THREADING RULES - READ BEFORE WIRING THIS INTO TK
   Manager, WM_ENDSESSION at logoff) call on_quit and never destroy the window; only stop() does that.
 
 Behaviour: left click / double click -> on_open. Right click -> popup menu at the cursor:
-    "Open <title>" (default, bold) | toggle item (hidden when label None, greyed when disabled) | --- | "Quit"
+    "Open <title>" (default, bold) | toggle item (hidden when label None, greyed when disabled) |
+    "Switch model" > submenu (only with >= 2 set_models() items; current one checked + greyed; all greyed when
+    set_models(enabled=False)) | --- | "Quit"
+A pick in the submenu is ignored when its key is no longer in the latest set_models() items (changed while the
+menu was open), is the current one, or the submenu is disabled now. Clicking a notify() balloon -> on_balloon_click.
 The icon = assets/app.png scaled to the small-icon size with a status dot (bottom-right, 1 px dark outline).
 The icon is re-added automatically when Explorer restarts ("TaskbarCreated"), retrying every READD_INTERVAL_S.
 notify() balloons requested while the icon is not in the shell are kept (the latest one only) and shown once it is.
@@ -65,9 +74,18 @@ ICON_UID = 1
 ID_OPEN = 1001
 ID_TOGGLE = 1002
 ID_QUIT = 1003
+ID_MODEL_BASE = 2000                   # "Switch model" items: ID_MODEL_BASE + index (index < MAX_MODELS)
+MAX_MODELS = 100
+ID_MODELS_POPUP = -1                   # marker in _menu_spec() for the submenu entry (popups have no command id)
+MODELS_TEXT = "Switch model"
+MODEL_LABEL_MAX = 40
 
 NIN_SELECT = win32con.WM_USER + 0
 NIN_KEYSELECT = NIN_SELECT | 0x1
+NIN_BALLOONSHOW = win32con.WM_USER + 2
+NIN_BALLOONHIDE = win32con.WM_USER + 3
+NIN_BALLOONTIMEOUT = win32con.WM_USER + 4
+NIN_BALLOONUSERCLICK = win32con.WM_USER + 5
 WM_CONTEXTMENU = 0x007B
 NIIF_INFO = 0x1
 NIIF_NOSOUND = 0x10
@@ -144,6 +162,12 @@ def hicon_from_image(img: Image.Image) -> int:
     return int(hicon)
 
 
+def _model_label(label: object) -> str:
+    """Menu text for a model: single line, at most MODEL_LABEL_MAX chars (ellipsis when cut)."""
+    text = " ".join(str(label).split())
+    return text if len(text) <= MODEL_LABEL_MAX else text[:MODEL_LABEL_MAX - 1].rstrip() + "\u2026"
+
+
 def _norm_hex(led_hex: str | None) -> str | None:
     if led_hex is None:
         return None
@@ -160,13 +184,17 @@ class TrayIcon:
 
     def __init__(self, title: str, icon_png: str, on_open: Callable[[], None] | None,
                  on_toggle: Callable[[], None] | None, on_quit: Callable[[], None] | None,
-                 class_name: str = "AgentStartTray", on_lost: Callable[[], None] | None = None) -> None:
+                 class_name: str = "AgentStartTray", on_lost: Callable[[], None] | None = None,
+                 on_switch: Callable[[str], None] | None = None,
+                 on_balloon_click: Callable[[str | None], None] | None = None) -> None:
         self.title = str(title)
         self.icon_png = icon_png
         self.on_open = on_open
         self.on_toggle = on_toggle
         self.on_quit = on_quit
         self.on_lost = on_lost
+        self.on_switch = on_switch                # (key) on the tray thread
+        self.on_balloon_click = on_balloon_click  # (key | None) on the tray thread; None -> on_open
         self.class_name = class_name          # base name; each run registers "<base>_<pid>_<n>" (see _run_class)
         # Seconds during which a second left-click "up" is folded into the first (a double click = 2 ups).
         self.open_debounce_s = max(0.2, min(win32gui.GetDoubleClickTime() / 1000.0, 0.8))
@@ -177,7 +205,13 @@ class TrayIcon:
         self._want: tuple[str | None, str, str | None, bool] = (None, self.title[:TIP_MAX], None, True)
         self._applied: tuple | None = None
         self._update_posted = False
-        self._balloon: tuple[str, str] | None = None   # latest unshown notify() (older ones would be overwritten)
+        self._balloon: tuple[str, str, str | None] | None = None   # latest unshown notify() (title, msg, key)
+        # set_models() state (any thread, under _lock): ((label, key), ...), current key, enabled
+        self._models: tuple[tuple[tuple[str, str], ...], str | None, bool] = ((), None, True)
+        # tray thread only
+        self._menu_model_ids: dict[int, str] | None = None   # cmd id -> key of the LAST built menu (None: none)
+        self._balloon_key_last: str | None = None   # key of the last balloon handed to the shell
+        self._balloon_key: str | None = None        # key of the balloon currently up (None after timeout/hide)
 
         self._thread: threading.Thread | None = None
         self._gen = 0                          # bumped by stop(): cancels a start_async() that has not begun
@@ -256,11 +290,26 @@ class TrayIcon:
             with self._lock:                   # not delivered: let the next set_status() try again
                 self._update_posted = False
 
-    def notify(self, title: str, message: str) -> None:
-        """Best-effort balloon / toast from the icon. Thread-safe. Only the latest pending one is shown; one requested
-        before start() or while the icon is missing is shown once the icon is (back) in the shell."""
+    def set_models(self, items: list[tuple[str, str]] | None, current: str | None, enabled: bool = True) -> None:
+        """Thread-safe. Content of the "Switch model" submenu: items = [(label, key), ...] (labels cut to ~40 chars,
+        at most MAX_MODELS shown); `current` is checked and greyed; enabled=False greys the whole submenu. None or
+        fewer than 2 items -> no submenu. A pick calls on_switch(key) on the tray thread. Unchanged -> no-op."""
+        norm: list[tuple[str, str]] = []
+        for item in (items or ())[:MAX_MODELS]:
+            label, key = item
+            norm.append((_model_label(label), str(key)))
+        want = (tuple(norm), None if current is None else str(current), bool(enabled))
         with self._lock:
-            self._balloon = (str(title)[:63], str(message)[:255])
+            if want == self._models:
+                return
+            self._models = want
+
+    def notify(self, title: str, message: str, key: str | None = None) -> None:
+        """Best-effort balloon / toast from the icon. Thread-safe. Only the latest pending one is shown; one requested
+        before start() or while the icon is missing is shown once the icon is (back) in the shell. Clicking it calls
+        on_balloon_click(key) (key None if none was given or the balloon timed out), or on_open without that."""
+        with self._lock:
+            self._balloon = (str(title)[:63], str(message)[:255], None if key is None else str(key))
             hwnd = self._hwnd
         if hwnd:
             self._post(WM_TRAY_NOTIFY)
@@ -339,21 +388,43 @@ class TrayIcon:
         self._readd_attempts = 0
         self._in_menu = False
         self._stop_pending = False
+        self._menu_model_ids = None
+        self._balloon_key_last = self._balloon_key = None
 
     # ------------------------------------------------------------------------------------- helpers for tests
     def _menu_items(self) -> list[tuple[str, bool, bool]]:
-        """Menu model as (text, enabled, is_default); the separator is ("-", False, False)."""
+        """Menu model as (text, enabled, is_default); the separator is ("-", False, False), the submenu entry is
+        ("Switch model", enabled, False) - its items are in _submenu_items()."""
         return [(text, enabled, default) for _id, text, enabled, default in self._menu_spec()]
 
-    def _menu_spec(self) -> list[tuple[int, str, bool, bool]]:
+    def _submenu_items(self) -> list[tuple[str, bool, bool]]:
+        """"Switch model" submenu as (label, enabled, checked); [] when there is no submenu."""
+        return [(text, enabled, checked) for _id, text, _key, enabled, checked in self._submenu_spec()[1]]
+
+    def _snapshot(self) -> tuple[tuple, tuple]:
         with self._lock:
-            _led, _tip, label, enabled = self._want
+            return self._want, self._models
+
+    def _menu_spec(self, snap: tuple[tuple, tuple] | None = None) -> list[tuple[int, str, bool, bool]]:
+        want, models = snap or self._snapshot()
+        _led, _tip, label, enabled = want
         items = [(ID_OPEN, f"Open {self.title}", True, True)]
         if label is not None:
             items.append((ID_TOGGLE, label, enabled, False))
+        if len(models[0]) >= 2:
+            items.append((ID_MODELS_POPUP, MODELS_TEXT, models[2], False))
         items.append((0, "-", False, False))
         items.append((ID_QUIT, "Quit", True, False))
         return items
+
+    def _submenu_spec(self, snap: tuple[tuple, tuple] | None = None
+                      ) -> tuple[bool, list[tuple[int, str, str, bool, bool]]]:
+        """(submenu enabled, [(cmd id, label, key, item enabled, checked), ...]); empty list = no submenu."""
+        _want, (items, current, enabled) = snap or self._snapshot()
+        if len(items) < 2:
+            return enabled, []
+        return enabled, [(ID_MODEL_BASE + i, label, key, enabled and key != current, key == current)
+                         for i, (label, key) in enumerate(items)]
 
     def _base(self, size: int) -> Image.Image:
         img = self._base_cache.get(size)
@@ -543,7 +614,21 @@ class TrayIcon:
         with self._lock:
             item, self._balloon = self._balloon, None
         if item is not None:
-            self._show_balloon(*item)
+            title, msg, key = item
+            self._balloon_key_last = self._balloon_key = key
+            self._show_balloon(title, msg)
+
+    def _on_balloon_event(self, event: int) -> None:
+        if event == NIN_BALLOONSHOW:
+            self._balloon_key = self._balloon_key_last      # (a replaced balloon's TIMEOUT may have come first)
+        elif event in (NIN_BALLOONTIMEOUT, NIN_BALLOONHIDE):
+            self._balloon_key = None
+        elif event == NIN_BALLOONUSERCLICK:
+            key, self._balloon_key = self._balloon_key, None
+            if self.on_balloon_click is not None:
+                self._call("on_balloon_click", self.on_balloon_click, key)
+            else:
+                self._call("on_open", self.on_open)
 
     def _show_balloon(self, title: str, msg: str) -> None:
         try:
@@ -553,11 +638,11 @@ class TrayIcon:
         except Exception as e:  # noqa: BLE001
             log.debug("tray: balloon failed: %s", e)
 
-    def _call(self, name: str, fn: Callable[[], None] | None) -> None:
+    def _call(self, name: str, fn: Callable[..., None] | None, *args: object) -> None:
         if fn is None:
             return
         try:
-            fn()
+            fn(*args)
         except Exception:  # noqa: BLE001
             log.exception("tray: %s callback raised", name)
 
@@ -619,17 +704,28 @@ class TrayIcon:
         menu = win32gui.CreatePopupMenu()
         self._in_menu = True
         try:
+            snap = self._snapshot()                        # one consistent view for the menu and its submenu
             shown_label = None
-            for item_id, text, enabled, default in self._menu_spec():
+            model_ids: dict[int, str] = {}
+            for item_id, text, enabled, default in self._menu_spec(snap):
                 if item_id == 0:
                     win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
                     continue
                 flags = win32con.MF_STRING | (0 if enabled else win32con.MF_GRAYED)
+                if item_id == ID_MODELS_POPUP:
+                    sub = self._build_models_menu(snap, model_ids)
+                    try:
+                        win32gui.AppendMenu(menu, flags | win32con.MF_POPUP, sub, text.replace("&", "&&"))
+                    except Exception:  # noqa: BLE001 - not attached: free it ourselves
+                        win32gui.DestroyMenu(sub)
+                        raise
+                    continue                               # (attached: DestroyMenu(menu) frees it)
                 win32gui.AppendMenu(menu, flags, item_id, text.replace("&", "&&"))
                 if item_id == ID_TOGGLE:
                     shown_label = text
             win32gui.SetMenuDefaultItem(menu, ID_OPEN, False)
             self._menu_label_shown = shown_label
+            self._menu_model_ids = model_ids
             self._track_popup(menu, hwnd)
             if not self._stop_pending and win32gui.IsWindow(hwnd):
                 win32gui.PostMessage(hwnd, win32con.WM_NULL, 0, 0)
@@ -641,6 +737,29 @@ class TrayIcon:
                 if self._stop_pending:                     # stop() arrived while the menu was open
                     self._stop_pending = False
                     self._destroy(hwnd)
+
+    def _build_models_menu(self, snap: tuple[tuple, tuple], model_ids: dict[int, str]) -> int:
+        """The "Switch model" popup (caller attaches or destroys it); fills model_ids with cmd id -> key."""
+        sub = win32gui.CreatePopupMenu()
+        try:
+            checked_id = 0
+            specs = self._submenu_spec(snap)[1]
+            for cmd_id, label, key, enabled, checked in specs:
+                flags = win32con.MF_STRING | (0 if enabled else win32con.MF_GRAYED)
+                if checked:
+                    flags |= win32con.MF_CHECKED
+                    checked_id = cmd_id
+                win32gui.AppendMenu(sub, flags, cmd_id, label.replace("&", "&&"))
+                model_ids[cmd_id] = key
+            if checked_id and specs:
+                try:                                       # radio bullet instead of a tick (cosmetic)
+                    win32gui.CheckMenuRadioItem(sub, specs[0][0], specs[-1][0], checked_id, win32con.MF_BYCOMMAND)
+                except Exception:  # noqa: BLE001
+                    pass
+            return sub
+        except Exception:
+            win32gui.DestroyMenu(sub)
+            raise
 
     def _track_popup(self, menu: int, hwnd: int) -> None:
         """Modal popup menu at the cursor (returns when it closes). Separate method so tests can fake it."""
@@ -683,6 +802,27 @@ class TrayIcon:
                 self._call("on_toggle", self.on_toggle)
         elif cmd_id == ID_QUIT:
             self._call("on_quit", self.on_quit)
+        elif ID_MODEL_BASE <= cmd_id < ID_MODEL_BASE + MAX_MODELS:
+            self._on_model_pick(cmd_id)
+
+    def _on_model_pick(self, cmd_id: int) -> None:
+        built, self._menu_model_ids = self._menu_model_ids, None
+        with self._lock:
+            items, current, enabled = self._models
+        latest = {key for _label, key in items}
+        if built is None:                                  # no menu built (direct WM_COMMAND): current layout
+            built = {cmd_id_: key for cmd_id_, _l, key, _e, _c in self._submenu_spec()[1]}
+        key = built.get(cmd_id)
+        if key is None:
+            log.info("tray: model pick %d ignored (not in the menu that was shown)", cmd_id)
+        elif len(items) < 2 or not enabled:
+            log.info("tray: model pick %r ignored (submenu hidden/disabled now)", key)
+        elif key not in latest:
+            log.info("tray: model pick %r ignored (no longer offered)", key)
+        elif key == current:
+            log.info("tray: model pick %r ignored (already current)", key)
+        else:
+            self._call("on_switch", self.on_switch, key)
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         try:
@@ -692,6 +832,8 @@ class TrayIcon:
                     self._open_from_click()
                 elif event in (win32con.WM_RBUTTONUP, WM_CONTEXTMENU):
                     self._show_menu()
+                elif event in (NIN_BALLOONSHOW, NIN_BALLOONHIDE, NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK):
+                    self._on_balloon_event(event)
                 return 0
             if msg == WM_TRAY_UPDATE:
                 self._apply()

@@ -1,2 +1,2 @@
 ; GENERATED from version.py by tools/sync_version.py - do not edit by hand.
-#define AppVersion "1.7.0"
+#define AppVersion "1.8.0"

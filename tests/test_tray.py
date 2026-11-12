@@ -6,7 +6,9 @@ Safe by construction:
     tray icon may be running).
   * Never opens a real popup menu (the WM_COMMAND path is driven directly; the menu test fakes TrackPopupMenu).
     No processes, no network. "Explorer restarts" are simulated by posting TaskbarCreated to OUR window only.
-  * One balloon notification is shown (title "Agent Start tray test").
+  * One balloon notification is shown (title "Agent Start tray test"); the balloon-click tests fake the balloon and
+    post NIN_BALLOON* callback messages to OUR window. The model-submenu tests fake TrackPopupMenu (they inspect the
+    real HMENU that was built, then post the WM_COMMAND a click would have produced).
   * Negative checks ("callback did NOT fire") use sync(): a sentinel message posted after the stimulus; once the
     tray thread has handled it, everything posted before it has been handled too.
 """
@@ -160,7 +162,22 @@ class Recorder:
 
 def make(rec: Recorder, **kw) -> TrayIcon:
     return TrayIcon("Agent Start", ICON_PNG, rec.cb("open"), rec.cb("toggle"), rec.cb("quit"),
-                    class_name=kw.pop("class_name", CLASS), on_lost=rec.cb("lost"))
+                    class_name=kw.pop("class_name", CLASS), on_lost=rec.cb("lost"), **kw)
+
+
+class ArgRecorder:
+    """Records (arg, thread name) for the one-argument callbacks (on_switch / on_balloon_click)."""
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, str]] = []
+
+    def __call__(self, arg) -> None:
+        self.calls.append((arg, threading.current_thread().name))
+
+    def args(self) -> list:
+        return [a for a, _ in self.calls]
+
+
+MODELS = [("Claude Opus", "opus"), ("GPT-5 & friends", "gpt5"), ("Local Qwen 32B", "qwen")]
 
 
 def applied(t: TrayIcon) -> bool:
@@ -342,21 +359,33 @@ def test_lifecycle_and_callbacks() -> None:
         check("notify() is best-effort and harmless", sync(t) and t.is_running and icon_alive(hwnd)
               and t._balloon is None)
 
-        # GDI / USER handle leak check
+        # GDI / USER handle leak check (set_models + menu builds with a submenu mixed in; fake TrackPopupMenu)
+        t._track_popup = lambda menu, hwnd_: None
         for i in range(10):
             t.set_status((GREEN, RED)[i % 2], f"warm {i}", "Turn off")
+            t.set_models(MODELS, MODELS[i % 3][1], True)
+            win32gui.PostMessage(hwnd, tray.WM_TRAY, tray.ICON_UID, win32con.WM_RBUTTONUP)
             wait_until(lambda: applied(t))
+        sync(t)
         gdi0, user0 = gui_counts()
         cols = (GREEN, AMBER, RED, BLUE, GREY, None)
         for i in range(200):                       # rapid burst from this thread (coalesced)
             t.set_status(cols[i % 6], f"Agent Start - burst {i}", ("Turn on", "Turn off", None)[i % 3], i % 2 == 0)
+            t.set_models(MODELS[: 1 + i % 3] if i % 4 else None, MODELS[i % 3][1], i % 5 != 0)
+            if i % 4 == 1:
+                win32gui.PostMessage(hwnd, tray.WM_TRAY, tray.ICON_UID, win32con.WM_RBUTTONUP)
         check("burst of 200 converges to the last state", wait_until(lambda: applied(t), 3.0)
               and t._applied[1] == "Agent Start - burst 199")
         for i in range(200):                       # 200 renders, each applied
             t.set_status(cols[i % 6], f"Agent Start - step {i}", "Turn off")
+            t.set_models(MODELS, MODELS[i % 3][1], True)
+            if i % 2:
+                win32gui.PostMessage(hwnd, tray.WM_TRAY, tray.ICON_UID, win32con.WM_RBUTTONUP)
             if not wait_until(lambda: applied(t), 2.0):
                 break
         check("200 sequential renders all applied", applied(t) and t._applied[1] == "Agent Start - step 199")
+        check("menu builds during the leak run completed (no menu left open)", sync(t) and not t._in_menu)
+        del t._track_popup
         gdi1, user1 = gui_counts()
         check("GUI resource counts readable", gdi0 > 0 and user0 > 0, f"gdi={gdi0} user={user0}")
         check(f"no GDI leak over 400 set_status (GDI {gdi0}->{gdi1})", gdi1 - gdi0 <= 6)
@@ -752,11 +781,287 @@ def test_notify_before_start() -> None:
         t.stop()
 
 
+def test_models_menu_model() -> None:
+    section("'Switch model' submenu model")
+    t = make(Recorder(), class_name=CLASS + "_mm")
+    base = [("Open Agent Start", True, True), ("-", False, False), ("Quit", True, False)]
+    check("no set_models -> no submenu", t._menu_items() == base and t._submenu_items() == [], repr(t._menu_items()))
+    t.set_models(None, None)
+    check("set_models(None) -> no submenu", t._menu_items() == base and t._submenu_items() == [])
+    t.set_models(MODELS[:1], "opus")
+    check("1 item -> no submenu", t._menu_items() == base and t._submenu_items() == [], repr(t._menu_items()))
+    t.set_models([], None)
+    check("0 items -> no submenu", t._menu_items() == base)
+
+    t.set_status(GREEN, "active", "Turn off", True)
+    t.set_models(MODELS, "gpt5")
+    items = t._menu_items()
+    check("menu: Open / toggle / Switch model / - / Quit",
+          items == [("Open Agent Start", True, True), ("Turn off", True, False), ("Switch model", True, False),
+                    ("-", False, False), ("Quit", True, False)], repr(items))
+    sub = t._submenu_items()
+    check("submenu: current checked + disabled, others enabled + unchecked",
+          sub == [("Claude Opus", True, False), ("GPT-5 & friends", False, True), ("Local Qwen 32B", True, False)],
+          repr(sub))
+    ids = [i for i, *_ in t._submenu_spec()[1]]
+    check("submenu ids are distinct and collide with no other command id",
+          len(set(ids)) == 3 and not set(ids) & {tray.ID_OPEN, tray.ID_TOGGLE, tray.ID_QUIT, 0}, repr(ids))
+
+    t.set_models(MODELS, "gpt5", enabled=False)
+    check("enabled=False -> 'Switch model' greyed", ("Switch model", False, False) in t._menu_items(),
+          repr(t._menu_items()))
+    check("... and every item disabled, current still checked",
+          t._submenu_items() == [("Claude Opus", False, False), ("GPT-5 & friends", False, True),
+                                 ("Local Qwen 32B", False, False)], repr(t._submenu_items()))
+    t.set_models(MODELS, None)
+    check("current None -> nothing checked, all enabled", t._submenu_items() == [(lb, True, False) for lb, _ in MODELS])
+    t.set_models(MODELS, "not-listed")
+    check("current not in items -> nothing checked", all(not c for _l, _e, c in t._submenu_items()))
+    t.set_status(GREY, "idle", None)
+    t.set_models(MODELS[:2], "opus")
+    check("toggle hidden: Open / Switch model / - / Quit",
+          [i[0] for i in t._menu_items()] == ["Open Agent Start", "Switch model", "-", "Quit"], repr(t._menu_items()))
+
+    long = "A very long model name that goes on and on - 128k context (preview)"
+    t.set_models([(long, "long"), ("x", "x")], "x")
+    lab = t._submenu_items()[0][0]
+    check("long label truncated to <= 40 chars with an ellipsis", len(lab) <= tray.MODEL_LABEL_MAX
+          and lab.endswith("\u2026") and long.startswith(lab[:-1].rstrip()), repr(lab))
+    check("40-char label kept as is", tray._model_label("y" * 40) == "y" * 40)
+    check("multi-line label flattened", tray._model_label("a\nb\tc") == "a b c")
+    before = t._models
+    t.set_models([(long, "long"), ("x", "x")], "x")
+    check("set_models unchanged -> no-op (state object kept)", t._models is before)
+    t.set_models([(long, "long"), ("x", "x")], "x", True)
+    check("... also with explicit enabled=True", t._models is before)
+    t.set_models([("L%d" % i, "k%d" % i) for i in range(tray.MAX_MODELS + 20)], "k0")
+    check(f"at most MAX_MODELS ({tray.MAX_MODELS}) items, ids in range",
+          len(t._submenu_items()) == tray.MAX_MODELS
+          and max(i for i, *_ in t._submenu_spec()[1]) < tray.ID_MODEL_BASE + tray.MAX_MODELS)
+
+
+def _menu_dump(menu: int) -> list:
+    """[(text-less) (state flags, item id, [sub items] | None)] of a real HMENU."""
+    out = []
+    for pos in range(win32gui.GetMenuItemCount(menu)):
+        state = win32gui.GetMenuState(menu, pos, win32con.MF_BYPOSITION)
+        sub = win32gui.GetSubMenu(menu, pos) if state & win32con.MF_POPUP else 0
+        out.append((state & 0xFF, win32gui.GetMenuItemID(menu, pos), _menu_dump(sub) if sub else None))
+    return out
+
+
+def test_models_switch() -> None:
+    section("'Switch model': menu build + WM_COMMAND -> on_switch (fake TrackPopupMenu)")
+    rec, sw = Recorder(), ArgRecorder()
+    t = make(rec, class_name=CLASS + "_sw", on_switch=sw)
+    dumps: list[list] = []
+    plan: dict = {"pick": None, "during": None}
+
+    def fake_track(menu, hwnd_) -> None:           # no real menu: inspect the HMENU, then act like a click on an item
+        dumps.append(_menu_dump(menu))
+        if plan["during"]:
+            plan["during"]()                       # state changes while the "menu is open"
+        if plan["pick"] is not None:               # TrackPopupMenu (no TPM_RETURNCMD) POSTS the WM_COMMAND
+            win32gui.PostMessage(hwnd_, win32con.WM_COMMAND, plan["pick"], 0)
+
+    t._track_popup = fake_track
+    n_err = len(LOG.errors())
+    check("start", t.start())
+    hwnd = t._hwnd
+    try:
+        t.set_status(GREEN, "active", "Turn off", True)
+        errs: list[str] = []
+
+        def worker() -> None:
+            try:
+                for cur in ("opus", "gpt5", "qwen", "opus"):
+                    t.set_models(MODELS, cur, True)
+            except Exception as e:  # noqa: BLE001
+                errs.append(repr(e))
+
+        th = threading.Thread(target=worker)
+        th.start()
+        th.join(5)
+        check("set_models from another thread", not errs and t._models[1] == "opus", "; ".join(errs))
+
+        def right_click(pick=None, during=None) -> list:
+            plan["pick"], plan["during"] = pick, during
+            n = len(dumps)
+            win32gui.PostMessage(hwnd, tray.WM_TRAY, tray.ICON_UID, win32con.WM_RBUTTONUP)
+            wait_until(lambda: len(dumps) > n)
+            sync(t)
+            return dumps[-1] if len(dumps) > n else []
+
+        d = right_click()
+        G, C, P = win32con.MF_GRAYED, win32con.MF_CHECKED, win32con.MF_POPUP
+        check("real menu has 5 entries, submenu 3rd", len(d) == 5 and d[2][2] is not None
+              and d[2][0] & P and not d[2][0] & G, repr(d))
+        sub = d[2][2] if len(d) == 5 and d[2][2] else []
+        check("real submenu: 3 items with our ids",
+              [i for _s, i, _x in sub] == [tray.ID_MODEL_BASE + k for k in range(3)], repr(sub))
+        check("real submenu: current 'opus' checked + greyed, others neither",
+              len(sub) == 3 and sub[0][0] & C and sub[0][0] & G and not sub[1][0] & (C | G)
+              and not sub[2][0] & (C | G), repr(sub))
+        check("no submenu pick -> no on_switch", sw.calls == [])
+
+        d = right_click(pick=tray.ID_MODEL_BASE + 2)
+        check("pick 'qwen' -> on_switch('qwen') on the tray thread", wait_until(lambda: sw.calls == [("qwen", "tray")]),
+              repr(sw.calls))
+
+        right_click(pick=tray.ID_MODEL_BASE + 0)
+        check("pick of the current model -> ignored", sync(t) and sw.args() == ["qwen"], repr(sw.calls))
+
+        # stale: the shown menu offered 'gpt5' (id +1); it disappears while the menu is open
+        right_click(pick=tray.ID_MODEL_BASE + 1,
+                    during=lambda: t.set_models([MODELS[0], MODELS[2]], "opus"))
+        check("stale pick (key no longer offered) -> ignored", sync(t) and sw.args() == ["qwen"], repr(sw.calls))
+
+        # reorder under the open menu: id -> key comes from the menu that was SHOWN
+        t.set_models(MODELS, "opus")
+        right_click(pick=tray.ID_MODEL_BASE + 1,
+                    during=lambda: t.set_models([MODELS[2], MODELS[0], MODELS[1]], "opus"))
+        check("reordered while open -> key of the shown item ('gpt5'), not the new index ('opus')",
+              wait_until(lambda: sw.args() == ["qwen", "gpt5"]), repr(sw.calls))
+
+        t.set_models(MODELS, "opus", enabled=False)
+        d = right_click(pick=tray.ID_MODEL_BASE + 2)
+        check("disabled: real 'Switch model' popup greyed, all items greyed",
+              len(d) == 5 and d[2][0] & G and d[2][2] is not None and all(s & G for s, _i, _x in d[2][2]), repr(d))
+        check("disabled: pick ignored", sync(t) and sw.args() == ["qwen", "gpt5"], repr(sw.calls))
+        right_click(pick=tray.ID_MODEL_BASE + 2, during=lambda: t.set_models(MODELS, "opus", enabled=False))
+        t.set_models(MODELS, "opus", enabled=True)
+        right_click(pick=tray.ID_MODEL_BASE + 2, during=lambda: t.set_models(MODELS, "opus", enabled=False))
+        check("disabled while the menu was open -> ignored", sync(t) and sw.args() == ["qwen", "gpt5"], repr(sw.calls))
+
+        t.set_models(MODELS[:1], "opus")
+        d = right_click(pick=tray.ID_MODEL_BASE + 1)
+        check("< 2 items: real menu has no submenu (4 entries)", len(d) == 4 and all(x is None for *_r, x in d),
+              repr(d))
+        check("< 2 items: stray model id ignored", sync(t) and sw.args() == ["qwen", "gpt5"])
+
+        # direct WM_COMMAND (no menu built since the last pick): current layout is used
+        t.set_models(MODELS, "gpt5")
+        win32gui.PostMessage(hwnd, win32con.WM_COMMAND, tray.ID_MODEL_BASE + 0, 0)
+        check("WM_COMMAND of a submenu id -> on_switch(key)", wait_until(lambda: sw.args()[-1:] == ["opus"]),
+              repr(sw.calls))
+        win32gui.PostMessage(hwnd, win32con.WM_COMMAND, tray.ID_MODEL_BASE + 7, 0)
+        win32gui.PostMessage(hwnd, win32con.WM_COMMAND, tray.ID_MODEL_BASE + 1, 0)   # current 'gpt5'
+        check("out-of-range / current ids ignored", sync(t) and sw.args() == ["qwen", "gpt5", "opus"], repr(sw.calls))
+
+        t.set_models(MODELS, "opus")
+        right_click(pick=tray.ID_TOGGLE)
+        check("toggle still works with the submenu present", wait_until(lambda: rec.count("toggle") == 1))
+        t.on_switch = None
+        right_click(pick=tray.ID_MODEL_BASE + 1)
+        check("no on_switch -> pick is harmless", sync(t) and t.is_running)
+        t.on_switch = lambda key: 1 / 0
+        right_click(pick=tray.ID_MODEL_BASE + 1)
+        check("raising on_switch does not kill the tray thread", sync(t) and t.is_running and icon_alive(hwnd))
+        check("only the switch callback logged an error", all("callback raised" in e for e in LOG.errors()[n_err:]),
+              repr(LOG.errors()[n_err:]))
+        check("no menu left open", not t._in_menu)
+    finally:
+        t.stop()
+    check("stopped", not t.is_running and t._thread is None and not win32gui.IsWindow(hwnd))
+
+
+def test_balloon_click() -> None:
+    section("balloon click -> on_balloon_click(key) / on_open")
+    shown: list[tuple[str, str]] = []
+
+    def click(t: TrayIcon, event: int = tray.NIN_BALLOONUSERCLICK) -> None:
+        win32gui.PostMessage(t._hwnd, tray.WM_TRAY, tray.ICON_UID, event)
+
+    # without on_balloon_click -> on_open
+    rec = Recorder()
+    t = make(rec, class_name=CLASS + "_bal1")
+    t._show_balloon = lambda title, msg: shown.append((title, msg))    # no real balloons
+    try:
+        check("start", t.start())
+        t.notify("Agent Start", "update available", key="update")
+        sync(t)
+        click(t)
+        check("click without on_balloon_click -> on_open (tray thread)",
+              wait_until(lambda: rec.count("open") == 1) and rec.calls[-1][1] == "tray", repr(rec.calls))
+        win32gui.PostMessage(t._hwnd, tray.WM_TRAY, tray.ICON_UID, tray.NIN_BALLOONTIMEOUT)
+        click(t)
+        check("... also with no balloon key", wait_until(lambda: rec.count("open") == 2), repr(rec.calls))
+        for ev in (tray.NIN_BALLOONSHOW, tray.NIN_BALLOONHIDE, tray.NIN_BALLOONTIMEOUT):
+            click(t, ev)
+        check("show / hide / timeout alone -> no callback", sync(t) and len(rec.calls) == 2, repr(rec.calls))
+    finally:
+        t.stop()
+
+    # with on_balloon_click
+    rec2, bc = Recorder(), ArgRecorder()
+    t2 = make(rec2, class_name=CLASS + "_bal2", on_balloon_click=bc)
+    t2._show_balloon = lambda title, msg: shown.append((title, msg))
+    t2.notify("Agent Start", "queued before start", key="early")
+    try:
+        check("start", t2.start())
+        check("balloon queued before start was shown", wait_until(lambda: ("Agent Start", "queued before start")
+                                                                  in shown) and sync(t2))
+        click(t2)
+        check("click on a balloon queued before start -> its key", wait_until(lambda: bc.args() == ["early"]),
+              repr(bc.calls))
+        t2.notify("Agent Start", "update", key="update")
+        sync(t2)
+        click(t2)
+        check("click -> on_balloon_click('update') on the tray thread, not on_open",
+              wait_until(lambda: bc.calls[-1:] == [("update", "tray")]) and rec2.count("open") == 0, repr(bc.calls))
+        click(t2)
+        check("second click on the same balloon -> None (key consumed)", wait_until(lambda: len(bc.calls) == 3)
+              and bc.args()[-1] is None, repr(bc.calls))
+        t2.notify("Agent Start", "no key")
+        sync(t2)
+        click(t2)
+        check("notify() without key -> on_balloon_click(None)", wait_until(lambda: len(bc.calls) == 4)
+              and bc.args()[-1] is None, repr(bc.calls))
+        t2.notify("Agent Start", "times out", key="t")
+        sync(t2)
+        click(t2, tray.NIN_BALLOONTIMEOUT)
+        click(t2)
+        check("NIN_BALLOONTIMEOUT clears the key", wait_until(lambda: len(bc.calls) == 5) and bc.args()[-1] is None,
+              repr(bc.calls))
+        t2.notify("Agent Start", "hidden", key="h")
+        sync(t2)
+        click(t2, tray.NIN_BALLOONHIDE)
+        click(t2)
+        check("NIN_BALLOONHIDE clears the key", wait_until(lambda: len(bc.calls) == 6) and bc.args()[-1] is None,
+              repr(bc.calls))
+        t2.notify("Agent Start", "first", key="a")
+        sync(t2)
+        t2.notify("Agent Start", "replacement", key="b")
+        sync(t2)
+        click(t2, tray.NIN_BALLOONTIMEOUT)            # the replaced balloon's timeout ...
+        click(t2, tray.NIN_BALLOONSHOW)               # ... then the shell shows the new one
+        click(t2)
+        check("replaced balloon: click -> the latest key", wait_until(lambda: len(bc.calls) == 7)
+              and bc.args()[-1] == "b", repr(bc.calls))
+        t2.notify("Agent Start", "x", key=42)
+        sync(t2)
+        click(t2)
+        check("key passed as str", wait_until(lambda: len(bc.calls) == 8) and bc.args()[-1] == "42", repr(bc.calls))
+        check("all on_balloon_click calls on the tray thread", all(th == "tray" for _a, th in bc.calls))
+        t2.on_balloon_click = lambda key: 1 / 0
+        t2.notify("Agent Start", "boom", key="boom")
+        sync(t2)
+        click(t2)
+        check("raising on_balloon_click does not kill the tray thread", sync(t2) and t2.is_running
+              and icon_alive(t2._hwnd))
+        check("normal clicks unaffected by balloon handling", rec2.count("open") == 0)
+        win32gui.PostMessage(t2._hwnd, tray.WM_TRAY, tray.ICON_UID, win32con.WM_LBUTTONUP)
+        check("left click still -> on_open", wait_until(lambda: rec2.count("open") == 1))
+    finally:
+        t2.stop()
+    check("stopped", not t2.is_running and t2._thread is None)
+
+
 def main() -> int:
     for fn in (test_render, test_menu_model, test_lifecycle_and_callbacks, test_start_failure,
                test_stop_from_callback, test_readd_retry, test_close_requests, test_post_failure,
                test_unique_classes_and_restart_guard, test_logger, test_start_async, test_stop_with_menu_open,
-               test_notify_before_start):
+               test_notify_before_start, test_models_menu_model, test_models_switch, test_balloon_click):
         try:
             fn()
         except Exception:

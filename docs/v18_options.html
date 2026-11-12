@@ -1,0 +1,84 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  .row { display:flex; gap:18px; align-items:flex-start; flex-wrap:wrap; }
+  .col { display:flex; flex-direction:column; gap:6px; }
+  .cap { font-size:12px; color:var(--muted-foreground); max-width:360px; line-height:1.4; }
+  .cap b { color:var(--foreground); }
+  .win { width:360px; background:#141415; border:1px solid #2C2C30; border-radius:10px; font-family:"Segoe UI Variable","Segoe UI",sans-serif; color:#EDEDEB; box-sizing:border-box; padding:14px 16px 10px; position:relative; }
+  .status { display:flex; align-items:center; gap:8px; height:28px; }
+  .led { width:8px; height:8px; border-radius:50%; background:#3CC77E; flex:none; }
+  .state { font-weight:700; font-size:17px; }
+  .sum { font-size:12.5px; color:#A1A1A6; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .gear { margin-left:auto; color:#8A8A90; font-size:15px; }
+  .detail { margin:4px 0 0 16px; font-size:12px; color:#A1A1A6; text-decoration:underline; height:16px; }
+  .btn { width:180px; height:56px; margin:12px auto 0; border-radius:10px; background:#26262A; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:16px; }
+  .under { text-align:center; font-size:12px; color:#A1A1A6; margin-top:7px; height:16px; }
+  .under a { color:#EDEDEB; text-decoration:underline; cursor:pointer; }
+  .ghost { width:180px; height:26px; margin:6px auto 0; border-radius:8px; border:1px solid #303035; display:flex; align-items:center; justify-content:center; font-size:12.5px; color:#EDEDEB; }
+  .card { margin-top:14px; background:#1C1C1E; border-radius:10px; padding:10px 12px; font-size:12px; color:#A1A1A6; }
+  .bar { height:8px; border-radius:4px; background:#26262A; margin:8px 0 6px; overflow:hidden; display:flex; }
+  .bar i { display:block; height:100%; }
+  .h { font-size:11px; color:#8A8A90; margin-top:2px; }
+  /* settings */
+  .set { width:340px; background:#141415; border:1px solid #2C2C30; border-radius:10px; font-family:"Segoe UI Variable","Segoe UI",sans-serif; color:#EDEDEB; padding:10px 12px 12px; box-sizing:border-box; font-size:13px; }
+  .set .t { display:flex; justify-content:space-between; font-weight:700; font-size:14px; }
+  .set .t span { font-weight:400; font-size:12px; color:#8A8A90; font-family:Consolas,monospace; }
+  .lbl { font-size:12px; color:#A1A1A6; margin:10px 0 4px; }
+  .field { background:#1C1C1E; border-radius:8px; height:30px; display:flex; align-items:center; padding:0 10px; color:#8A8A90; font-size:12.5px; }
+  .sw { display:flex; align-items:center; gap:10px; margin-top:9px; font-size:13px; }
+  .sw i { width:34px; height:18px; border-radius:9px; background:#3CC77E; position:relative; flex:none; }
+  .sw i::after { content:""; position:absolute; right:3px; top:3px; width:12px; height:12px; border-radius:50%; background:#EDEDEB; }
+  .sw.off i { background:#26262A; } .sw.off i::after { left:3px; right:auto; background:#8A8A90; }
+  .sw small { display:block; color:#8A8A90; font-size:11.5px; }
+  .hr { height:1px; background:#2C2C30; margin:10px 0 0; }
+  .btns { display:flex; gap:8px; margin-top:12px; } .btns div { flex:1; height:32px; border-radius:8px; display:flex; align-items:center; justify-content:center; font-size:13px; }
+  .new { outline:1px dashed #E0A33A; outline-offset:3px; border-radius:6px; }
+</style></head><body>
+<div class="row">
+  <div class="col">
+    <div class="win">
+      <div class="status"><span class="led"></span><span class="state">Serving</span><span class="sum">Generating · 412 tokens</span><span class="gear">⚙</span></div>
+      <div class="detail">Turns off after this reply · click to cancel</div>
+      <div class="btn">Stop now</div>
+      <div class="card">Memory · 64 GB<div class="bar"><i style="width:22%;background:#55555B"></i><i style="width:72%;background:#3CC77E"></i></div></div>
+    </div>
+    <div class="cap"><b>Now (v1.7).</b> The pending note sits under the status line, away from the button it belongs to.</div>
+  </div>
+  <div class="col">
+    <div class="win">
+      <div class="status"><span class="led"></span><span class="state">Serving</span><span class="sum">Generating · 412 tokens</span><span class="gear">⚙</span></div>
+      <div class="btn">Stop now</div>
+      <div class="under new">Turns off after this reply · <a>Cancel</a></div>
+      <div class="card">Memory · 64 GB<div class="bar"><i style="width:22%;background:#55555B"></i><i style="width:72%;background:#3CC77E"></i></div></div>
+    </div>
+    <div class="cap"><b>A · text under the button, centred.</b> One line: what will happen plus a <i>Cancel</i> link, so only the word is clickable. Same height as now.</div>
+  </div>
+  <div class="col">
+    <div class="win">
+      <div class="status"><span class="led"></span><span class="state">Serving</span><span class="sum">Generating · 412 tokens</span><span class="gear">⚙</span></div>
+      <div class="btn">Stop now</div>
+      <div class="under new" style="margin-top:6px">Turns off after this reply</div>
+      <div class="ghost new">Keep running</div>
+      <div class="card">Memory · 64 GB<div class="bar"><i style="width:22%;background:#55555B"></i><i style="width:72%;background:#3CC77E"></i></div></div>
+    </div>
+    <div class="cap"><b>B · note plus a real Cancel button.</b> Cancel becomes a full-width target under the button. About 30 px taller while a stop is pending.</div>
+  </div>
+</div>
+<div class="row" style="margin-top:22px">
+  <div class="col">
+    <div class="set">
+      <div class="t">Settings <span>v1.7.0</span></div>
+      <div class="lbl">Strata launcher</div><div class="field">run-swift-iq3_s.bat ⌄</div>
+      <div class="lbl">Endpoint</div><div class="field">Open Strata dashboard ↗</div>
+      <div class="field" style="margin-top:8px">Protected apps…</div>
+      <div class="hr"></div>
+      <div class="sw"><i></i><div>Reopen closed apps after Turn off</div></div>
+      <div class="sw new"><i></i><div>Keep running in the tray<small>Off: closing the window quits (asks about Strata)</small></div></div>
+      <div class="sw new"><i></i><div>Check for updates daily<small>Asks GitHub once a day; never installs on its own</small></div></div>
+      <div class="btns"><div style="background:#26262A">Cancel</div><div style="background:#EDEDEB;color:#141415">Save</div></div>
+    </div>
+    <div class="cap"><b>Settings.</b> Two new switches (dashed) under the reopen switch. They apply at once, like the reopen switch. About 70 px taller.</div>
+  </div>
+</div>
+</body></html>

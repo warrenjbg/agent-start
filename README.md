@@ -13,8 +13,9 @@ and makes sure it gets the RAM it needs to run at full speed.
 - **Turn off**: unloads the model, stops only Strata's own processes, checks the port is free, shows a toast, and
   reopens the apps it closed (games as a one-click *Reopen*).
 - Notices a Strata you started yourself and adopts it. Warns when Strata fell back to its slower Low-RAM (SSD) mode.
-- Lives in the system tray (X hides the window; the tray icon's dot shows the state, right-click for Turn on/off and
-  Quit), finds your Strata folder on first start, and offers new versions from GitHub with one-click install.
+- Lives in the system tray (X hides the window; the tray icon's dot shows the state, right-click for Turn on/off,
+  Switch model and Quit), can start with Windows, finds your Strata folder on first start, tells you when a game
+  starts while Strata holds the RAM, and offers new versions from GitHub with one-click install.
 
 Requires Windows 10/11 x64 and a Strata install. Not affiliated with the Strata project.
 
@@ -31,8 +32,19 @@ the idle line says *Strata found · click to set up*, which opens Settings with 
 reads the `.bat` and starts the same command itself; it never runs it.
 
 **Tray:** closing the window (X) keeps the app running in the system tray; the icon's dot has the status colour.
-Click the icon to open the window; right-click for *Turn on / Turn off* and **Quit**. Windows 11 puts new tray icons
-in the hidden-icons (^) area: drag it onto the taskbar to keep it visible.
+Click the icon to open the window; right-click for *Turn on / Turn off*, **Switch model** (two or more `run-*.bat`)
+and **Quit**. Windows 11 puts new tray icons in the hidden-icons (^) area: drag it onto the taskbar to keep it visible.
+Turn the tray off in Settings and X quits as before.
+
+**Start with Windows** (Settings, installed app only): starts hidden in the tray at logon (minimised to the taskbar
+if the tray is off). It is a normal per-user startup entry: Task Manager → Startup apps shows it, and the uninstaller
+removes it.
+
+**Game alert:** while Strata serves, starting a game (anything in your game folders: Steam, Epic, Riot, Xbox, GOG,
+Battle.net) shows a notification: *ELDEN RING started while Strata is running · Click to turn Strata off*. Clicking it
+within ~90 s turns Strata off (asking first if a reply is running); the apps closed for Strata are then offered as a
+one-click Reopen instead of starting over your game. Launchers, SteamVR and redistributable installers don't count.
+Off in Settings if you don't want it.
 
 **Updates:** once a day the app asks GitHub for the latest release (one small request, no data about you). When a
 newer version exists, the idle line says *Update to x.y.z available · click to install*. Click → confirm → it
@@ -89,8 +101,9 @@ script); the Settings dialog and the log show the same number.
   its settings) in your browser; greyed out with *not running* while Strata is off. Below it the API address
   (`…/v1`) with **Copy**, for pasting into Hermes or other clients.
 - **Protected apps…** — the whitelist: apps that are never offered for closing.
-- **Reopen closed apps after Turn off** — on by default; the same choice as the checkbox in the start dialog.
-  Turning it off also forgets the apps currently waiting to be reopened.
+- **Switches** (apply at once): *Reopen closed apps after Turn off* (same as the start dialog's checkbox; off = the
+  closed apps are offered as one click instead), *Keep running in the tray*, *Start with Windows*, *Tell me when a
+  game starts while Strata runs*, *Check for updates daily*.
 
 ## Stats section
 
@@ -185,7 +198,7 @@ To serve another Strata model, pick its `run-*.bat` in ⚙ Settings — no hand-
   pre-ticked. Untick them or add them to the whitelist.
 - **VRAM per app is an estimate.** NVIDIA's NVML reports nothing per process on Windows; the app uses Windows' GPU
   memory counters, capped at the card's real usage. *VRAM freed* after a sweep is measured on the whole card.
-- **Stopping during a reply**: while Strata is reading or writing a reply, Turn off (and a model switch) asks first: *Turn off when it's done* waits until the model has been idle for 6 s (the toggle then reads *Stop now*, and the line under the status says *Turns off after this reply · click to cancel*), *Turn off now* cuts the reply off, *Keep running* does nothing. Agents (Hermes and others) answer in several requests: when a request ends with a tool call (web search, file read…), the app knows the agent will come back with the result and keeps waiting (*Agent running web_search*), for up to 10 minutes per tool. It turns off after a request that ends with an answer. Stopping Strata ends any
+- **Stopping during a reply**: while Strata is reading or writing a reply, Turn off (and a model switch) asks first: *Turn off when it's done* waits until the model has been idle for 6 s (the toggle then reads *Stop now*, and the line under it says *Turns off after this reply · Cancel*; the toast then says it turned off after the reply), *Turn off now* cuts the reply off, *Keep running* does nothing. Agents (Hermes and others) answer in several requests: when a request ends with a tool call (web search, file read…), the app knows the agent will come back with the result and keeps waiting (*Agent running web_search*), for up to 10 minutes per tool. It turns off after a request that ends with an answer. Stopping Strata ends any
   chat session that is using it.
 - **First scan** after launch takes ~2 s (later ~0.3 s); it runs in the background.
 - **Launcher is parsed when you save it.** If you later edit that `.bat` (or Strata's updater rewrites it), open
@@ -213,7 +226,9 @@ Run from this folder with `.venv\Scripts\python.exe`:
 | `tests\test_app_extras.py` | Tool-call-aware safe Turn off, tray wiring, update offer/install flow (stubbed), first-start Strata search, the reopen switch |
 | `tests\test_updater.py` | GitHub release check + download against a local server: size/SHA-256, redirects, cancel, path checks, installer argv (never runs it) |
 | `tests\test_strata_finder.py` | The Strata search: depth/time limits, decoys, skipped folders, junctions |
-| `tests\test_tray.py` | Tray icon on its own thread: status icon, menu model, callbacks, no GDI leaks |
+| `tests\test_tray.py` | Tray icon on its own thread: status icon, menu + Switch model submenu, balloon clicks, callbacks, no GDI leaks |
+| `tests\test_game_watch.py` | Game-launch detection: baseline, launchers, one alert per install, real throwaway "game" process |
+| `tests\test_autostart.py` | Start with Windows in a test registry key: quoting, Task Manager's disabled flag, refresh |
 | `tests\run_real_idle.py` | Real backends, IDLE only, no clicks |
 | `tests\run_real_onoff.py` | **Real** Strata ON → OFF (only with your OK; closes no apps) |
 

@@ -368,6 +368,7 @@ def expected_h(app) -> int:
     status + button, optional detail / progress, the visible panels (pinned, or all while expanded), the bar."""
     h = main.BASE_H + (main.DETAIL_H if detail_shown(app) else 0)
     h += main.PROGRESS_H if app.progress.winfo_manager() == "grid" else 0
+    h += main.PENDING_H if getattr(app, "_pending_shown", False) else 0       # "Turns off after this reply · Cancel"
     groups = ([p for p in main.PANELS if p in app.pinned],
               [p for p in main.PANELS if p not in app.pinned] if app.expanded else [])
     first = True
@@ -1584,7 +1585,9 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
         check(str(dlg._save_btn.cget("state")) == "normal", "Save enabled for a valid launcher")
         w, h = dlg.winfo_width(), dlg.winfo_height()
         scale = ctk.ScalingTracker.get_window_scaling(dlg)
-        check(abs(w - 340 * scale) <= 2 and abs(h - SettingsDialog.HEIGHT * scale) <= 2, f"SettingsDialog size {w}x{h}")
+        check(abs(w - 340 * scale) <= 2 and abs(h - (SettingsDialog.HEIGHT + SettingsDialog.SWITCH_STEP
+                                                            * len(dlg._extra_switches)) * scale) <= 2,
+              f"SettingsDialog size {w}x{h}")
         check(dlg.grab_status() == "local", f"SettingsDialog grab {dlg.grab_status()}")
         check(dlg._link_host.cget("text") == "not running" and dlg._link_text.cget("text_color") == T.TEXT_3,
               f"dashboard link greyed out while Strata is off ({dlg._link_host.cget('text')!r})")

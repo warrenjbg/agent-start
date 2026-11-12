@@ -24,7 +24,8 @@ NO_LAUNCHERS = "No run-*.bat found"
 
 class SettingsDialog(ctk.CTkToplevel):
     WIDTH = 340
-    HEIGHT = 362
+    HEIGHT = 362                                 # with one switch; each further switch adds SWITCH_STEP
+    SWITCH_STEP = 34                             # switch 24 px + 10 px gap
     EXT_GLYPH = "\uE8A7"   # Segoe Fluent Icons "Open in new window"
 
     def __init__(self, master, cfg: dict, detector,
@@ -35,8 +36,12 @@ class SettingsDialog(ctk.CTkToplevel):
                  reopen_after: bool | None = None,
                  on_reopen_changed: Callable[[bool], None] | None = None,
                  update_version: str | None = None,
-                 on_update: Callable[[], None] | None = None) -> None:
-        """on_save(info, done) persists the launcher and calls done(error | None) on the Tk thread.
+                 on_update: Callable[[], None] | None = None,
+                 switches: list[dict] | None = None) -> None:
+        """switches: more on/off settings under the reopen switch, applied at once (like it):
+        {"key", "label", "value": bool, "on_change": callable(bool), "enabled": bool = True}.
+
+        on_save(info, done) persists the launcher and calls done(error | None) on the Tk thread.
 
         current_bat overrides the configured launcher (a saved change that is waiting for the next start);
         running=True adds the "applies next start" hint when another launcher is picked.
@@ -62,7 +67,8 @@ class SettingsDialog(ctk.CTkToplevel):
 
         self.title("Settings")
         self.resizable(False, False)
-        center_over(self, master, self.WIDTH, self.HEIGHT)
+        self._extra_switches = [sw for sw in (switches or []) if isinstance(sw, dict) and sw.get("key")]
+        center_over(self, master, self.WIDTH, self.HEIGHT + self.SWITCH_STEP * len(self._extra_switches))
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<Escape>", lambda _e: self.close())
         self.grid_columnconfigure(0, weight=1)
@@ -167,12 +173,27 @@ class SettingsDialog(ctk.CTkToplevel):
                                             fg_color=T.RAISED, switch_width=34, switch_height=18,
                                             command=self._reopen_toggled)
         self._reopen_switch.grid(row=9, column=0, sticky="w", padx=12, pady=(10, 0))
+        # further switches (tray, updates, start with Windows, game alert): one frame in row 9b, same look
+        self.switches: dict[str, tuple] = {"reopen": (self._reopen_var, self._reopen_switch)}
+        if self._extra_switches:
+            box = ctk.CTkFrame(self, fg_color="transparent")
+            box.grid(row=10, column=0, sticky="ew", padx=12)
+            for i, sw in enumerate(self._extra_switches):
+                var = ctk.BooleanVar(value=bool(sw.get("value")))
+                w = ctk.CTkSwitch(box, text=str(sw.get("label")), variable=var, font=body, text_color=T.TEXT,
+                                  text_color_disabled=T.TEXT_3, progress_color=T.ACCENT, button_color=T.TEXT,
+                                  button_hover_color=T.PRIMARY_HOVER, fg_color=T.RAISED, switch_width=34,
+                                  switch_height=18, command=lambda sw=sw, var=var: self._switch_toggled(sw, var))
+                if not sw.get("enabled", True):
+                    w.configure(state="disabled")
+                w.grid(row=i, column=0, sticky="w", pady=(10, 0))
+                self.switches[str(sw["key"])] = (var, w)
 
         self._msg = ctk.CTkLabel(self, text="", anchor="w", text_color=T.TEXT_2, font=small, height=16)
-        self._msg.grid(row=10, column=0, sticky="ew", padx=12, pady=(8, 2))
+        self._msg.grid(row=11, column=0, sticky="ew", padx=12, pady=(8, 2))
 
         btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=11, column=0, sticky="ew", padx=12, pady=(0, 12))
+        btns.grid(row=12, column=0, sticky="ew", padx=12, pady=(0, 12))
         btns.grid_columnconfigure((0, 1), weight=1, uniform="b")
         self._cancel_btn = ctk.CTkButton(btns, text="Cancel", height=30, fg_color="transparent", border_width=1,
                                          border_color=T.RAISED_HOVER, hover_color=T.RAISED, command=self.close)
@@ -318,6 +339,18 @@ class SettingsDialog(ctk.CTkToplevel):
         master = self.master
         self.close()                             # the confirmation box belongs to the main window
         master.after(50, cb)
+
+    def _switch_toggled(self, sw: dict, var) -> None:
+        cb = sw.get("on_change")
+        if cb is None:
+            return
+        try:
+            res = cb(bool(var.get()))
+            if res is False:                     # the change was refused (e.g. the registry write failed)
+                var.set(not bool(var.get()))
+        except Exception:  # noqa: BLE001
+            log.exception("setting %s failed", sw.get("key"))
+            var.set(not bool(var.get()))
 
     def _reopen_toggled(self) -> None:
         if self._on_reopen_changed is not None:

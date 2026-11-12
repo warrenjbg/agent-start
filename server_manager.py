@@ -225,6 +225,9 @@ class EndpointManager:
         self._probe_model: str | None = None
         self._probe_loaded: bool | None = None
         self.last_toast: str | None = None         # message of the last toast shown (diagnostics/tests)
+        # One-shot wording for the next stop's toast, set by the UI just before a stop it wants explained
+        # (e.g. a safe Turn off that waited for the reply): (title, message); "{freed}" becomes e.g. "50.3 GB".
+        self.next_toast: tuple[str, str] | None = None
 
     # ------------------------------------------------------------------ config helpers
     @property
@@ -987,22 +990,29 @@ class EndpointManager:
             result["error"] = None
             if errors:
                 log.warning("stop: port released but: %s", "; ".join(errors))
+            note, self.next_toast = self.next_toast, None
             if self._notify:
-                self._toast(model)
+                self._toast(model, note, result.get("ram_freed_mb"))
         else:
             result["ok"] = False
             errors.append(f"port {self._port} still in use after {stop_timeout:g} s")
             result["error"] = "; ".join(errors)
 
-    def _toast(self, model: str) -> None:
-        msg = f"Strata stopped: {model} unloaded and memory freed."
+    def _toast(self, model: str, note: tuple[str, str] | None = None, freed_mb: float | None = None) -> None:
+        title, msg = "Strata stopped", f"Strata stopped: {model} unloaded and memory freed."
+        if note:
+            freed = f"{freed_mb / 1024:.1f} GB" if isinstance(freed_mb, (int, float)) and freed_mb > 0 else "its memory"
+            try:
+                title, msg = note[0], note[1].replace("{freed}", freed).replace("{model}", model)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             from winotify import Notification
             icon = config_store.APP_DIR / "assets" / "app.png"
             # Installed build: the Start-menu shortcut carries this AUMID, so the toast shows the app's
             # name + icon. From source there is no shortcut, so use a plain display name.
             app_id = "warrenjbg.AgentStart" if config_store.FROZEN else "Agent Start"
-            Notification(app_id=app_id, title="Strata stopped", msg=msg,
+            Notification(app_id=app_id, title=title, msg=msg,
                          icon=str(icon) if icon.exists() else "").show()
             self.last_toast = msg
         except Exception:  # noqa: BLE001 - toast failure is non-fatal

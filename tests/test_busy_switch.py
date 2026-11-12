@@ -99,6 +99,17 @@ def settle_reopen(app) -> None:
     pump_until(app, lambda: not app._reopening, 5)
 
 
+def pend_txt(app) -> str:
+    """v1.8: the pending-stop line sits under the button: '<what> after this reply · ' + 'Cancel' (the link)."""
+    if not getattr(app, "_pending_shown", False) or not app.pending_box.winfo_manager():
+        return ""
+    return app.pending_text.cget("text") + app.pending_cancel.cget("text")
+
+
+def click_cancel(app) -> None:
+    app.pending_cancel._label.event_generate("<Button-1>")
+
+
 def pending(app):
     return getattr(app, "_stop_pending", "<no _stop_pending attribute>")
 
@@ -302,39 +313,38 @@ def test_when_idle_line_and_cancel() -> None:
               "when_idle: still ACTIVE, nothing stopped, dialog closed")
         check(app.toggle.cget("text") == "Stop now" and str(app.toggle.cget("state")) == "normal",
               f"when_idle: toggle says 'Stop now' ({app.toggle.cget('text')!r})")
-        txt = app.preview.cget("text")
-        check(U.detail_shown(app) and app._detail_link is True, f"pending line forced visible + a link "
-              f"(shown={U.detail_shown(app)}, link={app._detail_link})")
-        check("after this reply" in txt and "click to cancel" in txt, f"pending line text ({txt!r})")
-        check(str(app.preview.cget("cursor")) == "hand2", "pending line has the hand cursor")
+        txt = pend_txt(app)
+        check(app.pending_box.winfo_ismapped(), "pending line shown under the button")
+        check(txt == "Turns off after this reply · Cancel", f"pending line text ({txt!r})")
+        check(str(app.pending_cancel.cget("cursor")) == "hand2", "Cancel has the hand cursor")
+        check("after this reply" not in app.preview.cget("text"), "not in the detail line any more")
         scale = ctk.ScalingTracker.get_window_scaling(app)
-        check(abs(app.winfo_height() - U.expected_h(app) * scale) <= 2,
-              f"window grew for the detail line ({app.winfo_height()} vs {U.expected_h(app)}*{scale})")
-        check(app.preview.winfo_reqwidth() <= app.winfo_width() - (main.DETAIL_INDENT + 8) * scale
-              and "\n" not in txt, f"pending line fits on one line ({app.preview.winfo_reqwidth()} px, {txt!r})")
+        bx = app.toggle.winfo_rootx() + app.toggle.winfo_width() / 2
+        px = app.pending_box.winfo_rootx() + app.pending_box.winfo_width() / 2
+        check(abs(bx - px) <= 2, f"pending line centred under the button ({bx:.0f} vs {px:.0f})")
+        check(app.pending_box.winfo_reqwidth() <= app.winfo_width() - 32 * scale,
+              f"pending line fits on one line ({app.pending_box.winfo_reqwidth()} px)")
         check(pill(app)[0] == "Generating", f"status title still shows the model state ({pill(app)})")
         U.shot(app, "busy_pending_stop")
         # the line survives the status refreshes of the following polls; nothing stops while the model is busy
         p0 = app.metrics.polls
         pump(app, GRACE + 4 * POLL)
-        txt2 = app.preview.cget("text")
-        check(app.metrics.polls > p0 and "after this reply" in txt2 and "click to cancel" in txt2 and app._detail_link
+        txt2 = pend_txt(app)
+        check(app.metrics.polls > p0 and "after this reply" in txt2 and txt2.endswith("Cancel")
               and app.toggle.cget("text") == "Stop now", f"pending line survives metrics refreshes ({txt2!r})")
         check(len(ep.stop_calls) == n and pending(app) == ("off", None) and app.state_name == "ACTIVE",
               f"busy for longer than the grace: still waiting ({app.state_name}, {pending(app)!r})")
         # other model states keep it too
         go_busy(app, "reading")
         pump(app, 2 * POLL)
-        check("after this reply" in app.preview.cget("text") and app._detail_link,
-              f"reading: pending line still there ({app.preview.cget('text')!r})")
-        # ---- click the line = cancel
-        app.preview._label.event_generate("<Button-1>")
+        check("after this reply" in pend_txt(app), f"reading: pending line still there ({pend_txt(app)!r})")
+        # ---- click Cancel = cancel
+        click_cancel(app)
         pump(app, 0.3)
         check(pending(app) is None, f"click cancels: _stop_pending None ({pending(app)!r})")
         check(app.toggle.cget("text") == "Turn off" and app.state_name == "ACTIVE" and len(ep.stop_calls) == n,
               f"click cancels: toggle back to 'Turn off', nothing stopped ({app.toggle.cget('text')!r})")
-        check("after this reply" not in app.preview.cget("text") and not app._detail_link,
-              f"click cancels: the line is gone ({app.preview.cget('text')!r})")
+        check(pend_txt(app) == "" and not app._pending_shown, f"click cancels: the line is gone ({pend_txt(app)!r})")
         info(f"right after the cancel click the status area says {status(app)!r}")
         go_model_idle(app)
         pump(app, GRACE + 4 * POLL)
@@ -387,7 +397,7 @@ def test_when_idle_grace() -> None:
         pump(app, GRACE + 4 * POLL)                 # an un-reset timer from the first idle would fire in here
         check(len(ep.stop_calls) == n and app.state_name == "ACTIVE" and pending(app) == ("off", None),
               f"new request resets the wait: still pending while it runs ({app.state_name}, {pending(app)!r})")
-        check("after this reply" in app.preview.cget("text"), "line still shown after the reset")
+        check("after this reply" in pend_txt(app), "line still shown after the reset")
         # ---- a "queued" model (idle + waiting requests) is not idle
         f = app._fetch_metrics
         f.live, f.queued = "idle", 2
@@ -890,22 +900,21 @@ def test_switch_busy(S: Strata) -> None:
         check(isinstance(p, tuple) and len(p) == 2 and p[0] == "switch"
               and isinstance(p[1], launcher_bat.LauncherInfo) and p[1].bat_path == S.bat_b and p[1].model_name == "model-b",
               f"when_idle: _stop_pending == ('switch', LauncherInfo run-b) ({p!r})")
-        txt = app.preview.cget("text")
-        check("Switches model" in txt and "click to cancel" in txt and U.detail_shown(app) and app._detail_link is True,
-              f"pending switch line: forced, link, text ({txt!r}, link={app._detail_link})")
-        check(app.preview.winfo_reqheight() <= 18 * ctk.ScalingTracker.get_widget_scaling(app),
-              f"pending switch line is one line ({app.preview.winfo_reqheight()})")
+        txt = pend_txt(app)
+        check(txt == "Switches model after this reply · Cancel", f"pending switch line text ({txt!r})")
+        check(app.pending_box.winfo_reqheight() <= 18 * ctk.ScalingTracker.get_widget_scaling(app),
+              f"pending switch line is one line ({app.pending_box.winfo_reqheight()})")
         scale = ctk.ScalingTracker.get_window_scaling(app)
-        check(app.preview.winfo_reqwidth() <= app.winfo_width() - (main.DETAIL_INDENT + 8) * scale and "\n" not in txt,
-              f"pending switch line fits on one line ({app.preview.winfo_reqwidth()} px of {app.winfo_width()})")
+        check(app.pending_box.winfo_reqwidth() <= app.winfo_width() - 32 * scale,
+              f"pending switch line fits ({app.pending_box.winfo_reqwidth()} px of {app.winfo_width()})")
         check(app.state_name == "ACTIVE" and len(ep.stop_calls) == n_stop and S.on_a(app), "when_idle: still serving a")
         info(f"toggle while a switch is pending: {app.toggle.cget('text')!r}; switch button "
              f"{app.switch_btn.cget('state')}")
         U.shot(app, "busy_pending_switch")
         pump(app, GRACE + 4 * POLL)
-        check(len(ep.stop_calls) == n_stop and "Switches model" in app.preview.cget("text"),
-              f"busy longer than the grace: still waiting, line kept ({app.preview.cget('text')!r})")
-        app.preview._label.event_generate("<Button-1>")
+        check(len(ep.stop_calls) == n_stop and "Switches model" in pend_txt(app),
+              f"busy longer than the grace: still waiting, line kept ({pend_txt(app)!r})")
+        click_cancel(app)
         pump(app, 0.4)
         check(pending(app) is None and app.state_name == "ACTIVE" and len(ep.stop_calls) == n_stop and S.on_a(app)
               and "Switches model" not in app.preview.cget("text") and app.toggle.cget("text") == "Turn off",

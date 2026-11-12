@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 import test_ui_smoke as U  # noqa: E402  (first: redirects the data dir, fakes reopen.launch / webbrowser.open)
 import config_store  # noqa: E402
+import launcher_bat  # noqa: E402
 import main  # noqa: E402
 import reopen  # noqa: E402
 import strata_finder  # noqa: E402
@@ -123,14 +124,18 @@ def test_tool_gap() -> None:
         check(app._stop_pending == ("off", None), "stop pending")
         pump(app, main.IDLE_GRACE_S * 3 + 0.5)
         check(len(ep.stop_calls) == n and app.state_name == "ACTIVE", "waits through the tool gap (longer than the grace)")
-        check("after the agent's reply" in app.preview.cget("text") and app.preview.winfo_reqheight() <= 20,
-              f"pending line, one line ({app.preview.cget('text')!r})")
+        ptxt = app.pending_text.cget("text") + app.pending_cancel.cget("text")
+        check(app._pending_shown and ptxt == "Turns off after the agent's reply · Cancel",
+              f"pending line under the button ({ptxt!r})")
         U.shot(app, "extras_toolgap_pending")
         # the agent's next request is the answer
         _request(app, pm, fs, "answering", sampled="answering", gen_s=0.8)
         check(len(ep.stop_calls) == n, "not during the answer")
         check(pump_until(app, lambda: len(ep.stop_calls) > n, main.IDLE_GRACE_S + 3),
               "answer finished -> turns off after the grace")
+        nt = getattr(ep, "next_toast", None)
+        check(isinstance(nt, tuple) and "after the reply" in nt[1] and "{freed}" in nt[1],
+              f"the stop toast says why ({nt})")
     finally:
         close(app)
     # named tool from /status, fallback sampling without /status, stale phase, expiry, dialog auto-idle
@@ -179,8 +184,11 @@ def test_tool_gap() -> None:
 class FakeTray:
     instances: list = []
 
-    def __init__(self, title, icon_png, on_open, on_toggle, on_quit, class_name="AgentStartTray", on_lost=None):
+    def __init__(self, title, icon_png, on_open, on_toggle, on_quit, class_name="AgentStartTray", on_lost=None,
+                 on_switch=None, on_balloon_click=None):
         self.title, self.icon_png, self.on_lost = title, icon_png, on_lost
+        self.on_switch, self.on_balloon_click = on_switch, on_balloon_click
+        self.models: list = []
         self.on_open, self.on_toggle, self.on_quit = on_open, on_toggle, on_quit
         self.status: list = []
         self.notes: list = []
@@ -199,8 +207,11 @@ class FakeTray:
     def set_status(self, led_hex, tooltip, toggle_label, toggle_enabled=True):
         self.status.append((led_hex, tooltip, toggle_label, toggle_enabled))
 
-    def notify(self, title, message):
-        self.notes.append((title, message))
+    def notify(self, title, message, key=None):
+        self.notes.append((title, message, key))
+
+    def set_models(self, items, current, enabled=True):
+        self.models.append((items, current, enabled))
 
     def stop(self):
         self.stopped, self.is_running = True, False
@@ -504,6 +515,260 @@ def test_reopen_switch() -> None:
         close(app)
 
 
+# ------------------------------------------------------------------------------------------------ v1.8
+class FakeWatcher:
+    def __init__(self):
+        self.armed = 0
+        self.disarmed = 0
+        self.stopped = False
+
+    def arm(self):
+        self.armed += 1
+
+    def disarm(self):
+        self.disarmed += 1
+
+    def stop(self):
+        self.stopped = True
+
+
+def test_game_alert_and_tray_models(tmp: Path) -> None:
+    import threading
+    import tray as tray_mod
+    real = tray_mod.TrayIcon
+    tray_mod.TrayIcon = FakeTray
+    pa, pb = U._free_port(), U._free_port()
+    sdir = U.make_strata(tmp, "Strata-M", {"a": pa, "b": pb})
+    info = launcher_bat.parse_bat(str(sdir / "run-a.bat"))
+    cfg = dict(U.CFG, strata_dir=str(sdir), launcher_bat=str(sdir / "run-a.bat"), launch_cmd=info.argv,
+               launch_cwd=info.cwd, port=pa, endpoint_url=f"http://127.0.0.1:{pa}/v1")
+    app, det, ep = U.new_app(cfg)
+    try:
+        app._extras, app._no_tray = True, False
+        app._start_tray()
+        t = app.tray
+        pump_until(app, lambda: t.status, 3)
+        app._refresh_launchers()
+        app._sync_tray()
+        check(t.models and t.models[-1][0] and len(t.models[-1][0]) == 2, f"tray gets the two launchers ({t.models[-1:]})")
+        if t.models and t.models[-1][0]:
+            items, cur, en = t.models[-1]
+            check(cur and cur.endswith("run-a.bat") and en, f"current launcher marked, enabled ({cur}, {en})")
+            check(all("✓" not in lbl for lbl, _ in items), "labels without the ✓")
+        # tray switch -> same as the ⇄ menu
+        picked = []
+        app.switch_model = lambda path: picked.append(path)
+        threading.Thread(target=t.on_switch, args=(str(sdir / "run-b.bat"),)).start()
+        check(pump_until(app, lambda: picked, 3) and picked[0].endswith("run-b.bat"), "tray Switch model -> switch_model")
+        del app.switch_model
+        # game alert: armed only while serving
+        w = FakeWatcher()
+        app.games, app._games_armed = w, False
+        app._arm_games(app.state_name == "ACTIVE")
+        check(w.armed == 0, "idle: not armed")
+        U.to_active(app, ep)
+        pump(app, 0.5)
+        check(w.armed == 1 and app._games_armed, "serving: armed")
+        app._mem = (65536.0, 12000.0, 50000.0)
+        threading.Thread(target=lambda: app.post(app._on_game_started, "EldenRing", 9000.0)).start()
+        check(pump_until(app, lambda: any(n[2] == "game" for n in t.notes), 3), f"tray balloon about the game ({t.notes[-1:]})")
+        note = [n for n in t.notes if n[2] == "game"][-1]
+        check("EldenRing" in note[1] and "~49 GB" in note[1], f"balloon text ({note[1]!r})")
+        U.shot(app, "extras_game_alert")
+        # clicking the balloon turns Strata off (model idle -> straight away)
+        app.withdraw()
+        n = len(ep.stop_calls)
+        threading.Thread(target=t.on_balloon_click, args=("game",)).start()
+        check(pump_until(app, lambda: len(ep.stop_calls) > n, 3), "balloon click -> Turn off")
+        check(app.state() == "normal", "and the window is shown")
+        ep.status_value = dict(U.IDLE_STATUS)
+        U.fire(ep.stop_calls[-1][0], U.stop_result())
+        pump(app, 0.5)
+        check(w.disarmed >= 1 and not app._games_armed, "stopped: disarmed")
+        # switch off -> not armed when serving again
+        app.set_game_pref(False)
+        U.to_active(app, ep)
+        pump(app, 0.4)
+        check(w.armed == 1, "game alert off: not armed while serving")
+        t.notes.clear()
+        app._on_game_started("Doom", 1.0)
+        check(not t.notes, "game alert off: no balloon")
+        app.set_game_pref(True)
+        check(w.armed == 2, "switched back on while serving: armed again")
+    finally:
+        tray_mod.TrayIcon = real
+        close(app)
+
+
+def test_settings_switches() -> None:
+    import autostart
+    import tray as tray_mod
+    real = tray_mod.TrayIcon
+    tray_mod.TrayIcon = FakeTray
+    calls = []
+    saved_auto = (autostart.enable, autostart.disable, autostart.is_enabled)
+    autostart.enable = lambda exe, *a, **k: calls.append(("enable", exe))
+    autostart.disable = lambda *a, **k: calls.append(("disable",))
+    autostart.is_enabled = lambda *a, **k: False
+    real_frozen = config_store.FROZEN
+    app, det, ep = U.new_app()
+    try:
+        app._extras, app._no_tray = True, False
+        app._start_tray()
+        t = app.tray
+        pump_until(app, lambda: t.status, 3)
+        app.open_settings()
+        pump(app, 0.4)
+        d = app.dialog
+        keys = list(getattr(d, "switches", {}))
+        check(keys == ["reopen", "tray", "autostart", "games", "updates"], f"Settings switches ({keys})")
+        U.shot(d, "extras_settings_switches")
+        if "tray" in keys:
+            check(d.switches["tray"][0].get() is True, "tray switch on")
+            check(str(d.switches["autostart"][1].cget("state")) == "disabled", "from source: Start with Windows greyed")
+            check(str(d.switches["updates"][1].cget("state")) == "disabled", "from source: updates greyed")
+            d.switches["tray"][1].toggle()
+            pump(app, 0.3)
+            check(app.tray is None and t.stopped and not app._tray_pref, "tray switch off: icon removed")
+            check(pump_until(app, lambda: config_store.load_state().get("tray_enabled") is False, 3), "saved")
+            d.switches["games"][1].toggle()
+            pump(app, 0.2)
+            check(app._game_pref is False and pump_until(app, lambda: config_store.load_state().get("game_alert") is False, 3),
+                  "game alert switch off + saved")
+            d.switches["games"][1].toggle()
+            d.switches["tray"][1].toggle()
+            pump(app, 0.4)
+            check(app._tray_pref and isinstance(app.tray, FakeTray) and app.tray is not t, "tray switch on: a new icon")
+            d.close()
+            pump(app, 0.3)
+        # with the tray off, X quits
+        app.set_tray_pref(False)
+        app.on_close_request()
+        check(pump_until(app, lambda: app._destroyed, 3), "tray off: X quits")
+    finally:
+        close(app)
+    # installed app: Start with Windows + updates are live
+    config_store.FROZEN = True
+    app, det, ep = U.new_app()
+    try:
+        app._extras = True
+        sw = {x["key"]: x for x in app._settings_switches()}
+        check(sw["autostart"]["enabled"] and sw["updates"]["enabled"], "installed: both switches usable")
+        check(app.set_autostart_pref(True) is True and calls[-1][0] == "enable", f"autostart on -> enable ({calls[-1:]})")
+        check(app.set_autostart_pref(False) is True and calls[-1] == ("disable",), "autostart off -> disable")
+
+        def boom(*a, **k):
+            raise autostart.AutostartError("access denied")
+        autostart.enable = boom
+        check(app.set_autostart_pref(True) is False and "Start with Windows failed" in status(app),
+              f"a failed registry write is refused + shown ({status(app)!r})")
+        upd = []
+        app._maybe_check_update = lambda: upd.append(1)
+        app.set_update_pref(False)
+        check(app._no_update_check and app._update is None, "updates off: no checks")
+        app.set_update_pref(True)
+        check(not app._no_update_check and upd, "updates on (installed): checks again")
+    finally:
+        config_store.FROZEN = real_frozen
+        autostart.enable, autostart.disable, autostart.is_enabled = saved_auto
+        tray_mod.TrayIcon = real
+        config_store.save_state({"tray_enabled": True, "game_alert": True, "update_check": True})
+        close(app)
+
+
+def test_review_fixes() -> None:
+    """Fable v1.8 review: reachable windows without a tray, stale balloons, one-shot stop toast, tray models."""
+    import threading
+    import tray as tray_mod
+    # 1. --tray with the tray off: iconify after the loop runs; CTk's mainloop must not leave it withdrawn
+    app, det, ep = U.new_app()
+    try:
+        seen = {}
+        app._started_hidden = True
+        app.after(300, app.iconify)
+        app.after(1500, lambda: (seen.setdefault("state", app.state()), app.quit()))
+        app.mainloop()
+        check(seen.get("state") == "iconic", f"--tray without a tray: minimised to the taskbar ({seen})")
+    finally:
+        close(app)
+    # 2. --tray, the icon fails: minimised (not withdrawn), retried
+    app, det, ep = U.new_app()
+    try:
+        app._started_hidden, app._no_tray = True, False
+        app.withdraw()
+        pump(app, 0.2)
+        app._tray_started(None, False)          # self.tray is None -> stale check passes only for t == self.tray
+        app.tray = object()
+        t = app.tray
+        app._tray_started(t, False)
+        pump(app, 0.3)
+        check(app.state() == "iconic", f"tray failed at logon: minimised, reachable ({app.state()})")
+        check(app._tray_retry_until > time.monotonic() + 60, "and the icon is retried for 2 min")
+    finally:
+        close(app)
+    # 3. stale game balloon: only opens the window
+    real = tray_mod.TrayIcon
+    tray_mod.TrayIcon = FakeTray
+    app, det, ep = U.new_app()
+    try:
+        app._extras, app._no_tray = True, False
+        app._start_tray()
+        t = app.tray
+        pump_until(app, lambda: t.status, 3)
+        U.to_active(app, ep)
+        pump(app, 0.4)
+        app._on_game_started("Hades", 1.0)
+        app._game_alert = (time.monotonic() - main.GAME_ALERT_CLICK_S - 1, app._start_token)
+        n = len(ep.stop_calls)
+        app._balloon_clicked("game")
+        pump(app, 0.4)
+        check(len(ep.stop_calls) == n and app.state_name == "ACTIVE", "an old game balloon does not turn Strata off")
+        app._on_game_started("Hades", 1.0)
+        app._box_open = True
+        app._balloon_clicked("game")
+        pump(app, 0.3)
+        check(len(ep.stop_calls) == n, "not while a question box is open")
+        app._box_open = False
+        app._balloon_clicked("other")
+        check(len(ep.stop_calls) == n, "another balloon's click only opens the window")
+        # 4. tray off -> on: the new icon gets the model list again
+        app.set_tray_pref(False)
+        app.set_tray_pref(True)
+        t2 = app.tray
+        pump_until(app, lambda: t2.status, 3)
+        app._launchers = [("m-a  ·  run-a.bat  ✓", "a.bat"), ("m-b  ·  run-b.bat", "b.bat")]
+        app._sync_tray()
+        check(t2.models and t2.models[-1][1] == "a.bat", f"re-created tray gets the models ({t2.models[-1:]})")
+        # 5. game started while loading: told once ready
+        app.loaded = False
+        t2.notes.clear()
+        app._on_game_started("Celeste", 1.0)
+        check(not t2.notes and app._game_queued == ("Celeste", 1.0), "game during the load: queued")
+        app.loaded = True
+        app._apply_state()
+        check(any(n_[2] == "game" and "Celeste" in n_[1] for n_ in t2.notes), "delivered once the model is ready")
+    finally:
+        tray_mod.TrayIcon = real
+        close(app)
+    # 6. the safe-stop toast wording is one-shot: a later manual stop uses the default
+    app, det, ep = U.new_app()
+    try:
+        U.to_active(app, ep)
+        pump(app, 0.3)
+        app._stop_toast = ("Strata turned off", "x {freed}")
+        app.turn_off()
+        check(getattr(ep, "next_toast", None) == ("Strata turned off", "x {freed}"), "safe stop: explained toast")
+        ep.status_value = dict(U.IDLE_STATUS)
+        U.fire(ep.stop_calls[-1][0], U.stop_result())
+        pump(app, 0.4)
+        U.to_active(app, ep)
+        pump(app, 0.3)
+        app.turn_off()
+        check(getattr(ep, "next_toast", "unset") is None, "next manual stop: default toast")
+    finally:
+        close(app)
+
+
 def run() -> int:
     import tempfile
     main.TOGGLE_DEBOUNCE_S = 0.0
@@ -514,7 +779,9 @@ def run() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="as_extras_"))
     try:
         for fn, args in ((test_tool_gap, ()), (test_tray, ()), (test_update_offer, ()),
-                         (test_first_start_search, (tmp,)), (test_reopen_switch, ())):
+                         (test_first_start_search, (tmp,)), (test_reopen_switch, ()),
+                         (test_game_alert_and_tray_models, (tmp,)), (test_settings_switches, ()),
+                         (test_review_fixes, ())):
             gc.collect()
             print(f"-- {fn.__name__}", flush=True)
             try:

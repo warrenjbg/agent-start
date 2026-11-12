@@ -93,3 +93,13 @@ begin
     CloseHandle(H);
   end;
 end;
+
+{ Uninstall: remove "Start with Windows" (written by the app, not by Setup, so Setup does not know about it). }
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'Agent Start');
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run', 'Agent Start');
+  end;
+end;
