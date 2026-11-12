@@ -1,17 +1,17 @@
 # PyInstaller version resource for HermesController.exe
 # GENERATED from version.py by tools/sync_version.py - do not edit by hand.
 VSVersionInfo(
-  ffi=FixedFileInfo(filevers=(1, 2, 0, 0), prodvers=(1, 2, 0, 0), mask=0x3f, flags=0x0, OS=0x40004,
+  ffi=FixedFileInfo(filevers=(1, 3, 0, 0), prodvers=(1, 3, 0, 0), mask=0x3f, flags=0x0, OS=0x40004,
                     fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[
     StringFileInfo([StringTable("040904B0", [
       StringStruct("CompanyName", "warrenjbg"),
       StringStruct("FileDescription", "Hermes Controller - start/stop the local Strata endpoint"),
-      StringStruct("FileVersion", "1.2.0"),
+      StringStruct("FileVersion", "1.3.0"),
       StringStruct("InternalName", "HermesController"),
       StringStruct("OriginalFilename", "HermesController.exe"),
       StringStruct("ProductName", "Hermes Controller"),
-      StringStruct("ProductVersion", "1.2.0")])]),
+      StringStruct("ProductVersion", "1.3.0")])]),
     VarFileInfo([VarStruct("Translation", [1033, 1200])])
   ]
 )

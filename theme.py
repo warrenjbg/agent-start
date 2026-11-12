@@ -26,6 +26,7 @@ DANGER_HOVER = "#9C2F33"
 # --- the one accent: status-LED green; semantic tones toned into the palette ---------------------------------------
 ACCENT = "#3CC77E"      # active LED, Strata segment, progress fill
 AMBER = "#E0A33A"       # busy LED (starting / stopping / loading)
+BLUE = "#4DB6F5"        # model reading a prompt (LED + activity bar), as Strata's Monitor
 RED = "#E5484D"         # error LED + error text
 RED_TEXT = "#F2A7A9"    # error copy on dark (contrast-safe)
 APPS_SEG = "#55555B"    # "other apps" gauge segment

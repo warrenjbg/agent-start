@@ -78,6 +78,7 @@ class MetricsStore:
         # key -> (sort key (time, id), decode rate, prompt rate); kept sorted oldest -> newest
         self._reqs: "OrderedDict[str, tuple[tuple[float, str], float | None, float | None]]" = OrderedDict()
         self.live_state: str | None = None
+        self.live: dict = {}                         # what the model is doing now (see activity())
         self.live_decode: float | None = None
         self.live_prompt: float | None = None
         self.model: str | None = None
@@ -96,6 +97,7 @@ class MetricsStore:
 
     def clear_live(self) -> None:
         self.live_state = None
+        self.live = {}
         self.live_decode = None
         self.live_prompt = None
         self.hw_vram = None
@@ -162,6 +164,10 @@ class MetricsStore:
             return
         state = live.get("state")
         self.live_state = state if isinstance(state, str) else None
+        self.live = {"state": self.live_state, "queued": int(_num(live.get("queued")) or 0),
+                     "phase": live.get("phase") if isinstance(live.get("phase"), str) else None,
+                     **{k: _num(live.get(k)) for k in ("prompt_read", "prompt_total", "prompt_tokens", "generated",
+                                                       "max_tokens")}}
         if state == "generating":                            # parallel mode forces this with tok_s None: stays blank
             v = _num(live.get("tok_s"))
             if v is None or v <= 0:
@@ -190,6 +196,26 @@ class MetricsStore:
         self.live_prompt = v if v is not None and v > 0 else None
 
     # ------------------------------------------------------------------ views
+    def activity(self) -> dict | None:
+        """What the model is doing right now, from the latest /metrics `live` block (Strata's Monitor "Model state"),
+        or None when it is idle / unknown. Keys: kind ('reading' | 'generating' | 'queued'), queued (int),
+        frac (0..1 or None: prompt read progress), read, total, tokens, rate (tok/s or None), phase (str or None)."""
+        lv = self.live or {}
+        kind = lv.get("state")
+        queued = int(lv.get("queued") or 0)
+        if kind == "reading":
+            read, total = lv.get("prompt_read"), lv.get("prompt_total")
+            frac = min(1.0, max(0.0, read / total)) if read is not None and total else None
+            return {"kind": "reading", "queued": queued, "frac": frac, "read": read, "total": total,
+                    "tokens": lv.get("prompt_tokens"), "rate": self.live_prompt, "phase": None}
+        if kind == "generating":
+            return {"kind": "generating", "queued": queued, "frac": None, "read": None, "total": None,
+                    "tokens": lv.get("generated"), "rate": self.live_decode, "phase": lv.get("phase")}
+        if kind == "idle" and queued > 0:
+            return {"kind": "queued", "queued": queued, "frac": None, "read": None, "total": None, "tokens": None,
+                    "rate": None, "phase": None}
+        return None
+
     def __len__(self) -> int:
         return len(self._reqs)
 

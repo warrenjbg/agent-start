@@ -68,7 +68,11 @@ GAP_AFTER_DETAIL = 10                    # detail line -> button / progress bar
 CARD_TOP = 14                            # button -> memory card
 STATE_SAVE_DEBOUNCE_MS = 300
 REOPEN_STAGGER_S = 1.0                   # pause between two reopened apps
-DETAIL_POLL_S = 10.0                     # /metrics poll for the serving line's "last reply" when stats are closed
+LIVE_POLL_S = 1.0                        # /metrics poll while serving (model state on the status line), as Strata's
+                                         # own Monitor; stopped while the window is minimised
+ACT_BAR_X = 22                           # activity bar under the status line: starts at the state text...
+ACT_BAR_RIGHT = 36                       # ...and ends before the gear (logical px)
+ACT_STATUS = {"reading": ("Reading", T.BLUE), "generating": ("Generating", T.ACCENT), "queued": ("Queued", T.AMBER)}
 # Kept for tests/back-compat: the LED colour per state.
 PILL_COLORS = {k: v[1] for k, v in STATUS.items()}
 LOADING_COLOR = LOADING_STATUS[1]
@@ -322,6 +326,10 @@ class HermesControllerApp(ctk.CTk):
                                   fg_color="transparent", hover_color=T.RAISED, text_color=T.TEXT_2,
                                   text_color_disabled=T.HAIRLINE, command=self.open_settings)
         self.gear.grid(row=0, column=5)
+        # 2 px activity bar along the bottom of the status row (prompt read progress): no extra height
+        self.act_track = tkinter.Frame(top, bg=T.HAIRLINE, height=2, highlightthickness=0, bd=0)
+        self.act_fill = tkinter.Frame(self.act_track, bg=T.BLUE, highlightthickness=0, bd=0)
+        self._act_frac: float | None = None
         for w in (top, self.led, self.pill, self.summary, self.caret, self.elapsed):
             w.bind("<Button-1>", self._on_head_click)
             w.bind("<Enter>", lambda _e: self._head_hover(True))
@@ -426,6 +434,9 @@ class HermesControllerApp(ctk.CTk):
             self.progress.set(0)
             self.elapsed.configure(text="")
         self._track_span()
+        if st != ACTIVE:
+            self.metrics.live = {}                       # a stale "generating" must not survive OFF / a restart
+            self._set_act_bar(None)
         if st == ACTIVE:
             if self._ready_mono is None:
                 self._ready_mono = time.monotonic()      # adopted servers: uptime counts from when we saw it
@@ -441,17 +452,75 @@ class HermesControllerApp(ctk.CTk):
         self._layout()
 
     def _show_serving(self) -> None:
-        """ACTIVE: model on the status line; the detail line carries uptime + last reply speed (optional), or a
-        warning that must stay visible (Low-RAM mode, a launcher waiting for the next start, still loading)."""
+        """ACTIVE: the status line shows what the model is doing (Strata's Monitor "Model state": Reading with the
+        prompt progress bar, Generating with tokens + tok/s, Queued), else Serving + the model. The detail line
+        carries a warning that must stay visible (Low-RAM, pending launcher, still loading), else uptime + last reply
+        speed, or during a request the model + speed / phase."""
         model = self.model_id or self.cfg.get("model_name") or "model"
+        title, led = STATUS[ACTIVE]
         if self.loaded is False:
-            self._set_status(model, "Still loading the model", color=T.TEXT_2)
-        elif self._pending_launcher is not None:      # a launcher saved while running waits for the next start
-            self._set_status(model, f"{_short(self._pending_launcher.bat_name, 28)} applies next start")
+            title, led = LOADING_STATUS
         elif self._is_low_ram():
-            self._set_status("Low-RAM mode", self._low_ram_line(), color=T.AMBER)
-        else:
-            self._set_status(model, self._serving_line())
+            title, led = LOW_RAM_STATUS
+        act = self.metrics.activity() if self.loaded is not False else None
+        summary, detail, color, frac = model, self._serving_line(), T.TEXT_2, None
+        if act is not None:
+            title, led = ACT_STATUS[act["kind"]]
+            summary, detail, frac = self._activity_texts(act, model)
+            self.pill.configure(text=title)              # first: the summary's room depends on the state's width
+            q = f" · {act['queued']} queued"
+            if act["queued"] and summary.endswith(q) and not self._fits_summary(summary):
+                summary, detail = summary[: -len(q)], detail + q     # keep the numbers whole; queue goes below
+        if self.loaded is False:
+            detail = "Still loading the model"
+        elif self._pending_launcher is not None:      # a launcher saved while running waits for the next start
+            detail = f"{_short(self._pending_launcher.bat_name, 28)} applies next start"
+        elif self._is_low_ram():
+            detail, color = self._low_ram_line(), T.AMBER
+            if act is None:
+                summary = "Low-RAM mode"
+        self.pill.configure(text=title)
+        self.led.configure(fg_color=led)
+        self._set_act_bar(frac)
+        self._set_status(summary, detail, color=color)
+
+    @staticmethod
+    def _activity_texts(act: dict, model: str) -> tuple[str, str, float | None]:
+        """(status-line summary, detail line, bar fraction) for one metrics_store.activity() dict."""
+        q = f" · {act['queued']} queued" if act["queued"] else ""
+        rate = act.get("rate")
+        if act["kind"] == "reading":
+            read, total = act.get("read"), act.get("total")
+            if total and read is not None:
+                summary = f"{100 * act['frac']:.0f}% · {read:,.0f} / {total:,.0f}"
+            elif act.get("tokens"):
+                summary = f"{act['tokens']:,.0f} tokens"
+            else:
+                summary = "prompt"
+            return summary + q, model + (f" · reading {rate:,.0f} tok/s" if rate else ""), act.get("frac") or 0.0
+        if act["kind"] == "generating":
+            toks = act.get("tokens")
+            parts = ([f"{toks:,.0f} tokens"] if toks is not None else []) + ([f"{rate:.1f} tok/s"] if rate else [])
+            phase = act.get("phase")
+            return (" · ".join(parts) or "…") + q, model + (f" · {phase}" if phase else ""), None
+        return f"{act['queued']} waiting", model, None
+
+    def _set_act_bar(self, frac: float | None) -> None:
+        """The 2 px bar along the bottom of the status row (None hides it)."""
+        if frac is None:
+            if self._act_frac is not None:
+                self.act_track.place_forget()
+                self._act_frac = None
+            return
+        frac = min(1.0, max(0.0, float(frac)))
+        if self._act_frac is None:
+            sc = ctk.ScalingTracker.get_widget_scaling(self)
+            self.act_track.configure(height=max(1, round(2 * sc)))
+            self.act_track.place(x=round(ACT_BAR_X * sc), rely=1.0, anchor="sw", relwidth=1.0,
+                                 width=-round((ACT_BAR_X + ACT_BAR_RIGHT) * sc))
+        if self._act_frac != frac:
+            self.act_fill.place(x=0, y=0, relheight=1.0, relwidth=frac)
+        self._act_frac = frac
 
     def _serving_line(self) -> str:
         parts = []
@@ -475,7 +544,8 @@ class HermesControllerApp(ctk.CTk):
     def _summary_budget(self) -> int:
         """Logical px left for the summary on the status line. CTkFont.measure is unscaled, like the layout."""
         used = self.pill.cget("font").measure(self.pill.cget("text"))
-        fixed = WIDTH - 22 - 6 - 8 - 8 - 16 - 28                          # margins, LED, gaps, caret, gear
+        # row margins 10+12, LED 8 + pads 6/8, summary pad 8, caret 12 + pad 4, timer pads 6+4, gear 28, 2 spare
+        fixed = WIDTH - 22 - 22 - 8 - 16 - 10 - 28 - 2
         timer = (self.elapsed.cget("font").measure(self.elapsed.cget("text")) + 10) if self.elapsed.cget("text") else 0
         return int(fixed - used - timer)
 
@@ -896,10 +966,9 @@ class HermesControllerApp(ctk.CTk):
         last_epoch = None
         while not self._stop_evt.is_set():
             try:
-                # Stats open: every STATS_MS. Only the serving detail line open: every ~10 s, for "last reply".
-                slow_ok = (self.detail_open and self.state_name == ACTIVE
-                           and time.monotonic() - last_poll >= DETAIL_POLL_S)
-                if (self.expanded or slow_ok) and not self._iconic and self.state_name in (ACTIVE, STOPPING):
+                # Every LIVE_POLL_S while serving: the status line shows what the model is doing (reading /
+                # generating / queued) and the stats graphs use the same documents.
+                if not self._iconic and self.state_name in (ACTIVE, STOPPING):
                     epoch = self._metrics_epoch
                     root = config_store.server_root(str(self.cfg.get("endpoint_url") or ""))
                     # /metrics returns only the newest 12 requests: after a gap (section collapsed, window minimised,
@@ -914,7 +983,7 @@ class HermesControllerApp(ctk.CTk):
                     self.post(self._apply_metrics, epoch, data)
             except Exception:  # noqa: BLE001
                 log.debug("metrics poll failed", exc_info=True)
-            self._stop_evt.wait(STATS_MS / 1000.0)
+            self._stop_evt.wait(LIVE_POLL_S)
 
     def _apply_metrics(self, epoch: int, data: dict | None) -> None:
         if epoch != self._metrics_epoch or self.state_name not in (ACTIVE, STOPPING):
@@ -927,6 +996,8 @@ class HermesControllerApp(ctk.CTk):
             self.metrics.ingest(data, now=time.monotonic())
             if self.metrics.hw_vram is not None:          # fallback VRAM source when NVML is unavailable
                 self.vram.push_external(*self.metrics.hw_vram)
+        if self.state_name == ACTIVE:
+            self._show_serving()                          # model state on the status line
         self._refresh_stats()
 
     # ================================================================== progress / memory

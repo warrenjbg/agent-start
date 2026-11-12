@@ -504,7 +504,7 @@ def test_version_consistency() -> None:
     import version
     root = HERE.parent
     v = version.__version__
-    check(re.fullmatch(r"\d+\.\d+\.\d+", v) is not None and v == "1.2.0", f"version.py = {v}")
+    check(re.fullmatch(r"\d+\.\d+\.\d+", v) is not None and v == "1.3.0", f"version.py = {v}")
     quad = "(" + ", ".join(v.split(".") + ["0"]) + ")"
     info = (root / "installer" / "version_info.txt").read_text(encoding="utf-8")
     check(info.count(quad) == 2 and info.count(f'"{v}"') == 2, "installer/version_info.txt matches version.py")
@@ -518,8 +518,45 @@ def test_version_consistency() -> None:
     check(not stale, f"no hardcoded 1.0.0 left in README / build.bat / spec ({stale})")
 
 
+def test_activity() -> None:
+    """activity(): Strata's Monitor "Model state" from the live block (field names as in serve/server.py metrics())."""
+    m = MetricsStore()
+    check(m.activity() is None, "no poll yet -> no activity")
+    m.ingest(doc([], {"state": "idle", "queued": 0}), now=1.0)
+    check(m.activity() is None, "idle -> None")
+    m.ingest(doc([], {"state": "unloaded", "queued": 0}), now=2.0)
+    check(m.activity() is None, "unloaded -> None (the app shows its own load state)")
+    m.ingest(doc([], {"state": "reading", "queued": 1, "prompt_tokens": 87072, "prompt_read": 10752,
+                      "prompt_total": 87072, "prefill_tok_s_mean": None}), now=3.0)
+    a = m.activity()
+    check(a is not None and a["kind"] == "reading" and a["queued"] == 1 and abs(a["frac"] - 10752 / 87072) < 1e-9
+          and a["read"] == 10752 and a["total"] == 87072, f"reading with progress ({a})")
+    m.ingest(doc([], {"state": "reading", "queued": 0, "prompt_tokens": 500, "prompt_read": None,
+                      "prompt_total": None}), now=4.0)
+    a = m.activity()
+    check(a["kind"] == "reading" and a["frac"] is None and a["tokens"] == 500, f"reading without progress ({a})")
+    m.ingest(doc([], {"state": "reading", "prompt_read": 900, "prompt_total": 600}), now=5.0)
+    check(m.activity()["frac"] == 1.0, "progress clamped to 1")
+    m.ingest(doc([], {"state": "generating", "queued": 0, "generated": 412, "max_tokens": 32768, "phase": "thinking",
+                      "tok_s": 98.4, "tok_s_mean": 97.0}), now=6.0)
+    a = m.activity()
+    check(a["kind"] == "generating" and a["tokens"] == 412 and a["rate"] == 98.4 and a["phase"] == "thinking"
+          and a["frac"] is None, f"generating ({a})")
+    m.ingest(doc([], {"state": "idle", "queued": 2}), now=7.0)
+    a = m.activity()
+    check(a is not None and a["kind"] == "queued" and a["queued"] == 2, f"idle + queued -> queued ({a})")
+    m.ingest(doc([], {"state": "generating", "queued": "x", "generated": "bad", "phase": 5}), now=8.0)
+    a = m.activity()
+    check(a["kind"] == "generating" and a["queued"] == 0 and a["tokens"] is None and a["phase"] is None,
+          f"junk fields tolerated ({a})")
+    m.clear_live()
+    check(m.activity() is None and m.live == {}, "clear_live drops the activity")
+    m.ingest(doc([], None) | {"live": "nonsense"}, now=9.0)
+    check(m.activity() is None, "non-dict live -> None")
+
+
 def main() -> int:
-    for fn in (test_rates, test_accumulation, test_live, test_stale_prefill_mean, test_parallel_live,
+    for fn in (test_activity, test_rates, test_accumulation, test_live, test_stale_prefill_mean, test_parallel_live,
                test_catchup_and_model_change, test_fetch, test_vram_sampler, test_real_nvml_smoke,
                test_graph_helpers, test_bar_graph_render, test_version_consistency):
         print(f"-- {fn.__name__}")

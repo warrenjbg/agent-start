@@ -304,6 +304,7 @@ class FakeMetrics:
         self.calls: list[str] = []
         self.requests: list[dict] = []          # oldest first
         self.live = "idle"
+        self.queued = 0
         self.fail = False
 
     def add(self, n: int) -> None:
@@ -329,7 +330,9 @@ class FakeMetrics:
         busy = st in ("generating", "reading")
         # a real read advances between polls (the app ignores a stale prefill mean until it does)
         self._read = min(2400, getattr(self, "_read", 0) + 900) if st == "reading" else 0
-        live = {"state": st, "queued": 0, "tok_s": 101.3 if st == "generating" else None,
+        live = {"state": st, "queued": self.queued, "tok_s": 101.3 if st == "generating" else None,
+                "generated": 412 if st == "generating" else None, "max_tokens": 32768 if busy else None,
+                "phase": "thinking" if st == "generating" else None, "prompt_tokens": 2400 if busy else None,
                 "tok_s_mean": 99.8 if st == "generating" else None,
                 "prefill_tok_s_mean": 3650.0 if busy else None, "prompt_read": self._read if st == "reading" else None,
                 "prompt_total": 2400 if st == "reading" else None}
@@ -1034,6 +1037,70 @@ def test_strata_estimate(app, det, ep) -> None:
         app._set_state("IDLE")
 
 # ---------------------------------------------------------------- v1.1: stats section
+def test_model_state(app, det, ep) -> None:
+    """Strata's "Model state" on the status line: Reading (blue, prompt bar), Generating (green), Queued, back to Serving."""
+    fetch = app._fetch_metrics
+    old_poll = main.LIVE_POLL_S
+    main.LIVE_POLL_S = 0.2
+    try:
+        if app.expanded:
+            app.chevron.invoke()
+            pump(app, 0.3)
+        app.detail_open = False
+        fetch.fail, fetch.live, fetch.queued = False, "idle", 0
+        to_active(app, ep)
+        check(pump_until(app, lambda: pill(app)[0] == "Serving", 3), f"idle model: Serving ({pill(app)})")
+        h0 = app.winfo_height()
+        fetch.live = "reading"
+        ok = pump_until(app, lambda: pill(app)[0] == "Reading" and "/ 2,400" in app.summary.cget("text"), 4)
+        check(ok and pill(app)[1] == T.BLUE, f"reading: blue LED + progress text ({pill(app)}, {status(app)!r})")
+        check(pump_until(app, lambda: app._act_frac is not None and app.act_track.winfo_ismapped(), 2),
+              "reading: activity bar shown")
+        pump(app, 0.5)
+        check(app.winfo_height() == h0 and not detail_shown(app), "reading adds no height, detail stays closed")
+        wscale = ctk.ScalingTracker.get_widget_scaling(app)
+        tb = app.act_track.winfo_rooty() + app.act_track.winfo_height()
+        check(tb <= app.toggle.winfo_rooty() - 8 * wscale and app.act_track.winfo_rootx() >= app.pill.winfo_rootx() - 1
+              and app.act_track.winfo_rootx() + app.act_track.winfo_width() <= app.gear.winfo_rootx(),
+              "activity bar under the state text, clear of the gear and the button")
+        check(app.summary.winfo_rooty() + app.summary.winfo_height() <= app.act_track.winfo_rooty() + 1,
+              "bar does not cover the text")
+        fill_w = app.act_fill.winfo_width() / max(1, app.act_track.winfo_width())
+        check(abs(fill_w - app._act_frac) < 0.05, f"bar width = progress ({fill_w:.2f} vs {app._act_frac})")
+        shot(app, "model_reading")
+        app._on_head_click()
+        pump(app, 0.3)
+        check(detail_shown(app) and "swift-test-1" in app.preview.cget("text"), f"detail: model ({status(app)!r})")
+        app._on_head_click()
+        fetch.live, fetch.queued = "generating", 1
+        ok = pump_until(app, lambda: pill(app)[0] == "Generating", 4)
+        check(ok and pill(app)[1] == T.ACCENT and app.summary.cget("text") == "412 tokens · 101.3 tok/s"
+              and app.preview.cget("text").endswith("· 1 queued"),
+              f"generating: tokens + live speed; a queue that does not fit moves to the detail ({status(app)!r})")
+        check(app.summary.winfo_rootx() + app.summary.winfo_width() <= app.caret.winfo_rootx() + 1,
+              f"long summary is ellipsized before the caret ({app.summary.cget('text')!r})")
+        check(pump_until(app, lambda: app._act_frac is None, 2) and not app.act_track.winfo_ismapped(),
+              "generating: no bar")
+        check("thinking" in app.preview.cget("text"), f"detail carries the phase ({app.preview.cget('text')!r})")
+        shot(app, "model_generating")
+        fetch.live, fetch.queued = "idle", 2
+        check(pump_until(app, lambda: pill(app) == ("Queued", T.AMBER), 4) and app.summary.cget("text") == "2 waiting",
+              f"queued ({pill(app)}, {status(app)!r})")
+        fetch.queued = 0
+        check(pump_until(app, lambda: pill(app)[0] == "Serving" and app.summary.cget("text") == "swift-test-1", 4),
+              f"back to Serving ({pill(app)}, {status(app)!r})")
+        fetch.live = "reading"
+        check(pump_until(app, lambda: pill(app)[0] == "Reading", 4), "reading again")
+        ep.status_value = dict(IDLE_STATUS)
+        app.on_status(ep.status()); app.on_status(ep.status())
+        pump(app, 0.3)
+        check(app.state_name == "IDLE" and pill(app)[0] == "Idle" and not app.act_track.winfo_ismapped()
+              and app.metrics.activity() is None, "Strata gone: activity and bar cleared")
+        fetch.live = "idle"
+    finally:
+        main.LIVE_POLL_S = old_poll
+
+
 def test_reopen_flow(app, det, ep) -> None:
     """After Turn off: auto apps relaunch (faked launch), games stay as a one-click offer that relaunches them."""
     py = os.path.join(sys.base_prefix, "python.exe")
@@ -1151,6 +1218,9 @@ def test_stats_section(app, det, ep) -> None:
     scale = ctk.ScalingTracker.get_window_scaling(app)
     ep.status_value = dict(IDLE_STATUS)
     app._set_state("IDLE")
+    pump(app, main.LIVE_POLL_S + 0.3)        # earlier tests served: let a poll already in flight land
+    fetch.calls.clear()
+    fetch.all_calls = 0
     check(not app.expanded and not app.stats.winfo_ismapped(), "starts collapsed (no state.json)")
     check(app.chevron.cget("text") == T.CHEVRON_DOWN, "collapsed chevron points down")
     check(abs(app.winfo_height() - expected_h(app) * scale) <= 2,
@@ -1161,7 +1231,7 @@ def test_stats_section(app, det, ep) -> None:
           and app.chevron.winfo_height() <= app.mem_title.winfo_height() + 1,
           "chevron sits inside the memory card header without growing it")
     pump(app, 2.6)
-    check(fetch.calls == [], f"collapsed: /metrics is never polled ({len(fetch.calls)})")
+    check(fetch.calls == [], f"IDLE: /metrics is never polled ({len(fetch.calls)})")
 
     # ---- expand: IDLE, no NVML -> every graph shows its empty state
     app.chevron.invoke()
@@ -1251,7 +1321,7 @@ def test_stats_section(app, det, ep) -> None:
     pump(app, 0.3)
     n = len(fetch.calls)
     pump(app, 2.6)
-    check(len(fetch.calls) <= n + 1, f"collapsed: polling stops ({len(fetch.calls) - n} more calls)")
+    check(len(fetch.calls) >= n + 2, f"collapsed + serving: still polled for the model state ({len(fetch.calls) - n})")
     shot(app, "collapsed_active")
 
     # ---- Strata stops: bars of the finished session stay, live values clear, a new start resets them
@@ -1605,7 +1675,7 @@ def run() -> int:
                              (test_load_progress_view, (app, det, ep)), (test_strata_estimate, (app, det, ep)),
                              (test_stats_section, (app, det, ep)), (test_notes_and_stale_status, (app, det, ep)),
                              (test_low_ram, (app, det, ep)), (test_review_fixes, (app, det, ep)),
-                             (test_reopen_flow, (app, det, ep))):
+                             (test_model_state, (app, det, ep)), (test_reopen_flow, (app, det, ep))):
                 print(f"-- {fn.__name__}")
                 try:
                     fn(*args)

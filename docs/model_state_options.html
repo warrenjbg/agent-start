@@ -1,0 +1,73 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>
+:root{--bg:#141415;--surface:#1C1C1E;--raised:#26262A;--hair:#2C2C30;--text:#EDEDEB;--text2:#A1A1A6;--text3:#6B6B70;
+--green:#3CC77E;--amber:#E0A33A;--blue:#4DB6F5;--red:#E5484D}
+body{display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start;font-family:"Segoe UI Variable Text","Segoe UI",sans-serif}
+.col{display:flex;flex-direction:column;gap:6px}
+.cap{font-size:12px;color:var(--muted-foreground,#999);max-width:360px;line-height:1.4}
+.cap b{color:var(--foreground,#ddd)}
+.win{width:360px;background:var(--bg);border-radius:10px;padding:14px 16px 16px;box-sizing:border-box;color:var(--text);
+box-shadow:0 0 0 1px #2a2a2e}
+.head{display:flex;align-items:center;height:28px}
+.led{width:8px;height:8px;border-radius:4px;margin-right:8px}
+.state{font-weight:600;font-size:15px}
+.sum{font-size:12px;color:var(--text2);margin-left:8px;flex:1;white-space:nowrap}
+.gear{color:var(--text2);font-size:14px}
+.detail{font-size:12px;color:var(--text2);margin:4px 0 0 16px;display:flex;justify-content:space-between}
+.bar{height:4px;border-radius:2px;background:var(--surface);margin-top:10px;overflow:hidden}
+.bar i{display:block;height:100%;border-radius:2px}
+.btn{width:180px;height:56px;margin:10px auto 0;border-radius:12px;background:var(--raised);color:var(--text);display:flex;
+align-items:center;justify-content:center;font-weight:600;font-size:16px}
+.card{background:var(--surface);border-radius:12px;padding:10px 12px;margin-top:14px;font-size:12px;color:var(--text2)}
+.gauge{height:6px;border-radius:3px;background:#2C2C30;margin:8px 0;display:flex;overflow:hidden}
+.legend{font-family:Consolas,monospace;font-size:11px;display:flex;justify-content:space-between}
+.chips{display:flex;gap:4px;flex-wrap:wrap;margin:8px 0}
+.chip{font-size:11px;padding:2px 8px;border-radius:10px;background:transparent;color:var(--text3);display:flex;align-items:center;gap:5px}
+.chip::before{content:"";width:5px;height:5px;border-radius:3px;background:currentColor}
+.chip.on.r{background:#16384d;color:var(--blue)}
+.chip.on.g{background:#173527;color:var(--green)}
+.chip.on.q{background:#3a2e14;color:var(--amber)}
+.row{display:flex;justify-content:space-between;color:var(--text)}
+.row span:last-child{color:var(--text2)}
+</style></head><body>
+
+<div class="col">
+<div class="win">
+  <div class="head"><div class="led" style="background:var(--blue)"></div><span class="state">Reading</span>
+    <span class="sum">swift-1.5-iq3_s</span><span class="gear">⚙</span></div>
+  <div class="detail"><span>10,752 / 87,072 tokens · 12%</span><span>2,940 tok/s</span></div>
+  <div class="bar"><i style="width:12%;background:var(--blue)"></i></div>
+  <div class="btn">Turn off</div>
+  <div class="card">Memory · 64 GB<div class="gauge"><i style="width:18%;background:#55555B"></i><i style="width:62%;background:var(--green)"></i></div>
+  <div class="legend"><span>Apps 12.0 GB</span><span>Strata ~46.8 GB</span><span>Free 5.2 GB</span></div></div>
+</div>
+<div class="win">
+  <div class="head"><div class="led" style="background:var(--green)"></div><span class="state">Generating</span>
+    <span class="sum">swift-1.5-iq3_s · 1 queued</span><span class="gear">⚙</span></div>
+  <div class="detail"><span>412 tokens · thinking</span><span>98.4 tok/s</span></div>
+  <div class="bar"><i style="width:10%;background:var(--green)"></i></div>
+  <div class="btn">Turn off</div>
+</div>
+<div class="cap"><b>A · In the status line (recommended).</b> While Strata works the state replaces "Serving": a blue LED for
+<i>Reading</i> (prompt progress bar), green for <i>Generating</i> (tokens + live tok/s), "N queued" next to the model. When it
+finishes it goes back to "Serving" and "Up 12 min · last reply 98 tok/s". No extra height: it uses the existing progress row.</div>
+</div>
+
+<div class="col">
+<div class="win">
+  <div class="head"><div class="led" style="background:var(--green)"></div><span class="state">Serving</span>
+    <span class="sum">swift-1.5-iq3_s</span><span class="gear">⚙</span></div>
+  <div class="btn" style="margin-top:12px">Turn off</div>
+  <div class="card" style="color:var(--text)"><div class="row"><span style="color:var(--text2)">Model state</span></div>
+    <div class="chips"><span class="chip">Idle</span><span class="chip">Unloaded</span><span class="chip on r">Reading</span>
+      <span class="chip">Generating</span><span class="chip">Queued</span></div>
+    <div class="row"><span>Reading prompt</span><span>10,752 / 87,072 · 12%</span></div>
+    <div class="bar" style="margin-top:6px;background:#2C2C30"><i style="width:12%;background:var(--blue)"></i></div></div>
+  <div class="card">Memory · 64 GB<div class="gauge"><i style="width:18%;background:#55555B"></i><i style="width:62%;background:var(--green)"></i></div>
+  <div class="legend"><span>Apps 12.0 GB</span><span>Strata ~46.8 GB</span><span>Free 5.2 GB</span></div></div>
+</div>
+<div class="cap"><b>B · A "Model state" card, like Strata's dashboard.</b> State chips, the label and a progress bar in their own
+card above Memory, shown only while Strata runs. Closest to your screenshot, but the window grows by about 80 px while
+serving.</div>
+</div>
+</body></html>
