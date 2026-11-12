@@ -142,8 +142,20 @@ def t_strata_launch() -> None:
     check("No Strata launcher chosen yet" in err({}), "no launch_cmd: tells the user to pick a run-*.bat")
     check("must start with python.exe" in err({"launch_cmd": [str(tmp / "run-x.bat")], "strata_dir": str(tmp)}),
           "a .bat as the command is refused (never run through cmd.exe)")
-    check("launcher not found" in err({"launch_cmd": [str(tmp / "gone.exe")], "strata_dir": str(tmp)}), "missing exe")
+    check("launcher not found" in err({"launch_cmd": [str(tmp / "gone" / "python.exe")], "strata_dir": str(tmp)}), "missing exe")
     check("strata_dir not found" in err({"launch_cmd": [str(exe)], "strata_dir": str(tmp / "nope")}), "missing strata_dir")
+    other = tmp / "llama-server.exe"             # another engine's command left in a shared config.json
+    other.write_bytes(b"")
+    msg = err({"launch_cmd": [str(other), "-m", "x.gguf"], "strata_dir": str(tmp)})
+    check("must start with python.exe" in msg and "llama-server.exe" in msg,
+          f"a program that is not a python interpreter is never started as Strata ({msg!r})")
+    check(not e.is_configured({"launch_cmd": [str(other), "-m", "x.gguf"]}) and not e.is_configured({})
+          and e.is_configured({"launch_cmd": [str(exe), "serve\\server.py"]}),
+          "configured = a python launch command (another engine's command does not count)")
+    for name in ("pythonw.exe", "py.exe", "python3.14.exe"):
+        p2 = tmp / name
+        p2.write_bytes(b"")
+        check(not err({"launch_cmd": [str(p2), "serve\\server.py"], "strata_dir": str(tmp)}), f"{name} is accepted")
     plan = e.plan_launch({"launch_cmd": [str(exe), "serve\\server.py"], "strata_dir": str(tmp)})
     check(isinstance(plan, LaunchPlan) and plan.cmd == [str(exe), "serve\\server.py"] and plan.cwd == str(tmp),
           "valid settings: the command as configured, cwd = strata_dir")

@@ -47,6 +47,14 @@ _RUN_BAT_ABS_RE = re.compile(r'"([A-Za-z]:[\\/][^"]*?run-[^"\\/]*\.bat)"|([A-Za-
 _RUN_BAT_REL_RE = re.compile(r"(?:^|[\s\"])(run-[^\s\"\\/<>|*?]*\.bat)", re.IGNORECASE)
 
 
+def _is_python_exe(path: str) -> bool:
+    """The file name of a python interpreter (python.exe, pythonw.exe, python3.14.exe, py.exe, pyw.exe)."""
+    n = os.path.basename(str(path or "").strip()).casefold()
+    if n.endswith(".exe"):
+        n = n[:-4]
+    return n in _PY_NAMES or n.startswith("python")
+
+
 def is_strata_cmd(name: str | None, cmd: list[str] | None) -> bool:
     """STRICT identity for the kill path: a python interpreter whose argv (after argv[0]) has a token that ENDS
     with serve\\server.py. A substring match on the joined cmdline would also match e.g.
@@ -194,6 +202,11 @@ class StrataEngine(Engine):
         return None
 
     # ------------------------------------------------------------------ launch
+    def is_configured(self, cfg: Mapping[str, Any]) -> bool:
+        """A python launch command is set (another engine's command left in config.json does not count)."""
+        cmd = [str(x) for x in (cfg.get("launch_cmd") or [])]
+        return bool(cmd) and _is_python_exe(cmd[0])
+
     def plan_launch(self, cfg: Mapping[str, Any]) -> LaunchPlan:
         cmd = [str(x) for x in (cfg.get("launch_cmd") or [])]
         if not cmd:
@@ -202,6 +215,11 @@ class StrataEngine(Engine):
             # never hand a .bat/.cmd/script to CreateProcess: that runs it through cmd.exe (hand-edited config.json)
             raise LaunchError(f"Launch command must start with python.exe (the Strata venv interpreter), "
                               f"not {os.path.basename(cmd[0]) or cmd[0]!r} - re-select the run-*.bat in Settings")
+        if not _is_python_exe(cmd[0]):
+            # config.json's launch keys are shared between engines: after another engine was set up, its command
+            # is still there. Strata is only ever started through a python interpreter.
+            raise LaunchError(f"Launch command must start with python.exe (the Strata venv interpreter), "
+                              f"not {os.path.basename(cmd[0])} - re-select the run-*.bat in Settings")
         if not os.path.isfile(cmd[0]):
             raise LaunchError(f"launcher not found: {cmd[0]}")
         sdir = str(cfg.get("strata_dir") or "")

@@ -51,7 +51,7 @@ ignore = [
 [tool.mypy]
 # App modules and tools/. tests/ is not type-checked: the suites are scripts built on monkeypatching, fakes and
 # SimpleNamespace stand-ins (184 errors in 18 files with this config, nearly all from that); ruff still lints them.
-files = ["*.py", "tools/*.py"]
+files = ["*.py", "tools/*.py", "engines/*.py"]
 python_version = "3.11"
 explicit_package_bases = true
 warn_unused_configs = true

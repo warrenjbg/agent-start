@@ -31,6 +31,7 @@ import config_store
 from config_store import LOG_DIR, load_config, server_root
 from engines import get_engine
 from engines.base import (
+    CAP_LAUNCHER_FILES,
     CAP_LOAD_NUDGE,
     CAP_UNLOAD,
     NO_ANSWER,
@@ -237,6 +238,19 @@ class EndpointManager:
                    adopted=(self._adopted if ours else True), loaded=loaded)
         return out
 
+    def engine_pids(self) -> set[int]:
+        """The pids a stop would end right now (the identified engine root and what _kill_targets keeps of its
+        tree) - read-only, for measuring the engine's own CPU. Other children of the server (a browser, tool
+        servers) are not in it. Never raises."""
+        try:
+            root, _foreign = self._locate_root(fallback=False)
+            if root is None:
+                return set()
+            return {root.pid} | {p.pid for p in self._kill_targets(root, log_skips=False)}
+        except Exception:  # noqa: BLE001 - contract: never raises
+            log.debug("engine_pids failed", exc_info=True)
+            return set()
+
     def protected_pids(self) -> set[int]:
         try:
             pids: set[int] = set()
@@ -322,6 +336,18 @@ class EndpointManager:
         except Exception:  # noqa: BLE001
             hmap = {}
         return HttpReply(code=code, json=body, headers=hmap)
+
+    def _cfg_model_name(self) -> str:
+        """config.json's model_name as a fallback name - only for engines with launcher files, which write it
+        (for another engine it would be the name of a model that engine does not serve)."""
+        if not self._engine.can(CAP_LAUNCHER_FILES):
+            return ""
+        return str(self._cfg.get("model_name") or "")
+
+    def engine_http(self, method: str, path: str, timeout: float) -> HttpReply:
+        """The engine's HTTP access for callers outside the supervisor (the metrics poller): loopback, the
+        configured port only, the engine's headers only once the port identified itself."""
+        return self._http_id(method, path, timeout)
 
     def _http_id(self, method: str, path: str, timeout: float) -> HttpReply:
         """A request to a port ALREADY identified as the engine: adds the engine's own headers (an API key).
@@ -744,7 +770,7 @@ class EndpointManager:
                 if loaded:
                     model = self._fetch_model_id(h)
                     with self._lock:
-                        self._model_id = model or str(self._cfg.get("model_name") or "") or None
+                        self._model_id = model or self._cfg_model_name() or None
                         self._adopted = False
                     self._prime_probe(self._model_id)
                     return "ready", ""
@@ -916,7 +942,7 @@ class EndpointManager:
             avail_after = _avail_mb()
             if avail_after is not None:
                 result["ram_freed_mb"] = round(max(result["ram_freed_mb"], avail_after - avail_before), 1)
-        model = self._model_id or self._probe_model or str(self._cfg.get("model_name") or "") or "model"
+        model = self._model_id or self._probe_model or self._cfg_model_name() or "model"
         with self._lock:
             self._spawn_proc = None
             self._popen = None

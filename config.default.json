@@ -20,6 +20,10 @@
   "mem_watch_evict_sustain_s": 6,
   "mem_watch_evict_app_mb": 512,
   "resume_confirm_s": 10,
+  "fit_watch_vram_pct": 90,
+  "fit_watch_cpu_pct": 25,
+  "fit_watch_sustain_s": 8,
+  "fit_watch_clear_s": 20,
   "resume_expire_s": 21600,
   "game_dirs": [
     "steamapps",

@@ -1587,8 +1587,9 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
         scale = ctk.ScalingTracker.get_window_scaling(dlg)
         check(abs(w - 340 * scale) <= 2 and abs(h - dlg.logical_height * scale) <= 2, f"SettingsDialog size {w}x{h}")
         check(dlg.logical_height == SettingsDialog.HEIGHT + SettingsDialog.SWITCH_STEP * (len(dlg.switches) - 1)
-              + (SettingsDialog.UPDATE_ROW_H if dlg._check_btn is not None else 0),
-              f"SettingsDialog height = base + one step per switch + the update row ({dlg.logical_height})")
+              + (SettingsDialog.UPDATE_ROW_H if dlg._check_btn is not None else 0)
+              + (SettingsDialog.ENGINE_ROW_H if dlg.has_engine_row else 0),
+              f"SettingsDialog height = base + one step per switch + the update and engine rows ({dlg.logical_height})")
         check(dlg.grab_status() == "local", f"SettingsDialog grab {dlg.grab_status()}")
         check(dlg._link_host.cget("text") == "not running" and dlg._link_text.cget("text_color") == T.TEXT_3,
               f"dashboard link greyed out while Strata is off ({dlg._link_host.cget('text')!r})")

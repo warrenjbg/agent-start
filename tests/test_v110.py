@@ -87,14 +87,14 @@ class FakeResume:
 
 
 def _fake_resume(app) -> FakeResume:
-    real = getattr(app, "resume", None)
+    real = getattr(app.watch, "resume", None)
     if real is not None and not isinstance(real, FakeResume):
         try:
             real.stop()
         except Exception:  # noqa: BLE001
             traceback.print_exc()
-    app.resume = FakeResume()
-    return app.resume
+    app.watch.resume = FakeResume()
+    return app.watch.resume
 
 
 GAME_EXE = r"D:\SteamLibrary\steamapps\common\ELDEN RING\eldenring.exe"
@@ -157,7 +157,7 @@ def test_resume() -> None:
     try:
         fake = _fake_resume(app)
         app._extras = True
-        check(app._resume_action == "ask", "default: Ask me")
+        check(app.watch.resume_action == "ask", "default: Ask me")
         d = H.open_settings(app)
         check(d is not None, "Settings opens")
         if d is not None:
@@ -168,29 +168,29 @@ def test_resume() -> None:
             check(row["value"] == "Ask me" and row["choices"] == [labels[a] for a in main.RESUME_ACTIONS]
                   and row["enabled"], f"Settings row 'When that app closes' ({row})")
             check(H.choose_settings_option(d, "When that app closes", "Turn Strata back on"), "pick Turn Strata back on")
-            check(app._resume_action == "on", f"choice applied ({app._resume_action})")
+            check(app.watch.resume_action == "on", f"choice applied ({app.watch.resume_action})")
             H.close_settings(d)
             pump(app, 0.3)
         check(pump_until(app, lambda: config_store.load_state().get("resume_action") == "on", 3),
               "saved as state.json resume_action")
-        check(app.set_resume_action("Ask me") is True and app._resume_action == "ask", "a label is accepted")
-        check(app.set_resume_action("on") is True and app._resume_action == "on", "an id is accepted")
+        check(app.watch.set_resume_action("Ask me") is True and app.watch.resume_action == "ask", "a label is accepted")
+        check(app.watch.set_resume_action("on") is True and app.watch.resume_action == "on", "an id is accepted")
         # "none" ends a running watch and drops a pending alert
         fake.watch(_target())
-        app._resume_alert = (time.monotonic(), "Blender")
+        app.watch.resume_alert = (time.monotonic(), "Blender")
         n = fake.cancels
-        check(app.set_resume_action("none") is True and app._resume_action == "none", "Do nothing set")
-        check(fake.cancels > n and not fake.watching and app._resume_alert is None,
-              f"Do nothing cancels the watch and the alert ({fake.cancels}, {app._resume_alert})")
+        check(app.watch.set_resume_action("none") is True and app.watch.resume_action == "none", "Do nothing set")
+        check(fake.cancels > n and not fake.watching and app.watch.resume_alert is None,
+              f"Do nothing cancels the watch and the alert ({fake.cancels}, {app.watch.resume_alert})")
         check(pump_until(app, lambda: config_store.load_state().get("resume_action") == "none", 3), "none saved")
-        app.set_resume_action("on")
+        app.watch.set_resume_action("on")
         pump_until(app, lambda: config_store.load_state().get("resume_action") == "on", 3)
     finally:
         close(app)
     app = None
     try:
         app, det, ep = U.new_app()
-        check(app._resume_action == "on", f"the choice survives a restart ({app._resume_action})")
+        check(app.watch.resume_action == "on", f"the choice survives a restart ({app.watch.resume_action})")
     finally:
         if app is not None:
             close(app)
@@ -199,7 +199,7 @@ def test_resume() -> None:
         config_store.save_state({"resume_action": junk})
         try:
             a2, _d2, _e2 = U.new_app()
-            check(a2._resume_action == "ask", f"state.json resume_action {junk!r} -> Ask me ({a2._resume_action})")
+            check(a2.watch.resume_action == "ask", f"state.json resume_action {junk!r} -> Ask me ({a2.watch.resume_action})")
         finally:
             if a2 is not None:
                 close(a2)
@@ -209,12 +209,12 @@ def test_resume() -> None:
     app, det, ep = U.new_app()
     try:
         fake = _fake_resume(app)
-        check(app._resume_action == "ask" and app._game_action == "off", "defaults: ask / game stop")
+        check(app.watch.resume_action == "ask" and app.watch.game_action == "off", "defaults: ask / game stop")
         U.to_active(app, ep)
         pump(app, 0.4)
         # a. game (Turn Strata off) with its GameStart -> watched once it is off
-        app._on_game_started("ELDEN RING", 9000.0, _game("ELDEN RING"))
-        check("ELDEN RING" in getattr(app, "_resume_targets", {}), "game with src: target remembered")
+        app.watch.on_game_started("ELDEN RING", 9000.0, _game("ELDEN RING"))
+        check("ELDEN RING" in app.watch.resume_targets, "game with src: target remembered")
         ok = _stop_runs(app, ep, lambda: None)
         check(ok, "game: safe stop ran")
         check(len(fake.watched) == 1 and fake.watched[0].title == "ELDEN RING" and fake.watched[0].kind == "game",
@@ -222,11 +222,11 @@ def test_resume() -> None:
         pump(app, 0.5)
         check(len(fake.watched) == 1, "watch called once only")
         # adopting a running server cancels the watch and drops an alert
-        app._resume_alert = (time.monotonic(), "ELDEN RING")
+        app.watch.resume_alert = (time.monotonic(), "ELDEN RING")
         n = fake.cancels
         U.to_active(app, ep)
         pump(app, 0.3)
-        check(fake.cancels > n and app._resume_alert is None, "engine adopted (-> ACTIVE): watch cancelled, alert gone")
+        check(fake.cancels > n and app.watch.resume_alert is None, "engine adopted (-> ACTIVE): watch cancelled, alert gone")
         # b. the user's own Turn off: nothing watched
         w = len(fake.watched)
         ok = _stop_runs(app, ep, lambda: H.click_main_button(app))
@@ -234,38 +234,38 @@ def test_resume() -> None:
         # c. a stop for a title with no remembered target (old caller without src)
         U.to_active(app, ep)
         pump(app, 0.3)
-        app._on_game_started("Hades", 1.0)
-        check("Hades" not in app._resume_targets, "no src: nothing remembered")
+        app.watch.on_game_started("Hades", 1.0)
+        check("Hades" not in app.watch.resume_targets, "no src: nothing remembered")
         ok = _stop_runs(app, ep, lambda: None)
         check(ok and len(fake.watched) == w, "stop for a game without a target: no watch")
         # d. memory app (Turn Strata off) with its MemReport
-        app.set_memory_action("Turn Strata off")
+        app.watch.set_memory_action("Turn Strata off")
         U.to_active(app, ep)
         pump(app, 0.3)
-        ok = _stop_runs(app, ep, lambda: app._on_memory_app("Blender", 6349.0, "why", _mem_report()))
+        ok = _stop_runs(app, ep, lambda: app.watch.on_memory_app("Blender", 6349.0, "why", _mem_report()))
         check(ok and len(fake.watched) == w + 1 and fake.watched[-1].title == "Blender"
               and fake.watched[-1].kind == "app", f"memory stop -> watch the app ({fake.watched[w:]})")
-        app.set_memory_action("Ask me")
+        app.watch.set_memory_action("Ask me")
         # e. game "Ask me": the toast button stops it, then it is watched
-        app.set_game_action("Ask me")
+        app.watch.set_game_action("Ask me")
         U.to_active(app, ep)
         pump(app, 0.3)
         TOASTS.clear()
-        app._on_game_started("Celeste", 1.0, _game("Celeste", 70002))
+        app.watch.on_game_started("Celeste", 1.0, _game("Celeste", 70002))
         pump_until(app, lambda: TOASTS, 3)
         w = len(fake.watched)
         ok = _stop_runs(app, ep, app.game_off_requested)
         check(ok and len(fake.watched) == w + 1 and fake.watched[-1].title == "Celeste",
               f"ask + toast button: watched after the stop ({fake.watched[w:]})")
-        app.set_game_action("Turn Strata off")
+        app.watch.set_game_action("Turn Strata off")
         # f. "Do nothing": never watched
-        app.set_resume_action("Do nothing")
+        app.watch.set_resume_action("Do nothing")
         U.to_active(app, ep)
         pump(app, 0.3)
         w = len(fake.watched)
-        ok = _stop_runs(app, ep, lambda: app._on_game_started("Doom", 1.0, _game("Doom", 70003)))
+        ok = _stop_runs(app, ep, lambda: app.watch.on_game_started("Doom", 1.0, _game("Doom", 70003)))
         check(ok and len(fake.watched) == w, "Do nothing: no watch")
-        app.set_resume_action("Ask me")
+        app.watch.set_resume_action("Ask me")
         # g. a model switch finishing a game stop: no watch (simulated: the stop is marked as a switch)
         det.cands = []
         U.to_active(app, ep)
@@ -275,7 +275,7 @@ def test_resume() -> None:
         def as_switch() -> None:
             app._switching = True
 
-        ok = _stop_runs(app, ep, lambda: app._on_game_started("Doom", 1.0, _game("Doom", 70004)), before_fire=as_switch)
+        ok = _stop_runs(app, ep, lambda: app.watch.on_game_started("Doom", 1.0, _game("Doom", 70004)), before_fire=as_switch)
         check(ok and len(fake.watched) == w, "model switch: no watch")
         check(pump_until(app, lambda: len(ep.start_calls) > starts, 3), "(the switch starts the engine again)")
         if len(ep.start_calls) > starts:
@@ -288,7 +288,7 @@ def test_resume() -> None:
         w = len(fake.watched)
         bad = U.stop_result(ok=False, port_released=False, killed_pids=[], ram_freed_mb=0.0, unload="error",
                             error="Stop failed (test)")
-        ok = _stop_runs(app, ep, lambda: app._on_game_started("Doom", 1.0, _game("Doom", 70005)), result=bad)
+        ok = _stop_runs(app, ep, lambda: app.watch.on_game_started("Doom", 1.0, _game("Doom", 70005)), result=bad)
         check(ok and len(fake.watched) == w and app.state_name != "IDLE",
               f"failed stop: no watch ({app.state_name}, {fake.watched[w:]})")
     finally:
@@ -304,7 +304,7 @@ def test_resume() -> None:
         def exiting() -> None:
             app._exit_pending = True             # the app exits once this stop is done (e.g. an update installs)
 
-        ok = _stop_runs(app, ep, lambda: app._on_game_started("Doom", 1.0, _game("Doom", 70006)), before_fire=exiting)
+        ok = _stop_runs(app, ep, lambda: app.watch.on_game_started("Doom", 1.0, _game("Doom", 70006)), before_fire=exiting)
         check(ok and pump_until(app, lambda: app._destroyed, 3), "exit after the stop")
         check(not fake.watched, f"app exit: no watch ({fake.watched})")
         check(fake.stopped >= 1, "app exit: the watcher is stopped")
@@ -315,16 +315,16 @@ def test_resume() -> None:
     app, det, ep = U.new_app()
     try:
         _fake_resume(app)
-        app.set_game_action("Ask me")
+        app.watch.set_game_action("Ask me")
         U.to_active(app, ep)
         pump(app, 0.3)
         titles = [f"Game {i}" for i in range(10)]
         for i, t in enumerate(titles):
-            app._on_game_started(t, 1.0, _game(t, 70200 + i))
+            app.watch.on_game_started(t, 1.0, _game(t, 70200 + i))
         pump(app, 0.3)
-        keys = list(getattr(app, "_resume_targets", {}))
+        keys = list(app.watch.resume_targets)
         check(len(keys) == 8 and set(keys) == set(titles[2:]), f"at most 8 targets, oldest dropped ({keys})")
-        app.set_game_action("Turn Strata off")
+        app.watch.set_game_action("Turn Strata off")
     finally:
         close(app)
 
@@ -333,20 +333,20 @@ def test_resume() -> None:
     try:
         fake = _fake_resume(app)
         TOASTS.clear()
-        app._on_resume_closed(_target("Blender"), 90.0)
+        app.watch.on_resume_closed(_target("Blender"), 90.0)
         check(pump_until(app, lambda: TOASTS, 3), "ask: a toast")
         if TOASTS:
             title, body, buttons = TOASTS[-1]
             check(title == "Blender closed" and f"Turn {name} back on?" in body, f"ask: toast text ({TOASTS[-1]})")
             check(buttons == [] and body.endswith("Open Agent Start to turn it on."),
                   "from source: no button, says to open Agent Start")
-        al = app._resume_alert
+        al = app.watch.resume_alert
         check(al is not None and al[1] == "Blender" and abs(time.monotonic() - al[0]) < 5, f"alert remembered ({al})")
         check(app.state_name == "IDLE" and not ep.start_calls, "ask: nothing starts by itself")
         # long names are shortened like the other toasts
         long_title = "The Elder Scrolls V Skyrim Special Edition Anniversary Launcher"
         TOASTS.clear()
-        app._on_resume_closed(_target(long_title), 5.0)
+        app.watch.on_resume_closed(_target(long_title), 5.0)
         pump_until(app, lambda: TOASTS, 3)
         check(TOASTS and TOASTS[-1][0] == f"{main._short(long_title, 40)} closed",
               f"long title shortened ({TOASTS[-1:]})")
@@ -355,21 +355,21 @@ def test_resume() -> None:
         config_store.FROZEN, main._protocol_registered = True, lambda: True
         try:
             TOASTS.clear()
-            app._on_resume_closed(_target("Blender"), 5.0)
+            app.watch.on_resume_closed(_target("Blender"), 5.0)
             pump_until(app, lambda: TOASTS, 3)
             check(TOASTS and TOASTS[-1][2] == [(f"Turn on {name}", "agentstart://resume-on")],
                   f"installed: the Turn on button ({TOASTS[-1:]})")
         finally:
             config_store.FROZEN, main._protocol_registered = real_frozen, real_reg
         # the button: stale / no alert -> only shows the window
-        app._resume_alert = (time.monotonic() - main.RESUME_ALERT_VALID_S - 1, "Blender")
+        app.watch.resume_alert = (time.monotonic() - main.RESUME_ALERT_VALID_S - 1, "Blender")
         app.withdraw()
         pump(app, 0.2)
         app.resume_on_requested()
         pump(app, 0.4)
         check(app.state() == "normal" and app.state_name == "IDLE" and not ep.start_calls
               and not isinstance(app.dialog, SweepDialog), "stale alert: the window opens, nothing starts")
-        app._resume_alert = None
+        app.watch.resume_alert = None
         app.withdraw()
         pump(app, 0.2)
         app.resume_on_requested()
@@ -377,34 +377,34 @@ def test_resume() -> None:
         check(app.state() == "normal" and app.state_name == "IDLE" and not ep.start_calls,
               "no alert: the window opens, nothing starts")
         # fresh alert: the normal Turn on, with the close-apps dialog
-        app._on_resume_closed(_target("Blender"), 5.0)
+        app.watch.on_resume_closed(_target("Blender"), 5.0)
         pump(app, 0.2)
-        check(app._resume_alert is not None, "fresh alert")
+        check(app.watch.resume_alert is not None, "fresh alert")
         app.withdraw()
         pump(app, 0.2)
         app.resume_on_requested()
         check(pump_until(app, lambda: isinstance(app.dialog, SweepDialog), 3),
               f"fresh alert: the normal Turn on (close-apps dialog) ({app.state_name}, {app.dialog})")
-        check(app.state_name == "STARTING" and app._resume_alert is None, "starting; the alert is used up")
+        check(app.state_name == "STARTING" and app.watch.resume_alert is None, "starting; the alert is used up")
         check(_no_real_sweep(det) and not ep.start_calls, "nothing closed / started before the user decides")
         if isinstance(app.dialog, SweepDialog):
             app.dialog._decide("cancel")
         check(pump_until(app, lambda: app.state_name == "IDLE", 3), "dialog cancelled -> idle")
         # "Do nothing": a report is ignored
-        app.set_resume_action("Do nothing")
+        app.watch.set_resume_action("Do nothing")
         TOASTS.clear()
-        app._on_resume_closed(_target("Blender"), 5.0)
+        app.watch.on_resume_closed(_target("Blender"), 5.0)
         pump(app, 0.4)
-        check(not TOASTS and app._resume_alert is None, "Do nothing: no toast")
-        app.set_resume_action("Ask me")
+        check(not TOASTS and app.watch.resume_alert is None, "Do nothing: no toast")
+        app.watch.set_resume_action("Ask me")
         # not IDLE: a report and the button do nothing
         U.to_active(app, ep)
         pump(app, 0.3)
         TOASTS.clear()
-        app._on_resume_closed(_target("Blender"), 5.0)
+        app.watch.on_resume_closed(_target("Blender"), 5.0)
         pump(app, 0.4)
-        check(not TOASTS and app._resume_alert is None, "serving: a 'closed' report is ignored")
-        app._resume_alert = (time.monotonic(), "Blender")
+        check(not TOASTS and app.watch.resume_alert is None, "serving: a 'closed' report is ignored")
+        app.watch.resume_alert = (time.monotonic(), "Blender")
         n = len(ep.start_calls)
         app.withdraw()
         pump(app, 0.2)
@@ -419,17 +419,17 @@ def test_resume() -> None:
     app, det, ep = U.new_app()
     try:
         fake = _fake_resume(app)
-        app.set_resume_action("Turn Strata back on")
+        app.watch.set_resume_action("Turn Strata back on")
         TOASTS.clear()
         n_cancel = fake.cancels
         seen_dialog: list[bool] = []
-        app._on_resume_closed(_target("Blender"), 30.0)
+        app.watch.on_resume_closed(_target("Blender"), 30.0)
         ok = pump_until(app, lambda: seen_dialog.append(isinstance(app.dialog, SweepDialog)) or bool(ep.start_calls), 3)
         pump(app, 0.3)
         seen_dialog.append(isinstance(app.dialog, SweepDialog))
         check(ok and app.state_name == "STARTING", f"on: the engine starts ({app.state_name}, {len(ep.start_calls)})")
         check(not any(seen_dialog) and _no_real_sweep(det), "on: no close-apps dialog, nothing closed")
-        check(fake.cancels > n_cancel and app._resume_alert is None, "starting cancels the watch")
+        check(fake.cancels > n_cancel and app.watch.resume_alert is None, "starting cancels the watch")
         check(pump_until(app, lambda: TOASTS, 3) and TOASTS[-1][0] == f"{name} is starting"
               and "Blender" in TOASTS[-1][1], f"on: a toast names the app ({TOASTS[-1:]})")
         # back to idle (cancel the start)
@@ -445,10 +445,10 @@ def test_resume() -> None:
         check(d is not None, "Settings open")
         TOASTS.clear()
         n = len(ep.start_calls)
-        app._on_resume_closed(_target("Blender"), 30.0)
+        app.watch.on_resume_closed(_target("Blender"), 30.0)
         check(pump_until(app, lambda: TOASTS, 3) and TOASTS[-1][0] == "Blender closed",
               f"blocked: asks instead ({TOASTS[-1:]})")
-        check(len(ep.start_calls) == n and app.state_name == "IDLE" and app._resume_alert is not None,
+        check(len(ep.start_calls) == n and app.state_name == "IDLE" and app.watch.resume_alert is not None,
               "blocked: nothing starts, the alert is kept for the button")
         if d is not None:
             H.close_settings(d)
@@ -465,7 +465,7 @@ def test_resume() -> None:
     # being destroyed: a late report does nothing
     TOASTS.clear()
     try:
-        app._on_resume_closed(_target("Blender"), 1.0)
+        app.watch.on_resume_closed(_target("Blender"), 1.0)
         time.sleep(0.3)
         check(not TOASTS, "after exit: a late report shows nothing")
     except Exception:  # noqa: BLE001
@@ -599,17 +599,17 @@ def test_resume_after_cancelled_load() -> None:
     app, det, ep = U.new_app()
     try:
         fake = _fake_resume(app)
-        app._game_pref, app._game_action = True, "off"
+        app.watch.game_pref, app.watch.game_action = True, "off"
         cancelled: list[int] = []
         app.cancel_start = lambda: cancelled.append(1)
         app.state_name, app._start_phase = "STARTING", "server"
-        app._on_game_started("Doom", 1.0, _game("Doom"))
-        check(cancelled == [1] and app._cancel_game == "Doom", "a game during the load cancels the start")
+        app.watch.on_game_started("Doom", 1.0, _game("Doom"))
+        check(cancelled == [1] and app.watch.cancel_game == "Doom", "a game during the load cancels the start")
         del app.cancel_start
         app.on_stopped(U.stop_result(cancelled_start=True))
         pump(app, 0.3)
         watched = list(fake.watched)
-        check(app.state_name == "IDLE" and app._cancel_game is None, "back to idle after the cancelled load")
+        check(app.state_name == "IDLE" and app.watch.cancel_game is None, "back to idle after the cancelled load")
         check(len(watched) == 1 and watched[0].title == "Doom" and watched[0].kind == "game",
               f"the game the load was cancelled for is watched ({watched})")
         # a cancelled start with no game behind it watches nothing
@@ -643,11 +643,11 @@ def test_v110_review() -> None:
         _fake_resume(app)
         name = app.engine.name
         det.cands = []
-        app.set_resume_action("on")
+        app.watch.set_resume_action("on")
         # 1. the first automatic turn-on for an app starts the engine ...
         TOASTS.clear()
         n = len(ep.start_calls)
-        app._on_resume_closed(_target("Fortnite"), 12.0)
+        app.watch.on_resume_closed(_target("Fortnite"), 12.0)
         check(pump_until(app, lambda: len(ep.start_calls) > n, 3) and app.state_name == "STARTING",
               "first close: the engine starts by itself")
         check(pump_until(app, lambda: any(t_[0] == f"{name} is starting" for t_ in TOASTS), 3), "with its toast")
@@ -657,15 +657,15 @@ def test_v110_review() -> None:
         app._set_state("IDLE")
         TOASTS.clear()
         n = len(ep.start_calls)
-        app._on_resume_closed(_target("Fortnite"), 12.0)
+        app.watch.on_resume_closed(_target("Fortnite"), 12.0)
         pump_until(app, lambda: TOASTS, 3)
         check(len(ep.start_calls) == n and app.state_name == "IDLE", "closes again soon after: nothing starts")
-        check(bool(TOASTS) and TOASTS[-1][0] == "Fortnite closed" and app._resume_alert is not None,
+        check(bool(TOASTS) and TOASTS[-1][0] == "Fortnite closed" and app.watch.resume_alert is not None,
               f"...it asks instead ({TOASTS[-1:]})")
         # another app is not affected by Fortnite's turn; after the gap Fortnite is automatic again
-        app._resume_auto_at["Fortnite"] = time.monotonic() - main.RESUME_AUTO_GAP_S - 1
+        app.watch.resume_auto_at["Fortnite"] = time.monotonic() - main.RESUME_AUTO_GAP_S - 1
         n = len(ep.start_calls)
-        app._on_resume_closed(_target("Fortnite"), 12.0)
+        app.watch.on_resume_closed(_target("Fortnite"), 12.0)
         check(pump_until(app, lambda: len(ep.start_calls) > n, 3), "after the gap it is automatic again")
         app._start_token += 1
         app._start_phase = None
@@ -674,27 +674,27 @@ def test_v110_review() -> None:
         app._reopen_offer = [{"name": "Editor"}]
         TOASTS.clear()
         n = len(ep.start_calls)
-        app._on_resume_closed(_target("Hades"), 12.0)
+        app.watch.on_resume_closed(_target("Hades"), 12.0)
         pump_until(app, lambda: TOASTS, 3)
         check(len(ep.start_calls) == n and app.state_name == "IDLE" and app._reopen_offer == [{"name": "Editor"}],
               "a Reopen offer is waiting: nothing starts, the offer stays")
         check(bool(TOASTS) and TOASTS[-1][0] == "Hades closed", "...it asks instead")
         app._reopen_offer = []
         # 3. a memory stop that had to wait for a dialog keeps its own setting
-        app._game_queued, app._mem_queued = None, None
+        app.watch.game_queued, app.watch.mem_queued = None, None
         app.state_name = "ACTIVE"
         real_blocked = app._game_blocked
         app._game_blocked = lambda: True
         try:
-            app._stop_for_game("Blender", reason="memory")
-            check(app._mem_queued == ("Blender", 0.0) and app._game_queued is None,
+            app.watch.stop_for("Blender", reason="memory")
+            check(app.watch.mem_queued == ("Blender", 0.0) and app.watch.game_queued is None,
                   "a blocked memory stop waits under the memory setting")
-            app._mem_queued = None
-            app._stop_for_game("Doom")
-            check(app._game_queued == ("Doom", 0.0) and app._mem_queued is None, "a blocked game stop under the game one")
+            app.watch.mem_queued = None
+            app.watch.stop_for("Doom")
+            check(app.watch.game_queued == ("Doom", 0.0) and app.watch.mem_queued is None, "a blocked game stop under the game one")
         finally:
             app._game_blocked = real_blocked
-            app._game_queued, app._mem_queued = None, None
+            app.watch.game_queued, app.watch.mem_queued = None, None
             app.state_name = "IDLE"
         # 4. serving time collected but not yet saved is added when the app closes
         u = app.usage
@@ -707,13 +707,33 @@ def test_v110_review() -> None:
 
 
 def test_engine_picker() -> None:
-    engines.available()                              # discovery done before the fake is added
-    check(engines.choices() == [("strata", "Strata")], f"only Strata ({engines.choices()})")
+    engines.available()                              # discovery done before the registry is narrowed
+    real = dict(engines._FACTORIES)
+    check(sorted(engines.choices()) == [("llama_cpp", "llama.cpp"), ("strata", "Strata")],
+          f"the shipped engines ({engines.choices()})")
     try:
+        for k in list(engines._FACTORIES):           # a build with Strata alone: no Engine row
+            if k != "strata":
+                engines._FACTORIES.pop(k)
+        check(engines.choices() == [("strata", "Strata")], f"only Strata ({engines.choices()})")
         _engine_picker_checks()
     finally:
-        engines._FACTORIES.pop("v110fake", None)
-    check(engines.choices() == [("strata", "Strata")], "fake engine removed")
+        engines._FACTORIES.clear()
+        engines._FACTORIES.update(real)
+    check(sorted(engines.choices()) == [("llama_cpp", "llama.cpp"), ("strata", "Strata")], "registry restored")
+    # the shipped app: two engines, so the Engine row is there with Strata selected
+    app, det, ep = U.new_app()
+    try:
+        _fake_resume(app)
+        d = H.open_settings(app)
+        row = H.settings_option(d, "Engine") if d is not None and d.has_engine_row else None
+        check(row is not None and row["value"] == "Strata" and sorted(row["choices"]) == ["Strata", "llama.cpp"],
+              f"shipped app: the Engine row lists Strata and llama.cpp ({row})")
+        if d is not None:
+            H.close_settings(d)
+            pump(app, 0.3)
+    finally:
+        close(app)
 
 
 def _engine_picker_checks() -> None:

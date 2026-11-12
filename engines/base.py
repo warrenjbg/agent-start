@@ -171,6 +171,24 @@ class MetricsSample:
 
 
 @dataclass(frozen=True)
+class FitCheck:
+    """A read-only pre-check the app may run before a start: does the model fit on the GPU with these settings?
+    `program` must be an existing .exe in the SAME folder as the engine's configured program (the app enforces
+    both and refuses anything else); it is run without a window, with a time limit, and only its stdout is read."""
+    program: str
+    args: tuple[str, ...] = ()
+    timeout_s: float = 20.0
+
+
+@dataclass(frozen=True)
+class FitReport:
+    """What a FitCheck found. fits: True = everything on the GPU, False = part of the model will run on the CPU
+    (slower), None = cannot tell. detail: for the log only."""
+    fits: bool | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
 class LoadReport:
     """How the engine loaded the model, for engines with more than one memory mode (CAP_RAM_MODES).
 
@@ -380,6 +398,14 @@ class Engine:
         """CAP_LOAD_NUDGE: ask the service to load its model. Returns the HTTP status."""
         return None
 
+    def fit_check(self, cfg: Mapping[str, Any]) -> FitCheck | None:
+        """The pre-check to run before starting with this config, or None (no such tool / not applicable)."""
+        return None
+
+    def parse_fit(self, stdout: str, cfg: Mapping[str, Any]) -> FitReport:
+        """Turn the FitCheck program's stdout into a FitReport. Must never raise on junk."""
+        return FitReport()
+
     def is_busy(self, http: Http) -> bool | None:
         """Is a request running right now? Asked before a NON-forced stop of an engine without CAP_UNLOAD (an
         unload call says "busy" itself): True makes the stop answer "busy" instead of ending the process
@@ -462,6 +488,10 @@ class Engine:
     low_ram_label: str = "Low-RAM mode"
     low_ram_loading: str = "slower"
     low_ram_serving: str = "Running slower"
+    # GPU fit (any engine): the pre-check said no / the live check saw the symptoms while a reply ran.
+    gpu_fit_loading: str = "Won't fully fit on the GPU · will run partly on the CPU (slower)"
+    gpu_fit_serving: str = "Running partly on the CPU (slower) · a smaller context or model would fit the GPU"
+    watch_gpu_fit: bool = False                               # run the live check (fit_watch) for this engine
 
     # ---- load progress (CAP_LOAD_PROGRESS)
     def load_progress(self, log_text: str, elapsed_s: float, expected_s: float | None) -> tuple[str, float, str | None]:

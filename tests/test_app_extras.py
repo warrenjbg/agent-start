@@ -627,19 +627,19 @@ def test_game_alert_and_tray_models(tmp: Path) -> None:
         del app.switch_model
         # game alert: armed from Turn on (STARTING) while serving
         w = FakeWatcher()
-        app.games, app._games_armed = w, False
-        app._arm_games(app.state_name in ("STARTING", "ACTIVE"))
+        app.watch.games, app.watch.games_armed = w, False
+        app.watch.arm_games(app.state_name in ("STARTING", "ACTIVE"))
         check(w.armed == 0, "idle: not armed")
         U.to_active(app, ep)
         pump(app, 0.5)
-        check(w.armed == 1 and app._games_armed, "serving: armed")
+        check(w.armed == 1 and app.watch.games_armed, "serving: armed")
         app._mem = (65536.0, 12000.0, 50000.0)
         # default "Turn Strata off": a safe stop, no dialog, no toast asking anything
-        check(app._game_action == "off", "default action: turn Strata off")
+        check(app.watch.game_action == "off", "default action: turn Strata off")
         TOASTS.clear()
         n = len(ep.stop_calls)
         app.withdraw()                           # the user is in the game
-        threading.Thread(target=lambda: app.post(app._on_game_started, "EldenRing", 9000.0)).start()
+        threading.Thread(target=lambda: app.post(app.watch.on_game_started, "EldenRing", 9000.0)).start()
         check(pump_until(app, lambda: app._stop_pending == ("off", {"game": "EldenRing"}), 3),
               f"game -> stop pending (safe stop) ({app._stop_pending})")
         check(not app._dialog_open() and app.state() == "withdrawn", "no dialog, the window stays hidden")
@@ -651,16 +651,16 @@ def test_game_alert_and_tray_models(tmp: Path) -> None:
         ep.status_value = dict(U.IDLE_STATUS)
         U.fire(ep.stop_calls[-1][0], U.stop_result())
         pump(app, 0.5)
-        check(w.disarmed >= 1 and not app._games_armed, "stopped: disarmed")
+        check(w.disarmed >= 1 and not app.watch.games_armed, "stopped: disarmed")
         check(app._skip_reopen_once is False, "skip-reopen flag consumed")
         # "Ask me": a toast with a Turn off Strata button; the button (agentstart://game-off) stops it
-        app.set_game_action("Ask me")
-        check(app._game_action == "ask" and pump_until(app, lambda: config_store.load_state().get("game_action") == "ask", 3),
+        app.watch.set_game_action("Ask me")
+        check(app.watch.game_action == "ask" and pump_until(app, lambda: config_store.load_state().get("game_action") == "ask", 3),
               "Ask me saved")
         U.to_active(app, ep)
         pump(app, 0.4)
         TOASTS.clear()
-        app._on_game_started("Hades", 1.0)
+        app.watch.on_game_started("Hades", 1.0)
         check(pump_until(app, lambda: TOASTS, 3) and TOASTS[-1][0] == "Game started" and "Hades" in TOASTS[-1][1],
               f"ask: a toast ({TOASTS[-1:]})")
         check(app._stop_pending is None, "ask: nothing stops by itself")
@@ -669,7 +669,7 @@ def test_game_alert_and_tray_models(tmp: Path) -> None:
         main._protocol_registered = lambda: True
         try:
             TOASTS.clear()
-            app._on_game_started("Hades", 1.0)
+            app.watch.on_game_started("Hades", 1.0)
             pump_until(app, lambda: TOASTS, 3)
             check(TOASTS and TOASTS[-1][2] == [("Turn off Strata", "agentstart://game-off")],
                   f"installed: the toast has the button ({TOASTS[-1:]})")
@@ -686,33 +686,33 @@ def test_game_alert_and_tray_models(tmp: Path) -> None:
         # a stale / other-session button does nothing
         U.to_active(app, ep)
         pump(app, 0.4)
-        app._on_game_started("Hades", 1.0)
-        app._game_alert = (time.monotonic() - main.GAME_ALERT_VALID_S - 1, app._start_token, "Hades")
+        app.watch.on_game_started("Hades", 1.0)
+        app.watch.game_alert = (time.monotonic() - main.GAME_ALERT_VALID_S - 1, app._start_token, "Hades")
         n = len(ep.stop_calls)
         app.game_off_requested()
         pump(app, main.IDLE_GRACE_S + 1)
         check(len(ep.stop_calls) == n and app._stop_pending is None, "an old toast's button does nothing")
-        app._on_game_started("Hades", 1.0)
-        app._game_alert = (time.monotonic(), app._start_token + 99, "Hades")
+        app.watch.on_game_started("Hades", 1.0)
+        app.watch.game_alert = (time.monotonic(), app._start_token + 99, "Hades")
         app.game_off_requested()
         check(app._stop_pending is None, "a previous session's toast does nothing")
         # cancel the game stop: flags reset
-        app.set_game_action("Turn Strata off")
-        app._on_game_started("Doom", 1.0)
+        app.watch.set_game_action("Turn Strata off")
+        app.watch.on_game_started("Doom", 1.0)
         check(app._stop_pending == ("off", {"game": "Doom"}) and not app._skip_reopen_once,
               "auto stop pending; nothing set before it runs")
         app.cancel_pending_stop()
         check(not app._skip_reopen_once and app._stop_toast is None and app._stop_pending is None,
               "Cancel drops the game stop")
         # "Do nothing": not even armed
-        app.set_game_action("Do nothing")
-        check(not app._games_armed and app._game_action == "none", "Do nothing: watcher disarmed")
+        app.watch.set_game_action("Do nothing")
+        check(not app.watch.games_armed and app.watch.game_action == "none", "Do nothing: watcher disarmed")
         TOASTS.clear()
-        app._on_game_started("Doom", 1.0)
+        app.watch.on_game_started("Doom", 1.0)
         pump(app, 0.3)
         check(not TOASTS and app._stop_pending is None, "Do nothing: nothing happens")
-        app.set_game_action("Turn Strata off")
-        check(app._games_armed, "back on while serving: armed again")
+        app.watch.set_game_action("Turn Strata off")
+        check(app.watch.games_armed, "back on while serving: armed again")
     finally:
         tray_mod.TrayIcon = real
         close(app)
@@ -754,7 +754,7 @@ def test_settings_switches() -> None:
                   f"game dropdown ({gvar.get()!r}, {gmenu.cget('values')})")
             gvar.set("Do nothing")
             d._choice_changed(d._extra_switches[2], gvar, "Do nothing")
-            check(app._game_action == "none" and not app._game_pref
+            check(app.watch.game_action == "none" and not app.watch.game_pref
                   and pump_until(app, lambda: config_store.load_state().get("game_action") == "none", 3),
                   "Do nothing chosen + saved")
             d._choice_changed(d._extra_switches[2], gvar, "Turn Strata off")
@@ -847,16 +847,16 @@ def test_review_fixes() -> None:
         app._sync_tray()
         check(t2.models and t2.models[-1][1] == "a.bat", f"re-created tray gets the models ({t2.models[-1:]})")
         # 5. game started while loading: handled once ready
-        app.set_game_action("Ask me")
+        app.watch.set_game_action("Ask me")
         app.loaded = False
         TOASTS.clear()
-        app._on_game_started("Celeste", 1.0)
+        app.watch.on_game_started("Celeste", 1.0)
         pump(app, 0.2)
-        check(not TOASTS and app._game_queued == ("Celeste", 1.0), "game during the load: queued")
+        check(not TOASTS and app.watch.game_queued == ("Celeste", 1.0), "game during the load: queued")
         app.loaded = True
         app._apply_state()
         check(pump_until(app, lambda: any("Celeste" in t_[1] for t_ in TOASTS), 3), "delivered once the model is ready")
-        app.set_game_action("Turn Strata off")
+        app.watch.set_game_action("Turn Strata off")
     finally:
         tray_mod.TrayIcon = real
         close(app)
@@ -897,13 +897,13 @@ def test_v181_review() -> None:
         # A: Strata dies while a game stop waits -> nothing leaks into the next session
         app._fetch_metrics.live = "generating"
         pump(app, 0.6)
-        app._on_game_started("Doom", 1.0)
+        app.watch.on_game_started("Doom", 1.0)
         check(app._stop_pending == ("off", {"game": "Doom"}), "busy: game stop pending")
         app._set_state("IDLE")
         app._set_state("STARTING")
         check(not app._skip_reopen_once and app._stop_toast is None and app._last_stop_game is None,
               "a new start: no leftover game-stop flags")
-        app._game_queued = None
+        app.watch.game_queued = None
         app._set_state("IDLE")
         U.to_active(app, ep)
         pump(app, 0.4)
@@ -914,10 +914,10 @@ def test_v181_review() -> None:
         real = main.messagebox.askyesno
         main.messagebox.askyesno = lambda *a, **k: asked.append(a) or False
         try:
-            app._on_game_started("Doom", 1.0)
+            app.watch.on_game_started("Doom", 1.0)
             ok = pump_until(app, lambda: app.state_name == "STOPPING", main.IDLE_GRACE_S + 3)
             check(ok, f"game stop runs (state={app.state_name}, loaded={app.loaded}, pending={app._stop_pending}, "
-                      f"queued={app._game_queued}, tool={app._tool_wait}, fails={app._metrics_fails}, "
+                      f"queued={app.watch.game_queued}, tool={app._tool_wait}, fails={app._metrics_fails}, "
                       f"act={app.metrics.activity()})")
             if not ok:
                 raise RuntimeError("game stop did not run")
@@ -933,23 +933,23 @@ def test_v181_review() -> None:
         app.dialog = type("D", (), {"winfo_exists": lambda self: True})()
         real_open = app._dialog_open
         app._dialog_open = lambda: True
-        app._on_game_started("Hades", 1.0)
-        check(app._stop_pending is None and app._game_queued == ("Hades", 1.0), "dialog open: queued, nothing set")
+        app.watch.on_game_started("Hades", 1.0)
+        check(app._stop_pending is None and app.watch.game_queued == ("Hades", 1.0), "dialog open: queued, nothing set")
         app._dialog_open = real_open
         app.dialog = None
-        app._deliver_queued_game()
+        app.watch.deliver_queued()
         check(app._stop_pending == ("off", {"game": "Hades"}), "dialog closed: delivered")
         app.cancel_pending_stop()
         # D: the user's own pending stop is upgraded (no relaunch over the game)
         app._stop_pending = ("off", None)
-        app._on_game_started("Celeste", 1.0)
+        app.watch.on_game_started("Celeste", 1.0)
         check(app._stop_pending == ("off", {"game": "Celeste"}), "user's pending stop -> game stop")
         app.cancel_pending_stop()
         # E: /metrics failing -> the game stop runs anyway
         app._fetch_metrics.fail = True
         check(pump_until(app, lambda: app._metrics_fails >= 1, 3), "metrics failing")
         n = len(ep.stop_calls)
-        app._on_game_started("Hades", 1.0)
+        app.watch.on_game_started("Hades", 1.0)
         check(len(ep.stop_calls) == n + 1, "metrics failing: stops right away")
         nt = getattr(ep, "next_toast", None)
         check(nt and "Hades started" in nt[1], f"with the game toast ({nt})")
@@ -961,7 +961,7 @@ def test_v181_review() -> None:
         cancelled = []
         app.cancel_start = lambda: cancelled.append(1)
         app.state_name, app._start_phase = "STARTING", "server"
-        app._on_game_started("Doom", 1.0)
+        app.watch.on_game_started("Doom", 1.0)
         check(cancelled == [1], "game during the load: start cancelled")
         del app.cancel_start
         app.state_name, app._start_phase = "IDLE", None
@@ -978,7 +978,7 @@ def test_v181_review() -> None:
         config_store.save_state({"game_alert": None, "game_action": None, **saved})
         app, det, ep = U.new_app()
         try:
-            check(app._game_action == want, f"migration {saved} -> {want} ({app._game_action})")
+            check(app.watch.game_action == want, f"migration {saved} -> {want} ({app.watch.game_action})")
         finally:
             close(app)
     config_store.save_state({"game_alert": None, "game_action": "off"})
@@ -992,7 +992,7 @@ def test_memory_trigger() -> None:
     try:
         app._extras = True
         mw = FakeWatcher()
-        app.memwatch, app.games = mw, FakeWatcher()
+        app.watch.memwatch, app.watch.games = mw, FakeWatcher()
         check(mw.armed == 0, "idle: the memory check is not armed")
         U.to_active(app, ep)
         pump(app, 0.5)
@@ -1009,7 +1009,7 @@ def test_memory_trigger() -> None:
         pump(app, 0.3)
         TOASTS.clear()
         n = len(ep.stop_calls)
-        app._on_memory_app("Blender", 6349.0, "why")
+        app.watch.on_memory_app("Blender", 6349.0, "why")
         check(pump_until(app, lambda: TOASTS, 3) and TOASTS[-1][0] == "Memory is running low"
               and TOASTS[-1][1].startswith("Blender is using 6.2 GB while Strata is running."),
               f"ask: the toast names the app and how much memory it took ({TOASTS[-1:]})")
@@ -1020,7 +1020,7 @@ def test_memory_trigger() -> None:
         config_store.FROZEN, main._protocol_registered = True, lambda: True
         try:
             TOASTS.clear()
-            app._on_memory_app("Blender", 6349.0)
+            app.watch.on_memory_app("Blender", 6349.0)
             pump_until(app, lambda: TOASTS, 3)
             check(TOASTS and TOASTS[-1][2] == [("Turn off Strata", "agentstart://game-off")],
                   f"installed: the toast has the Turn off Strata button ({TOASTS[-1:]})")
@@ -1052,7 +1052,7 @@ def test_memory_trigger() -> None:
         pump(app, 0.5)
         TOASTS.clear()
         n = len(ep.stop_calls)
-        app._on_memory_app("DaVinci Resolve", 9000.0)
+        app.watch.on_memory_app("DaVinci Resolve", 9000.0)
         check(pump_until(app, lambda: len(ep.stop_calls) > n, main.IDLE_GRACE_S + 3), "off: a safe stop starts by itself")
         check(not any(t_[0] == "Memory is running low" for t_ in TOASTS) and H.open_dialog(app) is None,
               "off: no question toast, no dialog")
@@ -1062,29 +1062,29 @@ def test_memory_trigger() -> None:
         U.fire(ep.stop_calls[-1][0], U.stop_result())
         pump(app, 0.5)
         # "Do nothing": never armed, a stray report is ignored
-        app.set_memory_action("Do nothing")
+        app.watch.set_memory_action("Do nothing")
         armed_before = mw.armed
         U.to_active(app, ep)
         pump(app, 0.5)
         TOASTS.clear()
         n = len(ep.stop_calls)
-        app._on_memory_app("Blender", 9000.0)
+        app.watch.on_memory_app("Blender", 9000.0)
         pump(app, 0.4)
         check(mw.armed == armed_before and not TOASTS and len(ep.stop_calls) == n and not H.pending_line_visible(app),
               "Do nothing: not armed, nothing happens")
         # the game setting on "Do nothing" does not switch the memory check off
-        app.set_memory_action("Ask me")
-        app.set_game_action("Do nothing")
+        app.watch.set_memory_action("Ask me")
+        app.watch.set_game_action("Do nothing")
         pump(app, 0.2)
         check(mw.armed == armed_before + 1, "memory check armed while the game setting is Do nothing")
         TOASTS.clear()
-        app._on_memory_app("Blender", 5000.0)
+        app.watch.on_memory_app("Blender", 5000.0)
         check(pump_until(app, lambda: TOASTS, 3) and TOASTS[-1][0] == "Memory is running low", "and it still reports")
         # a report while a dialog is open waits for it
-        app.set_game_action("Turn Strata off")
+        app.watch.set_game_action("Turn Strata off")
         d = H.open_settings(app)
         TOASTS.clear()
-        app._on_memory_app("Unreal Editor", 7000.0)
+        app.watch.on_memory_app("Unreal Editor", 7000.0)
         pump(app, 0.3)
         check(not TOASTS, "a report while Settings is open waits")
         H.close_settings(d)
@@ -1097,7 +1097,7 @@ def test_memory_trigger() -> None:
         config_store.save_state({"memory_action": junk})
         try:
             a2, _d2, _e2 = U.new_app()
-            check(a2._mem_action == "ask", f"state.json memory_action {junk!r} -> Ask me")
+            check(a2.watch.mem_action == "ask", f"state.json memory_action {junk!r} -> Ask me")
         finally:
             if a2 is not None:
                 close(a2)
