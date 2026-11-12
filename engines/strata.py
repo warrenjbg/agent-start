@@ -266,6 +266,17 @@ class StrataEngine(Engine):
         import strata_finder
         return strata_finder.best_launcher(found) or None
 
+    def auto_launch(self, found: list[Any], cfg: Mapping[str, Any]) -> Any:
+        """One Strata install on this PC with exactly one launcher (one model) that can be read: use it. Several
+        launchers are several models: the user picks."""
+        try:
+            if len(found) != 1 or len(list(getattr(found[0], "launchers", None) or [])) != 1:
+                return None
+            path = self.preferred_launcher(found[0])
+            return self.read_launcher(path) if path else None
+        except Exception:  # noqa: BLE001 - LaunchError (a launcher that cannot be used) included: the user picks
+            return None
+
     # launcher files: run-*.bat in the Strata folder (launcher_bat parses them; they are never executed)
     def list_launchers(self, cfg: Mapping[str, Any]) -> list[str]:
         import launcher_bat

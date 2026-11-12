@@ -786,7 +786,8 @@ def t_registry_and_compat() -> None:
     e = ENG
     check(e.id == "llama_cpp" and e.name == "llama.cpp" and e.default_port == 9931 and e.log_prefix == "llama",
           "id, name, default port 9931, llama-*.log")
-    check(e.capabilities == frozenset({base.CAP_LIVE_ACTIVITY, base.CAP_REQUEST_HISTORY, base.CAP_LOAD_PROGRESS})
+    check(e.capabilities == frozenset({base.CAP_LIVE_ACTIVITY, base.CAP_REQUEST_HISTORY, base.CAP_LOAD_PROGRESS,
+                                         base.CAP_FIND_INSTALL})
           and not e.can(base.CAP_UNLOAD) and not e.can(base.CAP_LAUNCHER_FILES), "declared capabilities")
     check(e.unload(http_of({}), False) == base.UNLOAD_UNSUPPORTED, "no unload call")
     check(e.has_dashboard and ("llama-server", "llama-server.exe") in e.program_filetypes and "llama-server.exe"
@@ -811,8 +812,9 @@ def t_registry_and_compat() -> None:
             mods.update(a.name.split(".")[0] for a in node.names)
         elif isinstance(node, ast.ImportFrom):
             mods.add("." + (node.module or "") if node.level else (node.module or "").split(".")[0])
-    allowed = {"__future__", "json", "math", "os", "re", "struct", "collections", "typing", ".base", "psutil"}
-    check(mods <= allowed, f"imports: standard library + engines.base only ({sorted(mods)})")
+    allowed = {"__future__", "json", "math", "os", "re", "struct", "collections", "typing", ".base", "psutil",
+               "dataclasses", "llama_finder"}       # llama_finder: the bounded, read-only search (imported lazily)
+    check(mods <= allowed, f"imports: standard library, engines.base and llama_finder only ({sorted(mods)})")
     check(not any(w in src for w in ("Popen(", "urlopen(", ".connect(", ".terminate(", ".kill(", "send_signal(",
                                       "process_iter(", "psutil.Process(")),
           "no process start, connection or process action in the module")

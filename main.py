@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -20,6 +21,7 @@ import customtkinter as ctk
 import psutil
 
 import config_store
+import engine_profiles
 import engines
 import load_progress
 import ram_plan
@@ -214,14 +216,67 @@ def _toast_worker(title: str, msg: str, buttons: list[tuple[str, str]] | None = 
         log.debug("toast failed", exc_info=True)
 
 
-def _save_backend_worker(engine_id: str) -> None:
-    """Worker: write the chosen engine into config.json (re-read first: keep whatever else changed on disk)."""
+def _save_backend_worker(old_id: str, engine_id: str, post: Callable, done: Callable) -> None:
+    """Worker: make `engine_id` the engine in config.json (re-read first: keep whatever else changed on disk).
+    The running engine's launch settings are parked under its name and the new engine's own come back
+    (engine_profiles). Posts done(engine_id, ok)."""
+    ok = False
     try:
         disk = config_store.load_config()
-        disk["backend"] = engine_id
-        config_store.save_config(disk)
+        config_store.save_config(engine_profiles.switch(disk, old_id, engine_id, config_store.DEFAULTS))
+        ok = True
     except Exception:  # noqa: BLE001
         log.exception("saving the engine choice failed")
+    post(done, engine_id, ok)
+
+
+AFTER_EXIT_ARG = "--after-exit"          # --after-exit <pid>: a restart; wait for that Agent Start to be gone first
+
+
+def _relaunch_app() -> bool:
+    """Start a new Agent Start that takes over once this one has exited (it waits for our pid). Nothing else is
+    started, and nothing is stopped: the caller exits the normal way afterwards."""
+    try:
+        argv = [sys.executable] if config_store.FROZEN else [sys.executable, os.path.abspath(__file__)]
+        argv += [AFTER_EXIT_ARG, str(os.getpid())]
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen(argv, close_fds=True, creationflags=flags, cwd=str(config_store.APP_DIR),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:  # noqa: BLE001
+        log.exception("restart failed")
+        return False
+
+
+def _wait_for_exit(argv: list[str], timeout_s: float = 20.0) -> None:
+    """--after-exit <pid>: wait (bounded) until that process is gone, so the single-instance check does not see
+    the Agent Start that asked for the restart. Only waits; a pid that is not Agent Start is not waited for."""
+    try:
+        if AFTER_EXIT_ARG not in argv:
+            return
+        pid = int(argv[argv.index(AFTER_EXIT_ARG) + 1])
+        p = psutil.Process(pid)
+        me = psutil.Process()
+        if p.pid == me.pid or os.path.normcase(p.exe()) != os.path.normcase(me.exe()):
+            return
+        p.wait(timeout_s)
+    except Exception:  # noqa: BLE001 - gone already, bad argument, timeout: carry on with the normal start
+        return
+
+
+def _park_foreign_config() -> None:
+    """Start-up: launch settings that belong to another engine (the engine was changed by 1.11, which did not keep
+    them apart, or by hand) are parked under that engine, so they come back when the user switches to it."""
+    try:
+        cfg = config_store.load_config()
+        all_engines = [engines.get_engine({"backend": i}) for i in engines.available()]
+        fixed = engine_profiles.park_foreign(cfg, engines.get_engine(cfg), all_engines, config_store.DEFAULTS)
+        if fixed is not None:
+            config_store.save_config(fixed)
+            log.info("launch settings of another engine were found and kept for it (%s)",
+                     ", ".join(sorted(fixed.get(engine_profiles.PROFILES_KEY) or {})))
+    except Exception:  # noqa: BLE001
+        log.exception("could not sort the launch settings by engine")
 
 
 FIT_PRECHECK_WAIT_S = 6.0                # the launch waits at most this long for the GPU-fit pre-check
@@ -571,7 +626,9 @@ class AgentStartApp(ctk.CTk):
             protected_pids=lambda: self.endpoint.protected_pids(),
             engine_protects=lambda i: self.engine.protects_process(i.cmdline, i.exe, self.cfg),
         ), saved, enabled=bool(extras))
-        self._backend_pending: str | None = None  # engine chosen in Settings, used after a restart
+        self._switch_to: str | None = None       # engine chosen in Settings: switch (and restart) once it is off
+        self._switch_at = 0.0
+        self._can_relaunch = bool(extras)        # a test app never starts a second Agent Start
         self._served_acc = 0.0                    # serving seconds not yet in the usage history (metrics worker)
         self._served_model: str | None = None
         self._no_tray = not extras or not self._tray_pref
@@ -1869,6 +1926,7 @@ class AgentStartApp(ctk.CTk):
             self._request_preview()
             self._sync_tray()
             self.watch.arm_memory(self.loaded is True)   # the model finished loading after the state changed
+            self._engine_switch_check()
             self.watch.deliver_queued()          # a game that started while a dialog / box was open
             if self.tray is None and not self._no_tray and time.monotonic() < self._tray_retry_until:
                 self._start_tray()               # the icon failed at start: try again (every tick, ~5 s)
@@ -2485,6 +2543,11 @@ class AgentStartApp(ctk.CTk):
                 log.info("model switch: starting %s", (self._pending_launcher.model_name
                                                      if self._pending_launcher else self.cfg.get("model_name")))
                 self.after(300, self._switch_start)
+            elif self._switch_to is not None and not self._exit_pending:
+                # turned off for an engine switch: reopen what the sweep closed (it cannot be offered after the
+                # restart), then save the choice and restart
+                self._run_worker("hc-reopen", self._reopen_worker, self._reopen_pref and not self._skip_reopen_once)
+                self.after(1200, self._engine_switch_save)
             elif not self._exit_pending:
                 self.watch.arm_resume(stop_game)      # stopped for a game / an app: offer the turn-on once it closes
                 self._reopening = True
@@ -2507,6 +2570,14 @@ class AgentStartApp(ctk.CTk):
         self.show_window()
         pending = self._pending_launcher
         cfg, current = self.cfg, pending.path if pending is not None else None
+        if found is None and not self.engine.can(CAP_LAUNCHER_FILES):
+            found = self._found_strata           # the dropdowns show what the start-up search found
+        options = None
+        if found is not None and not self.engine.can(CAP_LAUNCHER_FILES):
+            try:
+                options = self.engine.launch_options(found, self.cfg)
+            except Exception:  # noqa: BLE001
+                log.debug("launch options unavailable", exc_info=True)
         if found is not None and not self.engine.is_configured(self.cfg):
             cfg = dict(self.cfg, **self.engine.install_settings(found))
             current = self.engine.preferred_launcher(found)
@@ -2520,7 +2591,7 @@ class AgentStartApp(ctk.CTk):
             on_check_updates=self.updates.check_now, can_check_updates=self.updates.available(),
             engine=self.engine,
             on_history=self.open_history if self.usage is not None else None,
-            engine_choices=engines.choices(), on_engine_change=self.set_backend)
+            engine_choices=engines.choices(), on_engine_change=self.set_backend, launch_options=options)
 
     # ------------------------------------------------------------------ system tray
     def _start_tray(self) -> None:
@@ -2614,11 +2685,14 @@ class AgentStartApp(ctk.CTk):
 
     # ------------------------------------------------------------------ first start: find an install
     def _maybe_find_strata(self) -> None:
-        if self._finder_ran or self.engine.is_configured(self.cfg) or getattr(self, "_no_finder", False) \
-                or not self.engine.can(CAP_FIND_INSTALL):
+        if self._finder_ran or getattr(self, "_no_finder", False) or not self.engine.can(CAP_FIND_INSTALL):
             return
+        configured = self.engine.is_configured(self.cfg)
+        if configured and self.engine.can(CAP_LAUNCHER_FILES):
+            return                               # its launcher files are listed from the install folder already
         self._finder_ran = True
-        self._set_note(f"Looking for {self.engine.name} on this PC…")
+        if not configured:                       # (configured: a quiet search, only for the Settings dropdowns)
+            self._set_note(f"Looking for {self.engine.name} on this PC…")
         self._run_worker("hc-find-install", _find_install_worker, self.engine, self.post, self._on_strata_found,
                          self._stop_evt)
 
@@ -2628,9 +2702,34 @@ class AgentStartApp(ctk.CTk):
             log.info("found %s: %s", self.engine.name, [self.engine.install_dir_of(f) for f in found])
         else:
             log.info("no %s found on this PC", self.engine.name)
+        if self.engine.is_configured(self.cfg):
+            return                               # the quiet search: nothing to say
         self._note_until = 0.0
         if self._found_strata is None and self.state_name == IDLE:
             self._set_note(f"No {self.engine.name} found\n{self.engine.setup_hint}")
+        elif self._found_strata is not None and self.state_name == IDLE and self._pending_launcher is None \
+                and not self._dialog_open():
+            info = None
+            try:
+                info = self.engine.auto_launch(list(found), self.cfg)
+                if info is not None:             # the same check a choice made in Settings gets
+                    trial = dict(self.cfg)
+                    self.engine.apply_launcher(trial, info)
+                    self.engine.plan_launch(trial)
+            except Exception as exc:  # noqa: BLE001 - LaunchError included: leave it to the user
+                log.info("found %s but could not set it up automatically: %s", self.engine.name, exc)
+                info = None
+            if info is not None:
+                log.info("one clear choice: setting up %s with %s", self.engine.name, info.summary())
+                self.save_launcher(info, lambda err, info=info: self._auto_configured(info, err))
+                return
+        self._request_preview()
+
+    def _auto_configured(self, info: Any, err: str | None) -> None:
+        if self._destroyed:
+            return
+        if err is None and self.state_name == IDLE:
+            self._set_note(f"Found {self.engine.name} · ready to turn on\n{_short(self.engine.launch_title(info), 44)}")
         self._request_preview()
 
     def _tray_switch(self, bat_path: str) -> None:
@@ -2681,19 +2780,78 @@ class AgentStartApp(ctk.CTk):
         return history_dialog.HistoryDialog(self, self.usage)
 
     def set_backend(self, engine_id: str) -> str | None:
-        """Settings > Engine (only shown with two or more engines): saved to config.json and used from the next
-        start of Agent Start; the running engine, and whatever it serves, stay as they are. Returns the note to
-        show, or None when nothing changed."""
+        """Settings > Engine: asks once, then switches - the running engine is turned off first (the normal, safe
+        Turn off), its launch settings are kept for it, and Agent Start restarts into the new engine. Returns a
+        note to show, or None when nothing changes (unknown / same engine, the user said no)."""
         names = dict(engines.choices())
         if engine_id not in names:
             return "That engine is not installed"
-        running = getattr(self.engine, "id", None)
-        if engine_id == (self._backend_pending or running):
+        running = str(getattr(self.engine, "id", "") or "")
+        if engine_id == running or self._switch_to is not None:
             return None
-        self._backend_pending = None if engine_id == running else engine_id
-        self._run_worker("hc-backend", _save_backend_worker, engine_id)
-        log.info("engine choice saved: %s (running: %s)", engine_id, running)
-        return None if engine_id == running else f"{names[engine_id]} is used after Agent Start restarts"
+        st = self.state_name
+        if st in (STARTING, STOPPING) or self.updates.updating:
+            return f"Wait until {self.engine.name} has finished"
+        new, cur = names[engine_id], self.engine.name
+        question = (f"{cur} is running. Turn it off and switch to {new}?\n\nAgent Start will restart."
+                    if st == ACTIVE else f"Switch to {new}?\n\nAgent Start will restart.")
+        if not self._ask(messagebox.askyesno, question):
+            return None
+        if self.state_name != st or self._destroyed:          # it changed under the box: pick again
+            return None
+        self._switch_to, self._switch_at = engine_id, time.monotonic()
+        log.info("engine switch: %s -> %s (state %s)", running, engine_id, st)
+        self.after(60, self._engine_switch_begin)             # after the Settings menu's own callback returned
+        return f"Turning {cur} off…" if st == ACTIVE else f"Switching to {new}…"
+
+    def _engine_switch_begin(self) -> None:
+        if self._switch_to is None or self._destroyed:
+            return
+        d = self.dialog
+        if d is not None:
+            try:
+                d.close()                         # Settings: the launch config it shows is about to be replaced
+            except Exception:  # noqa: BLE001
+                log.debug("closing Settings failed", exc_info=True)
+        if self.state_name == ACTIVE:
+            self.on_toggle()                      # the user's own Turn off, with its "a reply is running" question
+            return                                # _on_stopped carries on (or _tick drops the switch if declined)
+        self._engine_switch_save()
+
+    def _engine_switch_save(self) -> None:
+        target = self._switch_to
+        if target is None or self._destroyed or self.state_name not in (IDLE, ERROR):
+            self._switch_to = None
+            return
+        self._set_note(f"Switching to {dict(engines.choices()).get(target, target)}…")
+        self._run_worker("hc-backend", _save_backend_worker, str(self.engine.id), target, self.post,
+                         self._engine_switch_restart)
+
+    def _engine_switch_restart(self, engine_id: str, ok: bool) -> None:
+        self._switch_to = None
+        if self._destroyed:
+            return
+        name = dict(engines.choices()).get(engine_id, engine_id)
+        if not ok:
+            self._set_note("The engine could not be changed\nconfig.json could not be written")
+            return
+        if not self._can_relaunch or not _relaunch_app():
+            self._set_note(f"{name} is used after Agent Start restarts\nRestart it from the Start menu")
+            return
+        log.info("engine switch saved: restarting into %s", engine_id)
+        self._finish_exit()
+
+    def _engine_switch_check(self) -> None:
+        """Tick: a switch that waited for a Turn off the user then declined (or that failed) is dropped."""
+        if self._switch_to is None or time.monotonic() - self._switch_at < 3.0:
+            return
+        st = self.state_name
+        waiting = st == STOPPING or (st == ACTIVE and (self._stop_pending is not None or self._dialog_open()
+                                                       or self._box_open))
+        if st == ERROR or (st == ACTIVE and not waiting):
+            log.info("engine switch dropped (state %s)", st)
+            self._switch_to = None
+            self._set_note("Engine not changed")
 
     # ------------------------------------------------------------------ settings switches
     def set_tray_pref(self, on: bool) -> bool:
@@ -3044,6 +3202,8 @@ def _selftest() -> int:
         if not {"strata", "llama_cpp"} <= set(engines.available()):   # discovery imports every engine module
             return 5
         import fit_check  # noqa: F401
+        import llama_finder  # noqa: F401
+        import engine_profiles  # noqa: F401
         import fit_watch  # noqa: F401
         import strata_finder  # noqa: F401
         import tray
@@ -3100,6 +3260,7 @@ def main() -> None:
     global _SINGLETON_MUTEX
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
+    _wait_for_exit(sys.argv)                         # a restart (engine switch): the old one exits first
     import win32api
     import win32event
     import winerror
@@ -3140,6 +3301,7 @@ def main() -> None:
         _EVENTS = []
     _setup_logging()
     _check_config()
+    _park_foreign_config()
     try:  # own taskbar identity/icon instead of grouping under python(w).exe
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("warrenjbg.AgentStart")
     except Exception:  # noqa: BLE001

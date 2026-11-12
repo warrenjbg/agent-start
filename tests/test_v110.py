@@ -801,7 +801,7 @@ def _engine_picker_checks() -> None:
         pump(app, 0.5)
         check(res is None and not saved, f"current id: nothing saved, None ({res!r}, {saved})")
         note = app.set_backend("v110fake")
-        check(isinstance(note, str) and "restart" in note.lower(), f"another engine: a restart note ({note!r})")
+        check(isinstance(note, str) and "Fake Engine" in note, f"another engine: a note while it switches ({note!r})")
         check(pump_until(app, lambda: saved and saved[-1].get("backend") == "v110fake", 3),
               f"backend saved ({saved[-1:]})")
         check(app.engine is eng and app.engine.id == "strata", "app.engine unchanged")

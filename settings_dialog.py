@@ -38,6 +38,7 @@ class SettingsDialog(ctk.CTkToplevel):
     SWITCH_STEP = 34                             # switch 24 px + 10 px gap
     UPDATE_ROW_H = 30                            # the "Check for updates" row under the title (24 px + 6 px gap)
     ENGINE_ROW_H = 34                            # the "Engine" row (26 px + 8 px gap); only with 2+ engines
+    OPTION_ROW_H = 34                            # a "Build" / "Model" dropdown row (28 px + 6 px gap)
     EXT_GLYPH = "\uE8A7"   # Segoe Fluent Icons "Open in new window"
 
     def __init__(self, master, cfg: dict, detector,
@@ -53,6 +54,7 @@ class SettingsDialog(ctk.CTkToplevel):
                  on_check_updates: Callable[[Callable[[str, str | None], bool]], str] | None = None,
                  can_check_updates: bool = True, engine=None,
                  on_history: Callable[[], Any] | None = None,
+                 launch_options: dict | None = None,
                  engine_choices: list[tuple[str, str]] | None = None,
                  on_engine_change: Callable[[str], str | None] | None = None) -> None:
         """on_check_updates(on_result) adds the "Check for updates" row under the title (none when it is None): it
@@ -103,13 +105,25 @@ class SettingsDialog(ctk.CTkToplevel):
         self._paths: dict[str, str] = {}                 # dropdown label -> absolute launcher path
         self._initial = current_bat or (self._engine.current_launcher(cfg) if self._files else None)
         self._has_launch_cmd = bool(cfg.get("launch_cmd"))
+        # engines without launcher files: what the engine found on this PC, as dropdowns (engine.launch_options)
+        opts = launch_options if isinstance(launch_options, dict) and not self._files else {}
+        self._opts = opts
+        self._opt_programs = [(str(a), str(b)) for a, b in (opts.get("programs") or [])]
+        self._opt_models = [(str(a), str(b)) for a, b in (opts.get("models") or [])]
+        self.option_rows = int(bool(self._opt_programs)) + int(bool(self._opt_models))
+        self._program_menu: ctk.CTkOptionMenu | None = None
+        self._model_menu: ctk.CTkOptionMenu | None = None
+        self._program_choice: ctk.StringVar | None = None
+        self._model_choice: ctk.StringVar | None = None
+        self._syncing = False
 
         self.title("Settings")
         self.resizable(False, False)
         self._extra_switches = [sw for sw in (switches or []) if isinstance(sw, dict) and sw.get("key")]
         self.logical_height = (self.HEIGHT + self.SWITCH_STEP * len(self._extra_switches)
                                + (self.UPDATE_ROW_H if on_check_updates is not None else 0)
-                               + (self.ENGINE_ROW_H if self.has_engine_row else 0))
+                               + (self.ENGINE_ROW_H if self.has_engine_row else 0)
+                               + self.OPTION_ROW_H * self.option_rows)
         center_over(self, master, self.WIDTH, self.logical_height)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<Escape>", lambda _e: self.close())
@@ -194,12 +208,35 @@ class SettingsDialog(ctk.CTkToplevel):
         self._args_entry = ctk.CTkEntry(self, textvariable=self._args, height=28, corner_radius=8, font=mono,
                                         fg_color=T.SURFACE, border_color=T.HAIRLINE, text_color=T.TEXT,
                                         placeholder_text="Arguments")
+        prow = 0
+        for title, items, attr in ((str(opts.get("program_title") or "Program"), self._opt_programs, "program"),
+                                   (str(opts.get("model_title") or "Model"), self._opt_models, "model")):
+            if not items:
+                continue
+            line = ctk.CTkFrame(pick, fg_color="transparent")
+            line.grid(row=prow, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+            line.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(line, text=title, font=body, text_color=T.TEXT, anchor="w", width=48, height=28).grid(
+                row=0, column=0, sticky="w", padx=(2, 6))
+            var = ctk.StringVar(value=f"Choose a {title.lower()}…")
+            menu = ctk.CTkOptionMenu(
+                line, variable=var, values=[lab for lab, _p in items], height=28, corner_radius=8,
+                dynamic_resizing=False, font=body, dropdown_font=body, fg_color=T.RAISED, button_color=T.RAISED,
+                button_hover_color=T.RAISED_HOVER, text_color=T.TEXT, text_color_disabled=T.TEXT_3,
+                dropdown_fg_color=T.SURFACE, dropdown_hover_color=T.RAISED, dropdown_text_color=T.TEXT,
+                command=self._program_picked if attr == "program" else self._model_picked)
+            menu.grid(row=0, column=1, sticky="ew")
+            if attr == "program":
+                self._program_menu, self._program_choice = menu, var
+            else:
+                self._model_menu, self._model_choice = menu, var
+            prow += 1
         if not self._files:
-            self._program_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+            self._program_entry.grid(row=prow, column=0, sticky="ew", padx=(0, 6))
         self._browse_btn = ctk.CTkButton(pick, text="Browse…", width=76, height=28, corner_radius=8, font=body,
                                          fg_color=T.RAISED, hover_color=T.RAISED_HOVER, text_color=T.TEXT,
                                          command=self.browse)
-        self._browse_btn.grid(row=0, column=1)
+        self._browse_btn.grid(row=prow, column=1)
 
         # read-only: what the chosen .bat will run (model · config · port) or why it cannot be used
         self._detail = ctk.CTkLabel(self, text="", anchor="nw", justify="left", font=mono, text_color=T.TEXT_2,
@@ -441,6 +478,7 @@ class SettingsDialog(ctk.CTkToplevel):
         program = self._program.get().strip().strip('"')
         info = CommandLaunch(program=program, args=tuple(split_args(self._args.get())))
         self._info = None
+        self._sync_option_menus(program, info.args)
         if not program:
             self._enable_save(False)
             self._msg.configure(text="" if initial else "Choose the program to start", text_color=T.TEXT_2)
@@ -464,6 +502,51 @@ class SettingsDialog(ctk.CTkToplevel):
             self._enable_save(changed)
         self._msg.configure(text=f"Applies next start — {self._engine.name} keeps running"
                             if self._running and changed else "", text_color=T.TEXT_2)
+
+    # ---- what the engine found on this PC (dropdowns above the program and arguments boxes)
+    @staticmethod
+    def _same_file(a: str, b: str) -> bool:
+        try:
+            return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+        except (TypeError, ValueError):
+            return False
+
+    def _sync_option_menus(self, program: str, args: tuple) -> None:
+        """Show which found build / model the boxes name right now (or the "Choose…" text when none of them)."""
+        if self._syncing:
+            return
+        try:
+            if self._program_choice is not None:
+                title = str(self._opts.get("program_title") or "Program").lower()
+                lab = next((la for la, p in self._opt_programs if program and self._same_file(p, program)), None)
+                self._program_choice.set(lab or (f"Choose a {title}…" if not program else "Another program (below)"))
+            if self._model_choice is not None:
+                title = str(self._opts.get("model_title") or "Model").lower()
+                model_of = self._opts.get("model_of")
+                cur = model_of(args) if callable(model_of) else None
+                lab = next((la for la, p in self._opt_models if cur and self._same_file(p, cur)), None)
+                self._model_choice.set(lab or (f"Choose a {title}…" if not cur else "Another model (below)"))
+        except Exception:  # noqa: BLE001 - an engine helper must not take the dialog down
+            log.debug("option menus not updated", exc_info=True)
+
+    def _program_picked(self, label: str) -> None:
+        path = next((p for la, p in self._opt_programs if la == label), None)
+        if path and not self._saving:
+            self._program.set(path)                  # the trace re-checks the command
+
+    def _model_picked(self, label: str) -> None:
+        path = next((p for la, p in self._opt_models if la == label), None)
+        if not path or self._saving:
+            return
+        try:
+            args = tuple(split_args(self._args.get()))
+            if args:
+                new = self._opts["with_model"](args, path)
+            else:
+                new = self._opts["default_args"](path)
+            self._args.set(join_args([str(a) for a in new]))
+        except Exception:  # noqa: BLE001
+            log.exception("could not put the model into the arguments")
 
     def selected_path(self) -> str | None:
         return self._paths.get(self._choice.get())
@@ -654,7 +737,16 @@ class SettingsDialog(ctk.CTkToplevel):
         except Exception:  # noqa: BLE001
             log.exception("engine change failed")
             note = "The engine could not be changed"
-        self._msg.configure(text=str(note or ""), text_color=T.TEXT_2)
+        try:
+            if not self.winfo_exists():
+                return
+            if note is None and self._engine_var is not None:    # nothing changes: show the engine in use again
+                current = next((n for i, n in self._engine_choices if i == getattr(self._engine, "id", None)), None)
+                if current is not None:
+                    self._engine_var.set(current)
+            self._msg.configure(text=str(note or ""), text_color=T.TEXT_2)
+        except Exception:  # noqa: BLE001 - the app may have closed Settings from the callback
+            log.debug("engine row update failed", exc_info=True)
 
     def _child_alive(self) -> bool:
         try:

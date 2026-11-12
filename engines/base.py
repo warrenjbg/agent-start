@@ -436,6 +436,26 @@ class Engine:
         """Config overrides that make Settings open on a found install (not saved until the user confirms)."""
         return {}
 
+    def auto_launch(self, found: list[Any], cfg: Mapping[str, Any]) -> Any:
+        """CAP_FIND_INSTALL: the launcher to configure WITHOUT asking, when what find_installs() returned leaves
+        one clear choice; else None (the user picks in Settings). The result goes through apply_launcher and
+        plan_launch like a choice made in Settings. Never raises."""
+        return None
+
+    def launch_title(self, info: Any) -> str:
+        """What one launcher loads, in a few words (shown after an automatic set-up)."""
+        return str(getattr(info, "model_name", "") or getattr(info, "file_name", "") or "")
+
+    def launch_options(self, found: Any, cfg: Mapping[str, Any]) -> dict | None:
+        """Engines without launcher files: what Settings offers as dropdowns above the program and arguments
+        boxes, from one find_installs() result. None = no dropdowns. Keys:
+          programs      [(label, program path)]         "program_title": the row's name (e.g. "Build")
+          models        [(label, model path)]           "model_title"
+          with_model    fn(args tuple, model path) -> args tuple with that model
+          default_args  fn(model path) -> args tuple for a first set-up
+          model_of      fn(args tuple) -> the model path the arguments name, or None"""
+        return None
+
     def preferred_launcher(self, found: Any) -> str | None:
         """CAP_LAUNCHER_FILES: the launcher to preselect for a found install."""
         return None

@@ -467,6 +467,32 @@ def test_update_offer() -> None:
 
 
 # ------------------------------------------------------------------------------------------------ first start
+def test_first_start_auto(tmp: Path) -> None:
+    """One Strata install with ONE launcher: set up without a click (nothing is started)."""
+    port = U._free_port()
+    sdir = U.make_strata(tmp, "Strata-One", {"a": port})
+    found = strata_finder.Found(strata_dir=str(sdir), launchers=[str(sdir / "run-a.bat")], newest_mtime=time.time())
+    real, real_save, real_load = strata_finder.find_strata, config_store.save_config, config_store.load_config
+    strata_finder.find_strata = lambda roots=None, time_budget_s=8.0, max_depth=4, stop_evt=None: [found]
+    cfg = dict(U.CFG, strata_dir="", launcher_bat="", launch_cmd=[], launch_cwd="")
+    saved: list[dict] = []
+    config_store.save_config = lambda c, *a, **k: saved.append(dict(c))
+    config_store.load_config = lambda *a, **k: dict(cfg)
+    app, det, ep = U.new_app(cfg)
+    try:
+        app._no_finder = False
+        app._maybe_find_strata()
+        check(pump_until(app, lambda: bool(saved), 4), "one install, one launcher: saved without a click")
+        pump(app, 0.4)
+        check(bool(saved) and saved[-1].get("port") == port and os.path.normcase(str(saved[-1].get("launcher_bat")))
+              == os.path.normcase(str(sdir / "run-a.bat")), f"the launcher's own settings ({saved[-1:]})")
+        check(app.engine.is_configured(app.cfg) and "Found Strata" in status(app) and app.state_name == "IDLE"
+              and not ep.start_calls, f"configured, said so, nothing started ({status(app)!r})")
+    finally:
+        strata_finder.find_strata, config_store.save_config, config_store.load_config = real, real_save, real_load
+        close(app)
+
+
 def test_first_start_search(tmp: Path) -> None:
     pa, pb = U._free_port(), U._free_port()
     sdir = U.make_strata(tmp, "Strata-F", {"a": pa, "b": pb})
@@ -1204,7 +1230,7 @@ def run() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="as_extras_"))
     try:
         for fn, args in ((test_tool_gap, ()), (test_tray, ()), (test_update_offer, ()),
-                         (test_first_start_search, (tmp,)), (test_reopen_switch, ()),
+                         (test_first_start_auto, (tmp,)), (test_first_start_search, (tmp,)), (test_reopen_switch, ()),
                          (test_game_alert_and_tray_models, (tmp,)), (test_settings_switches, ()),
                          (test_review_fixes, ()), (test_v181_review, ()), (test_memory_trigger, ()),
                          (test_engine_without_launcher_files, (tmp,))):

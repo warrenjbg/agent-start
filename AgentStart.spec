@@ -15,7 +15,7 @@ a = Analysis(
     # The rest are plain imports PyInstaller finds itself - listed so a refactor to lazy imports cannot drop them.
     hiddenimports=["detector", "server_manager", "win32timezone", "pynvml", "version", "launcher_bat",
                    "settings_dialog", "metrics_store", "vram_sampler", "graphs",
-                   "engine_log", "ram_plan", "reopen", "tray", "updater", "update_controller", "strata_finder", "game_watch", "mem_watch", "watch_controller", "fit_check", "fit_watch", "resume_watch", "usage_history", "history_dialog", "engines", "engines.base", "engines.strata", *collect_submodules("engines"), "autostart", "toasts", "win32gui", "win32api", "win32con"],
+                   "engine_log", "ram_plan", "reopen", "tray", "updater", "update_controller", "strata_finder", "game_watch", "mem_watch", "watch_controller", "engine_profiles", "llama_finder", "fit_check", "fit_watch", "resume_watch", "usage_history", "history_dialog", "engines", "engines.base", "engines.strata", *collect_submodules("engines"), "autostart", "toasts", "win32gui", "win32api", "win32con"],
     excludes=["pytest", "unittest", "pydoc", "test", "lib2to3"],
     # PIL is needed at run time (tray.py draws the status icon). build.bat runs `AgentStart.exe --selftest` after
     # the build so a missing module in the frozen app fails the build instead of silently losing the tray.

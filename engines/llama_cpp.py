@@ -32,12 +32,14 @@ from __future__ import annotations
 import json
 import math
 import os
+from dataclasses import dataclass
 import re
 import struct
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, cast
 
 from .base import (
+    CAP_FIND_INSTALL,
     CAP_LIVE_ACTIVITY,
     CAP_LOAD_PROGRESS,
     CAP_REQUEST_HISTORY,
@@ -770,6 +772,15 @@ def judge_fit(stdout: Any, block_count: int | None) -> FitReport:
         return FitReport(None, f"llama-fit-params: could not judge the answer ({type(exc).__name__})")
 
 
+@dataclass(frozen=True)
+class FoundLlama:
+    """What llama_finder found: every build, every model file, and the suggested pair (choice.build is the best
+    build for this PC; choice.model only when there is exactly one model)."""
+    builds: tuple
+    models: tuple
+    choice: Any
+
+
 def model_label(model_id: str) -> str:
     """llama-server names a model after its -m argument, often a full path: show the file name without .gguf.
     An alias (--alias) or a repo name (org/model) is kept as it is."""
@@ -787,7 +798,7 @@ class LlamaCppEngine(Engine):
     log_prefix = "llama"
     # CAP_LIVE_ACTIVITY needs the poller's `http` seam (see metrics_poller); CAP_REQUEST_HISTORY reads the log of
     # a run this app started; CAP_LOAD_PROGRESS gives phase labels (no percentage exists in single-model mode).
-    capabilities = frozenset({CAP_LIVE_ACTIVITY, CAP_REQUEST_HISTORY, CAP_LOAD_PROGRESS})
+    capabilities = frozenset({CAP_LIVE_ACTIVITY, CAP_REQUEST_HISTORY, CAP_LOAD_PROGRESS, CAP_FIND_INSTALL})
     # No tool-call endings: finish_reason is only in the client's response and the stop causes are logged at debug
     # level only. An agent between two tool calls leaves the server idle while the tool runs, so a "turn off when
     # it's done" waits a minute of idleness (the design note's suggestion) instead of the app's few seconds.
@@ -841,6 +852,65 @@ class LlamaCppEngine(Engine):
                 return ServiceState(answered=True, is_engine=True, loaded=False)
         # something answered, but not as llama-server answers /health: not identified
         return ServiceState(answered=True, is_engine=False, loaded=None)
+
+    # ---- finding llama.cpp and models on this PC (llama_finder: bounded, read-only)
+    def find_installs(self, stop_evt: Any = None) -> list[Any]:
+        """One FoundLlama (the builds, the model files and the suggested pair), or [] when no build was found."""
+        import llama_finder
+        builds, models = llama_finder.find_all(stop_evt=stop_evt)
+        if not builds:
+            return []
+        choice = llama_finder.choose(builds, models, llama_finder.has_nvidia())
+        return [FoundLlama(tuple(builds), tuple(models), choice)]
+
+    def install_dir_of(self, found: Any) -> str:
+        build = getattr(getattr(found, "choice", None), "build", None)
+        return str(getattr(build, "folder", "") or "")
+
+    def install_settings(self, found: Any) -> dict:
+        """Settings opens with the best build in the program box (nothing is saved until the user saves)."""
+        build = getattr(getattr(found, "choice", None), "build", None)
+        return {"launch_cmd": [build.program]} if build is not None else {}
+
+    def auto_launch(self, found: list[Any], cfg: Mapping[str, Any]) -> Any:
+        """A build and exactly one model: `-m <model> --port 9931`, nothing else. Several models: the user picks."""
+        try:
+            import llama_finder
+            choice = getattr(found[0], "choice", None) if len(found) == 1 else None
+            if choice is None or not choice.clear or choice.build is None or choice.model is None:
+                return None
+            return CommandLaunch(program=choice.build.program,
+                                 args=llama_finder.default_args(choice.model.path, DEFAULT_PORT))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def launch_title(self, info: Any) -> str:
+        m = _last_value([str(a) for a in getattr(info, "args", ())], _MODEL_PATH_FLAGS)
+        return model_label(m.strip('"')) if m else super().launch_title(info)
+
+    def launch_options(self, found: Any, cfg: Mapping[str, Any]) -> dict | None:
+        try:
+            import llama_finder
+            builds, models = list(getattr(found, "builds", ())), list(getattr(found, "models", ()))
+            if not builds and not models:
+                return None
+
+            def model_of(args: Any) -> str | None:
+                m = _last_value([str(a) for a in args], _MODEL_PATH_FLAGS)
+                return m.strip('"') if m else None
+
+            return {
+                "program_title": "Build", "model_title": "Model",
+                "programs": list(zip(llama_finder.unique_labels(builds, llama_finder.build_label),
+                                     [b.program for b in builds])),
+                "models": list(zip(llama_finder.unique_labels(models, llama_finder.model_label),
+                                   [m.path for m in models])),
+                "with_model": llama_finder.with_model,
+                "default_args": lambda model: llama_finder.default_args(model, DEFAULT_PORT),
+                "model_of": model_of,
+            }
+        except Exception:  # noqa: BLE001
+            return None
 
     def fetch_model_id(self, http: Http, state: ServiceState) -> str | None:
         """As the default, but a model named after its file path is shown by its file name."""
@@ -1023,7 +1093,7 @@ class LlamaCppEngine(Engine):
             return FitReport(None, f"llama-fit-params: could not judge the answer ({type(exc).__name__})")
 
     # ------------------------------------------------------------------ UI features
-    setup_hint = "Open Settings (gear) and choose llama-server.exe"
+    setup_hint = "Open Settings (gear) and choose llama-server.exe and a model"
     launcher_kind = "llama-server.exe"
     launcher_pick_text = "Choose llama-server.exe."
     program_filetypes = (("llama-server", SERVER_EXE), ("Programs", "*.exe"), ("All files", "*.*"))
