@@ -25,7 +25,11 @@ That is all: the registry imports every module in `engines/` and registers each 
 `detector.py`, `main.py` or the dialogs needs to change. The engine is the `backend` key in `config.json`.
 
 Settings shows an **Engine** row once two or more engines are installed (now: Strata and llama.cpp). Choosing an
-engine there saves `backend`; the choice takes effect after Agent Start restarts.
+engine there asks once, turns the running engine off (the normal Turn off), parks its launch settings under
+`engine_profiles` (`engine_profiles.py`), saves `backend` and restarts Agent Start. An engine with
+`CAP_FIND_INSTALL` is searched for after the switch: `auto_launch()` returns a launcher when there is one clear
+choice (it is saved like a choice made in Settings), and `launch_options()` gives Settings its dropdowns for
+engines without launcher files.
 
 Not yet proven on a frozen build: the package-wide collection in the spec and the registry's discovery inside the
 packaged app. The first build after this change must run `--selftest`.

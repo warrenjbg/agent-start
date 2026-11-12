@@ -118,8 +118,9 @@ script); the Settings dialog and the log show the same number.
 
 ## Settings (⚙)
 
-- **Engine** — *Strata* or *llama.cpp* (see [Engines](#engines)). Choosing another engine saves `backend` in
-  `config.json` and takes effect after Agent Start restarts.
+- **Engine** — *Strata* or *llama.cpp* (see [Engines](#engines)). Choosing another engine asks once, then
+  Agent Start restarts into it. If the current engine is running it is turned off first (the normal Turn off,
+  which asks while a reply runs); say no there and nothing changes.
 - **Strata launcher** (with llama.cpp: a program box and an arguments box, see [Engines](#engines)) — a dropdown
   of every `run-*.bat` in the Strata folder (other `.bat` files such as
   `SETUP.bat` are not listed) plus **Browse…** for a `.bat` anywhere. The line below shows what that launcher
@@ -159,10 +160,18 @@ Agent Start runs one model server, the engine. There are two:
 
 To use llama.cpp:
 
-1. Settings (⚙) → **Engine** → *llama.cpp*. This saves `backend` in `config.json`; it takes effect after Agent
-   Start restarts.
-2. Settings then shows a program box and an arguments box instead of the launcher list. Pick `llama-server.exe`
-   (*Browse…*) and type its arguments, e.g. `-m C:\models\model.gguf --port 9931`.
+1. Settings (⚙) → **Engine** → *llama.cpp*, and confirm. Agent Start restarts into llama.cpp.
+2. It then looks for llama.cpp and for model files on this PC (a few seconds, read-only):
+   - builds: the winget package, folders on `PATH`, and `llama-server.exe` next to `llama.dll` / `ggml.dll` in
+     Downloads, Desktop, Documents, your home folder and near drive roots;
+   - models: `.gguf` files of 100 MB or more in those places, llama.cpp's own cache, the Hugging Face cache and LM
+     Studio's models folder (vision projectors and later parts of split files are left out).
+   With one model found it sets itself up (`-m <model> --port 9931`, the best build) and says so; nothing is
+   started. With several models, or none, Turn on opens Settings.
+3. Settings shows **Build** and **Model** dropdowns with what was found, above a program box and an arguments box.
+   On an NVIDIA card the CUDA build comes first. Picking a model writes it into the arguments and keeps the rest;
+   you can also *Browse…* for `llama-server.exe` and type the arguments yourself, e.g.
+   `-m C:\models\model.gguf --port 9931`.
    - An explicit `--port N` is required (with a space; `--port=N` is refused). llama-server's own default port is
      9931; Agent Start does not rely on it.
    - A model is required: `-m <file.gguf>` or `-hf <user>/<model>`. Router mode (no model) is not supported, and
@@ -180,7 +189,7 @@ To use llama.cpp:
 | Turn off | Ends `llama-server.exe` and its console host (and `llama-connect.exe` from the same folder, if `--connect` started one); nothing else |
 | App sweep | Never offers `llama-server.exe` or anything in its folder for closing |
 | Dashboard link | *Open llama.cpp dashboard* opens llama-server's own web page on `/` (not with `--no-ui`) |
-| Not available | Unloading without ending the process, a load percentage, tool-call awareness, the full-RAM / low-RAM plan, the Switch model button, the first-start search for an install |
+| Not available | Unloading without ending the process, a load percentage, tool-call awareness, the full-RAM / low-RAM plan, the Switch model button |
 
 Tested on one PC with llama.cpp build b12314 (the winget build and the CUDA build from llama.cpp's GitHub
 releases). Not tested yet: setups with `--api-key`, other builds.
@@ -205,8 +214,11 @@ runs partly on the CPU and is much slower.
 The four limits are `fit_watch_*` in `config.json`. They were set from a few runs of one 27B model on one 16 GB
 card, so treat them as a starting point. Strata is not checked: it manages its own memory plan.
 
-**Switching back to Strata:** Strata refuses a launch command that is not a python interpreter. If the start
-fails after switching back, re-select the `run-*.bat` in Settings.
+**Switching back and forth:** each engine keeps its own launch settings (program or launcher, port, model) in
+`config.json` under `engine_profiles`, so switching back restores them. A `config.json` from 1.11.0 that still
+has the other engine's command is sorted out at the next start. An engine that was never set up looks for its
+install after the switch: Strata sets itself up when it finds one install with one `run-*.bat`, otherwise it
+offers what it found as before.
 
 How the engines plug in: `docs/engines.md`; the llama.cpp module: `docs/llama_server_design.md`.
 
@@ -295,6 +307,7 @@ started*, then *Reopened 3 apps*.
 | `user_whitelist` | Edited by the ⚙ dialog |
 | `backend` | The inference engine: `strata` (default; a missing or unknown value means `strata`) or `llama_cpp`. Set by the Engine row in Settings. See [Engines](#engines) and `docs/engines.md` |
 | `fit_watch_vram_pct`, `fit_watch_cpu_pct`, `fit_watch_sustain_s`, `fit_watch_clear_s` | llama.cpp only, the live GPU-fit check: video memory at least this full (90) and the server at least this share of all CPU cores (25) for this many seconds of generating (8) shows the warning; this many seconds without it (20) clears it |
+| `engine_profiles` | Written by the app: the launch settings of the engine that is not in use (`launch_cmd`, `launch_cwd`, `launcher_bat`, `strata_dir`, `model_name`, `endpoint_url`, `port`, `api_key`), restored when you switch back |
 | `api_key` | llama.cpp only: the first `--api-key` from the arguments, saved by Settings; sent as a Bearer header only after the port identified itself as llama-server |
 | `mem_watch_app_mb`, `mem_watch_sustain_s` | Memory-pressure check: an app's memory that counts as large (4096), and how long both conditions must hold (15) |
 | `mem_watch_evict_pct`, `mem_watch_evict_sustain_s`, `mem_watch_evict_app_mb` | Pushed-out check: Strata's memory in RAM below this share of its peak (50) for this long (6), and the smallest new app that is named as the cause, in MB (512) |
@@ -365,6 +378,10 @@ notification area on a runner). *Local* suites open the real window and take scr
 | `tests\test_fit_check.py` | CI | The pre-check runner: only `llama-fit-params.exe` next to the engine program is ever run, windowless, time-limited |
 | `tests\test_fit_watch.py` | CI | The live GPU-fit rule (pure): sustain and clear windows, gaps, missing figures |
 | `tests\test_gpu_fit_ui.py` | Local | The GPU-fit warning in the app window (opens one window), fakes only |
+| `tests\test_llama_finder.py` | CI | The search for llama.cpp builds and model files, on made-up folders: what counts, what is skipped, ranking, limits |
+| `tests\test_engine_profiles.py` | CI | Per-engine launch settings: parked on a switch, restored on the way back, a 1.11.0 config sorted out |
+| `tests\test_engine_switch.py` | Local | Engine switch in the app window: the question, Turn off first, saved only then, restart (opens windows) |
+| `tests\test_engine_find.py` | Local | After a switch: automatic set-up with one clear choice, else Build / Model dropdowns (opens windows) |
 | `tests\test_llama_cpp.py` | CI | The llama.cpp engine on fakes only (nothing started or contacted): identity, launch checks and Save, `/health` and `/slots`, log parsing, load phases, the GPU-fit pre-check arguments, and stop/adopt through the real supervisor |
 | `tests\test_metrics_sample.py` | CI | Engine-neutral metrics samples: the Strata converter, old-vs-new store equivalence, a non-Strata sample, the Strata poller with fake fetchers |
 | `tests\test_usage_history.py` | CI | Usage history store: per-day / per-model totals, local midnight, each request counted once (also across an app restart), token-weighted speed, time served, atomic writes, corrupt or unreadable `usage.json`, dropping old days, threads; temp files only |
