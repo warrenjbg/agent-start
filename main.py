@@ -85,7 +85,11 @@ STATE_SAVE_DEBOUNCE_MS = 300
 REOPEN_STAGGER_S = 1.0                   # pause between two reopened apps
 IDLE_GRACE_S = 6.0                       # "when it's done": stop after the model has been idle this long (an agent
                                          # usually sends its next request within a few seconds of a tool call)
-GAME_ALERT_CLICK_S = 90.0                # a click on the game balloon turns Strata off only this soon after it
+GAME_STOP_METRICS_FAILS = 5              # a game stop runs anyway after this many failed /metrics polls
+GAME_ALERT_VALID_S = 1800.0              # the "Turn off Strata" button of a game toast works this long after it
+GAME_ACTIONS = ("off", "ask", "none")    # Settings "When a game starts": turn Strata off / ask / do nothing
+GAME_ACTION_LABELS = {"off": "Turn Strata off", "ask": "Ask me", "none": "Do nothing"}
+PROTOCOL = "agentstart"                  # agentstart://game-off (toast button; registered by the installer)
 TOOL_WAIT_S = 600.0                      # after a request that ended in a tool call the agent comes back with the tool's
                                          # result; "when it's done" waits up to this long for that next request
 SWITCH_GLYPH = "\uE8AB"                  # Segoe Fluent Icons "Switch"
@@ -207,14 +211,42 @@ def _cleanup_updates_worker(current: str) -> None:
         log.debug("update cleanup failed", exc_info=True)
 
 
-def _toast_worker(title: str, msg: str) -> None:
+def _toast_worker(title: str, msg: str, buttons: list[tuple[str, str]] | None = None) -> None:
+    """A Windows toast. buttons: (label, protocol URL), e.g. agentstart://game-off. toasts.py keeps every text as
+    data (a game folder named $(...) must not run PowerShell)."""
     try:
-        from winotify import Notification
+        import toasts
         icon = config_store.APP_DIR / "assets" / "app.png"
         app_id = "warrenjbg.AgentStart" if config_store.FROZEN else APP_TITLE
-        Notification(app_id=app_id, title=title, msg=msg, icon=str(icon) if icon.exists() else "").show()
+        toasts.show(title, msg, app_id, icon=str(icon) if icon.exists() else "", buttons=buttons)
     except Exception:  # noqa: BLE001
         log.debug("toast failed", exc_info=True)
+
+
+def _protocol_registered() -> bool:
+    """agentstart:// opens THIS exe (installer-registered): only then does a toast button work."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\agentstart\shell\open\command") as k:
+            cmd = str(winreg.QueryValueEx(k, "")[0])
+        return os.path.normcase(os.path.abspath(sys.executable)) in os.path.normcase(cmd)
+    except OSError:
+        return False
+
+
+def parse_protocol(argv: list[str]) -> str | None:
+    """The action of an agentstart:// argument: 'game-off', 'show' (any other agentstart: URL), or None."""
+    from urllib.parse import urlsplit
+    for a in argv:
+        if not str(a).lower().startswith(PROTOCOL + ":"):
+            continue
+        try:
+            u = urlsplit(str(a))
+        except ValueError:
+            return "show"
+        verb = (u.netloc or u.path.lstrip("/")).strip("/").lower()
+        return "game-off" if u.scheme.lower() == PROTOCOL and verb == "game-off" and not u.query else "show"
+    return None
 
 
 def _refresh_autostart_worker(exe: str) -> None:
@@ -382,14 +414,19 @@ class AgentStartApp(ctk.CTk):
         self._extras = bool(extras)
         self._tray_pref = saved.get("tray_enabled", True) is not False          # Settings switches (state.json)
         self._update_pref = saved.get("update_check", True) is not False
-        self._game_pref = saved.get("game_alert", True) is not False
+        ga = saved.get("game_action")
+        if ga not in GAME_ACTIONS:               # v1.8.0 had an on/off switch ("game_alert")
+            ga = "none" if saved.get("game_alert") is False else "off"
+        self._game_action = ga
+        self._game_pref = ga != "none"
         self._no_tray = not extras or not self._tray_pref
         self._no_finder = not extras
         # the updater replaces the installed app: only offered by the packaged build, not when run from source
         self._no_update_check = not extras or not config_store.FROZEN or not self._update_pref
         self.games = None                        # game_watch.GameWatcher (extras only)
         self._games_armed = False
-        self._game_alert: tuple[float, int] | None = None   # (monotonic, start token) of the last game balloon
+        self._game_alert: tuple | None = None    # (monotonic, start token, title) of the last "Ask me" game toast
+        self._last_stop_game: str | None = None  # title of the game the running stop is for
         self._game_queued: tuple[str, float] | None = None  # a game started while Strata was still loading
         self._skip_reopen_once = False           # Turn off from the game alert: offer the closed apps, don't relaunch
         self._stop_toast: tuple[str, str] | None = None     # wording for the next stop's toast (safe Turn off)
@@ -641,9 +678,7 @@ class AgentStartApp(ctk.CTk):
         # watch from Turn on (a game started during the load alerts once Strata is ready)
         self._arm_games(st in (STARTING, ACTIVE))
         if st == ACTIVE and self.loaded is not False and self._game_queued is not None:
-            title, ram = self._game_queued
-            self._game_queued = None
-            self._on_game_started(title, ram)
+            self.after_idle(self._deliver_queued_game)
         if st == ACTIVE:
             if self._ready_mono is None:
                 self._ready_mono = time.monotonic()      # adopted servers: uptime counts from when we saw it
@@ -1047,6 +1082,10 @@ class AgentStartApp(ctk.CTk):
         if st != ACTIVE:
             self._stop_pending, self._idle_since = None, None
             self._tool_wait, self._req_phase, self._was_busy = None, None, False
+        if st == STARTING or (st == ACTIVE and getattr(self, "state_name", None) in (IDLE, ERROR)):
+            # a new Strata session: nothing of an earlier stop's wording / reopen choice may leak into it
+            self._skip_reopen_once, self._stop_toast, self._last_stop_game = False, None, None
+            self._game_alert = None
         self.state_name = st
         self._state_seq += 1
         self._note_until = 0.0                   # a note belongs to the state it was shown in
@@ -1601,6 +1640,7 @@ class AgentStartApp(ctk.CTk):
             self._update_telemetry()
             self._request_preview()
             self._sync_tray()
+            self._deliver_queued_game()          # a game that started while a dialog / box was open
             if self.tray is None and not self._no_tray and time.monotonic() < self._tray_retry_until:
                 self._start_tray()               # the icon failed at start: try again (every tick, ~5 s)
             self._maybe_check_update()
@@ -1916,6 +1956,7 @@ class AgentStartApp(ctk.CTk):
         if not self.endpoint.stop_endpoint(lambda r: self.post(self.on_stopped, r), force=force):
             log.info("stop_endpoint returned False; reconciling")
             self._switching = False              # no stop happened: a model switch must not restart Strata later
+            self._skip_reopen_once, self._last_stop_game = False, None
             self._reconcile_now()
 
     # ------------------------------------------------------------------ safe stop (busy model) + model switch
@@ -1946,6 +1987,7 @@ class AgentStartApp(ctk.CTk):
         if self._stop_pending is None:
             return
         self._stop_pending, self._idle_since = None, None
+        self._skip_reopen_once, self._stop_toast = False, None
         log.info("pending stop cancelled")
         self._apply_state()                      # the line goes, the toggle reads "Turn off" again
 
@@ -1992,7 +2034,15 @@ class AgentStartApp(ctk.CTk):
     def _check_pending_stop(self, data_ok: bool) -> None:
         """Every /metrics poll while a stop waits: run it once the model has been idle for IDLE_GRACE_S after a
         request that ended in an answer (not a tool call)."""
-        if self._stop_pending is None or not data_ok:
+        if self._stop_pending is None:
+            return
+        if not data_ok:
+            # Strata not answering /metrics (often: a game just pushed it into swap): a game stop must not wait
+            # forever for an idle signal that cannot come
+            info = self._stop_pending[1]
+            if isinstance(info, dict) and info.get("game") and self._metrics_fails >= GAME_STOP_METRICS_FAILS:
+                log.info("game stop: /metrics not answering; stopping now")
+                self._run_pending(force=False)
             return
         if self._busy_activity() is not None:
             self._idle_since = None              # busy (again) / the agent is running a tool: keep waiting
@@ -2001,15 +2051,22 @@ class AgentStartApp(ctk.CTk):
         if self._idle_since is None:
             self._idle_since = now
         elif now - self._idle_since >= IDLE_GRACE_S:
-            if self._stop_pending is not None and self._stop_pending[0] == "off":
+            if self._stop_pending is not None and self._stop_pending[0] == "off" and self._stop_toast is None:
                 # the toast says why it stopped now (the window may be hidden in the tray)
                 self._stop_toast = ("Strata turned off", "Turned off after the reply finished · freed {freed}.")
             self._run_pending(force=False)
 
     def _run_pending(self, force: bool) -> None:
         action, self._stop_pending, self._idle_since = self._stop_pending, None, None
-        if action is not None:
-            self._execute(action, force=force)
+        if action is None:
+            return
+        game = action[1].get("game") if action[0] == "off" and isinstance(action[1], dict) else None
+        if game:                                 # a stop because a game started: say so, don't relaunch over it
+            self._skip_reopen_once, self._last_stop_game = True, game
+            closed = bool(reopen.load_pending())
+            self._stop_toast = ("Strata turned off", f"{_short(game, 40)} started · freed {{freed}} for it."
+                                + (" The apps closed for Strata are in Agent Start (Reopen)." if closed else ""))
+        self._execute(("off", None) if game else action, force=force)
 
     def _execute(self, action: tuple[str, Any], force: bool) -> None:
         kind, info = action
@@ -2123,6 +2180,15 @@ class AgentStartApp(ctk.CTk):
 
     def _on_stopped(self, result: dict) -> None:
         if not result.get("ok") and result.get("unload") == "busy":
+            game, self._last_stop_game = self._last_stop_game, None
+            if game and not self._exit_pending:  # a request arrived just now: wait for it, no box over the game
+                self._skip_reopen_once = False
+                self._set_state(ACTIVE)
+                self._stop_pending, self._idle_since = ("off", {"game": game}), None
+                log.info("game stop: the model got busy again; waiting for it")
+                self._apply_state()
+                return
+            self._skip_reopen_once = False
             if self._ask(messagebox.askyesno, "Model is mid-turn — force stop?"):
                 self.turn_off(force=True)
             else:
@@ -2130,6 +2196,7 @@ class AgentStartApp(ctk.CTk):
                 self._switching = False
                 self._set_state(ACTIVE)
             return
+        self._last_stop_game = None
         if not (result.get("port_released") or result.get("cancelled_start")):
             self._switching = False
         if result.get("cancelled_start") and not (result.get("ok") or result.get("port_released")):
@@ -2196,8 +2263,7 @@ class AgentStartApp(ctk.CTk):
             t = tray_mod.TrayIcon(APP_TITLE, icon, on_open=lambda: post(self.show_window),
                                   on_toggle=lambda: post(self._tray_toggle), on_quit=lambda: post(self.quit_app),
                                   on_lost=lambda: post(self._tray_lost),
-                                  on_switch=lambda key: post(self._tray_switch, key),
-                                  on_balloon_click=lambda key=None: post(self._balloon_clicked, key))
+                                  on_switch=lambda key: post(self._tray_switch, key))
             self.tray = t                          # X keeps quitting until the icon is really there (is_running)
             t.start_async(lambda ok: post(self._tray_started, t, ok))
         except Exception:  # noqa: BLE001
@@ -2301,12 +2367,9 @@ class AgentStartApp(ctk.CTk):
         self._save_state_later("update_checked_at", self._update_checked_at)
         if new is not None and new.version != known:
             log.info("update available: %s", new.version)
-            if self.tray is not None:
-                try:
-                    self.tray.notify(APP_TITLE, f"Version {new.version} is available. Install it from Settings, "
-                                                f"or click the update line while Strata is off.")
-                except Exception:  # noqa: BLE001
-                    pass
+            self._run_worker("hc-toast", _toast_worker, APP_TITLE,
+                             f"Version {new.version} is available. Install it from Settings, or click the update "
+                             f"line while Strata is off.")
         self._request_preview()
 
     def install_update(self) -> None:
@@ -2413,15 +2476,51 @@ class AgentStartApp(ctk.CTk):
             return
         self.switch_model(bat_path)
 
-    def _balloon_clicked(self, key: str | None) -> None:
-        self.show_window()
-        alert, self._game_alert = self._game_alert, None
-        fresh = alert is not None and time.monotonic() - alert[0] < GAME_ALERT_CLICK_S and alert[1] == self._start_token
-        if key == "game" and fresh and self.state_name == ACTIVE and self._stop_pending is None \
-                and not self._dialog_open() and not self._box_open and not self._updating:
-            self._skip_reopen_once = True            # don't relaunch apps over the game; they stay a one-click offer
-            self.request_stop(("off", None))         # asks first if a reply / an agent's tool call is running
-        # an old balloon / notification-centre entry only opens the window
+    def game_off_requested(self) -> None:
+        """The game toast's "Turn off Strata" button (agentstart://game-off, via a second launch). Only for the alert
+        of this serving session and within GAME_ALERT_VALID_S - an old notification-centre entry only opens the
+        window."""
+        alert = self._game_alert
+        fresh = alert is not None and time.monotonic() - alert[0] < GAME_ALERT_VALID_S and alert[1] == self._start_token
+        if not fresh or self.state_name != ACTIVE:
+            log.info("game toast button: %s; opening the window", "stale" if alert else "no alert")
+            self.show_window()
+            return
+        if self._game_blocked():
+            self.show_window()                   # a question is open: answer it; the button works again after
+            return
+        self._game_alert = None
+        self._stop_for_game(alert[2])
+
+    def _game_blocked(self) -> bool:
+        return self._box_open or self._updating or self._dialog_open()
+
+    def _stop_for_game(self, title: str) -> None:
+        """Safe Turn off because a game started: the current reply (or an agent's tool call) finishes first, no
+        dialog (the user is in the game); the closed apps become a one-click Reopen instead of starting over it.
+        The game rides in the pending action, so nothing of it outlives that action."""
+        if self.state_name != ACTIVE:
+            return
+        if self._game_blocked():
+            self._game_queued = (title, 0.0)     # retried from the tick once the dialog / box / update is gone
+            return
+        if self._stop_pending is not None:
+            if self._stop_pending == ("off", None):
+                self._stop_pending = ("off", {"game": title})   # the user's own "when it's done" stop: don't reopen
+            return                               # a pending model switch is the user's explicit choice
+        self._stop_pending, self._idle_since = ("off", {"game": title}), None
+        log.info("game started (%s): turning Strata off when the model is idle", title)
+        if self._metrics_fails:                  # no idle signal to wait for
+            self._run_pending(force=False)
+            return
+        self._apply_state()
+
+    def _deliver_queued_game(self) -> None:
+        if self._game_queued is None or self.state_name != ACTIVE or self.loaded is False or self._game_blocked():
+            return
+        title, ram = self._game_queued
+        self._game_queued = None
+        self._on_game_started(title, ram)
 
     # ------------------------------------------------------------------ game launch alert
     def _start_game_watch(self) -> None:
@@ -2458,24 +2557,35 @@ class AgentStartApp(ctk.CTk):
     def _on_game_started(self, title: str, ram_mb: float = 0.0) -> None:
         if not self._game_pref or self._destroyed:
             return
+        if self.state_name == STARTING and self._start_phase == "server" and self._game_action == "off" \
+                and not self._exit_pending:
+            log.info("game started during the load (%s): cancelling the start", title)
+            self._run_worker("hc-toast", _toast_worker, "Strata start cancelled",
+                             f"{_short(title, 40)} started, so Strata stopped loading and left the memory to it.")
+            self.cancel_start()
+            return
         if self.state_name == STARTING or (self.state_name == ACTIVE and self.loaded is False):
             self._game_queued = (title, ram_mb)  # tell once Strata is ready
             return
         if self.state_name != ACTIVE:
             return
-        self._game_alert = (time.monotonic(), self._start_token)
+        if self._game_blocked():
+            self._game_queued = (title, ram_mb)
+            return
         strata = self._mem[2] if getattr(self, "_mem", None) and self._mem[2] else None
         free = f"~{strata / 1024:.0f} GB" if strata else "its memory"
-        log.info("game started while serving: %s", title)
-        msg = f"{_short(title, 40)} started while Strata is running. Click to turn Strata off and free {free}."
-        if self.tray is not None and getattr(self.tray, "is_running", False):
-            try:
-                self.tray.notify("Game started", msg, key="game")
-                return
-            except Exception:  # noqa: BLE001
-                log.debug("tray notify failed", exc_info=True)
+        log.info("game started while serving: %s (action: %s)", title, self._game_action)
+        if self._game_action == "off":
+            self._stop_for_game(title)           # the stop's own toast says why
+            return
+        # ask: a real Windows toast (tray balloons are not shown on Windows 11, and during a full-screen game toasts
+        # wait in the notification centre) with a button that works from there
+        self._game_alert = (time.monotonic(), self._start_token, title)
+        buttons = [("Turn off Strata", f"{PROTOCOL}://game-off")] if config_store.FROZEN and _protocol_registered() \
+            else []
         self._run_worker("hc-toast", _toast_worker, "Game started",
-                         f"{_short(title, 40)} started while Strata is running. Open Agent Start to turn it off.")
+                         f"{_short(title, 40)} started while Strata is running ({free})."
+                         + ("" if buttons else " Open Agent Start to turn it off."), buttons)
 
     # ------------------------------------------------------------------ settings switches
     def set_tray_pref(self, on: bool) -> bool:
@@ -2507,9 +2617,15 @@ class AgentStartApp(ctk.CTk):
         log.info("daily update check: %s", "on" if on else "off")
         return True
 
-    def set_game_pref(self, on: bool) -> bool:
+    def set_game_action(self, action: str) -> bool:
+        if action not in GAME_ACTIONS:
+            action = {v: k for k, v in GAME_ACTION_LABELS.items()}.get(action, "off")
+        self._game_action = action
+        self._save_state_later("game_action", action)
+        return self.set_game_pref(action != "none", save=False)
+
+    def set_game_pref(self, on: bool, save: bool = False) -> bool:
         self._game_pref = bool(on)
-        self._save_state_later("game_alert", self._game_pref)
         self._arm_games(self.state_name in (STARTING, ACTIVE))
         log.info("game launch alert: %s", "on" if on else "off")
         return True
@@ -2544,8 +2660,9 @@ class AgentStartApp(ctk.CTk):
             {"key": "autostart", "label": "Start with Windows (in the tray)" if frozen
              else "Start with Windows (installed app only)", "value": auto_on,
              "on_change": self.set_autostart_pref, "enabled": frozen and self._extras},
-            {"key": "games", "label": "Tell me when a game starts while Strata runs", "value": self._game_pref,
-             "on_change": self.set_game_pref, "enabled": self._extras},
+            {"key": "games", "label": "When a game starts", "choices": [GAME_ACTION_LABELS[a] for a in GAME_ACTIONS],
+             "value": GAME_ACTION_LABELS[self._game_action], "on_change": self.set_game_action,
+             "enabled": self._extras},
             {"key": "updates", "label": "Check for updates daily" if frozen
              else "Check for updates daily (installed app only)", "value": self._update_pref,
              "on_change": self.set_update_pref, "enabled": frozen and self._extras},
@@ -2649,10 +2766,8 @@ class AgentStartApp(ctk.CTk):
         if not self._tray_hint_shown:
             self._tray_hint_shown = True
             self._save_state_later("tray_hint_shown", True)
-            try:
-                self.tray.notify(APP_TITLE, "Still running in the tray. Right-click the icon for Turn off and Quit.")
-            except Exception:  # noqa: BLE001
-                log.debug("tray notify failed", exc_info=True)
+            self._run_worker("hc-toast", _toast_worker, APP_TITLE,
+                             "Still running in the tray. Right-click the icon for Turn off and Quit.")
 
     def show_window(self) -> None:
         try:
@@ -2824,7 +2939,9 @@ def _check_config() -> None:
         APP_TITLE, 0x30)
 
 
+_EVENTS: list = []                               # the named events below, created right after the mutex
 SHOW_EVENT = "AgentStart.Show"                   # a second launch sets it: the running app shows its window
+GAME_OFF_EVENT = "AgentStart.GameOff"            # agentstart://game-off (toast button): turn Strata off for a game
 
 
 def _selftest() -> int:
@@ -2834,6 +2951,7 @@ def _selftest() -> int:
         import PIL.Image  # noqa: F401
         import autostart  # noqa: F401
         import game_watch  # noqa: F401
+        import toasts  # noqa: F401
         import strata_finder  # noqa: F401
         import tray
         import updater  # noqa: F401
@@ -2850,18 +2968,35 @@ def _selftest() -> int:
         return 2
 
 
+def _instance_running() -> bool:
+    import win32api
+    import win32event
+    try:
+        h = win32event.OpenMutex(win32event.SYNCHRONIZE, False, "AgentStart.Singleton")
+        win32api.CloseHandle(h)
+        return True
+    except Exception:  # noqa: BLE001 - ERROR_FILE_NOT_FOUND: no instance
+        return False
+
+
 def _watch_show_event(app: "AgentStartApp") -> None:
     """Daemon thread: a second launch (Start menu, desktop shortcut) sets SHOW_EVENT; bring this window back, also
     from the tray (FindWindow + ShowWindow from outside would leave Tk thinking it is still withdrawn)."""
     import win32event
     try:
         ev = win32event.CreateEvent(None, False, False, SHOW_EVENT)
+        game = win32event.CreateEvent(None, False, False, GAME_OFF_EVENT)
     except Exception:  # noqa: BLE001
         log.debug("show event unavailable", exc_info=True)
         return
     while not app._destroyed:
-        if win32event.WaitForSingleObject(ev, 1000) == win32event.WAIT_OBJECT_0 and not app._destroyed:
+        r = win32event.WaitForMultipleObjects([ev, game], False, 1000)
+        if app._destroyed:
+            break
+        if r == win32event.WAIT_OBJECT_0:
             app.post(app.show_window)
+        elif r == win32event.WAIT_OBJECT_0 + 1:
+            app.post(app.game_off_requested)
 
 
 def main() -> None:
@@ -2872,18 +3007,24 @@ def main() -> None:
     import win32event
     import winerror
 
+    if parse_protocol(sys.argv[1:]) is not None and not _instance_running():
+        sys.exit(0)                                  # a toast button after Quit: nothing to turn off, open nothing
     _SINGLETON_MUTEX = win32event.CreateMutex(None, False, "AgentStart.Singleton")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         if "--tray" in sys.argv:                     # a second autostart launch: nothing to show
             sys.exit(0)
+        action = parse_protocol(sys.argv[1:])
         try:                                         # the running app shows itself (also when hidden in the tray)
-            ev = win32event.OpenEvent(win32event.EVENT_MODIFY_STATE, False, SHOW_EVENT)
+            name = GAME_OFF_EVENT if action == "game-off" else SHOW_EVENT
+            ev = win32event.OpenEvent(win32event.EVENT_MODIFY_STATE, False, name)
             win32event.SetEvent(ev)
             sys.exit(0)
         except SystemExit:
             raise
-        except Exception:  # noqa: BLE001          # an older version is running: the old way
-            pass
+        except Exception:  # noqa: BLE001          # an older version is running / still starting: the old way
+            if action is not None:
+                sys.exit(0)                          # a toast-button URL never pops windows or boxes
+
         user32 = ctypes.windll.user32
         # class + title: an Explorer window of a folder called "Agent Start" has the same title
         hwnd = user32.FindWindowW("TkTopLevel", APP_TITLE)
@@ -2893,6 +3034,12 @@ def main() -> None:
         else:
             user32.MessageBoxW(None, "Agent Start is already running.", APP_TITLE, 0x40)
         sys.exit(0)
+    global _EVENTS
+    try:      # before the window exists: a second launch during our start-up must find them (else it shows a box)
+        _EVENTS = [win32event.CreateEvent(None, False, False, SHOW_EVENT),
+                   win32event.CreateEvent(None, False, False, GAME_OFF_EVENT)]
+    except Exception:  # noqa: BLE001
+        _EVENTS = []
     _setup_logging()
     _check_config()
     try:  # own taskbar identity/icon instead of grouping under python(w).exe

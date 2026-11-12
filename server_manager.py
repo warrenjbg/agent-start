@@ -1007,14 +1007,13 @@ class EndpointManager:
             except Exception:  # noqa: BLE001
                 pass
         try:
-            from winotify import Notification
+            import toasts                         # data-only toasts (winotify pasted text into PowerShell)
             icon = config_store.APP_DIR / "assets" / "app.png"
             # Installed build: the Start-menu shortcut carries this AUMID, so the toast shows the app's
             # name + icon. From source there is no shortcut, so use a plain display name.
             app_id = "warrenjbg.AgentStart" if config_store.FROZEN else "Agent Start"
-            Notification(app_id=app_id, title=title, msg=msg,
-                         icon=str(icon) if icon.exists() else "").show()
-            self.last_toast = msg
+            if toasts.show(title, msg, app_id, icon=str(icon) if icon.exists() else ""):
+                self.last_toast = msg
         except Exception:  # noqa: BLE001 - toast failure is non-fatal
             log.exception("toast failed")
 

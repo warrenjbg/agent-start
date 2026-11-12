@@ -40,11 +40,14 @@ Turn the tray off in Settings and X quits as before.
 if the tray is off). It is a normal per-user startup entry: Task Manager → Startup apps shows it, and the uninstaller
 removes it.
 
-**Game alert:** while Strata serves, starting a game (anything in your game folders: Steam, Epic, Riot, Xbox, GOG,
-Battle.net) shows a notification: *ELDEN RING started while Strata is running · Click to turn Strata off*. Clicking it
-within ~90 s turns Strata off (asking first if a reply is running); the apps closed for Strata are then offered as a
-one-click Reopen instead of starting over your game. Launchers, SteamVR and redistributable installers don't count.
-Off in Settings if you don't want it.
+**When a game starts** (Settings; default *Turn Strata off*): while Strata serves, starting a game from your game
+folders (Steam, Epic, Riot, Xbox, GOG, Battle.net) turns Strata off the safe way: a running reply or an agent's tool
+call finishes first, no dialog appears over the game, and the apps closed for Strata wait as a one-click Reopen
+instead of starting over it. A toast then says *ELDEN RING started · freed 49 GB for it*. A game started while
+Strata is still loading cancels the load. *Ask me* shows a toast with a **Turn off Strata** button instead (it also
+works from the notification centre after you alt-tab, for 30 min, for that Strata session only); *Do nothing* turns
+it off. Launchers, SteamVR and redistributable installers don't count. Windows holds toasts back during full-screen
+games (Do Not Disturb), which is why the default acts instead of asking.
 
 **Updates:** once a day the app asks GitHub for the latest release (one small request, no data about you). When a
 newer version exists, the idle line says *Update to x.y.z available · click to install*. Click → confirm → it

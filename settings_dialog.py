@@ -178,7 +178,26 @@ class SettingsDialog(ctk.CTkToplevel):
         if self._extra_switches:
             box = ctk.CTkFrame(self, fg_color="transparent")
             box.grid(row=10, column=0, sticky="ew", padx=12)
+            box.grid_columnconfigure(0, weight=1)
             for i, sw in enumerate(self._extra_switches):
+                if sw.get("choices"):            # a choice: label left, dark dropdown right (same row height)
+                    row = ctk.CTkFrame(box, fg_color="transparent")
+                    row.grid(row=i, column=0, sticky="ew", pady=(8, 0))
+                    row.grid_columnconfigure(0, weight=1)
+                    ctk.CTkLabel(row, text=str(sw.get("label")), font=body, text_color=T.TEXT, anchor="w",
+                                 height=26).grid(row=0, column=0, sticky="w", padx=(2, 0))
+                    svar = ctk.StringVar(value=str(sw.get("value")))
+                    menu = ctk.CTkOptionMenu(row, values=[str(c) for c in sw["choices"]], variable=svar, width=150,
+                                             height=26, font=body, dropdown_font=body, fg_color=T.RAISED,
+                                             button_color=T.RAISED, button_hover_color=T.RAISED_HOVER,
+                                             text_color=T.TEXT, dropdown_fg_color=T.SURFACE,
+                                             dropdown_hover_color=T.RAISED, dropdown_text_color=T.TEXT,
+                                             command=lambda v, sw=sw, svar=svar: self._choice_changed(sw, svar, v))
+                    if not sw.get("enabled", True):
+                        menu.configure(state="disabled")
+                    menu.grid(row=0, column=1, sticky="e")
+                    self.switches[str(sw["key"])] = (svar, menu)
+                    continue
                 var = ctk.BooleanVar(value=bool(sw.get("value")))
                 w = ctk.CTkSwitch(box, text=str(sw.get("label")), variable=var, font=body, text_color=T.TEXT,
                                   text_color_disabled=T.TEXT_3, progress_color=T.ACCENT, button_color=T.TEXT,
@@ -339,6 +358,18 @@ class SettingsDialog(ctk.CTkToplevel):
         master = self.master
         self.close()                             # the confirmation box belongs to the main window
         master.after(50, cb)
+
+    def _choice_changed(self, sw: dict, svar, value: str) -> None:
+        cb = sw.get("on_change")
+        prev = str(sw.get("value"))
+        try:
+            if cb is not None and cb(value) is False:
+                svar.set(prev)
+                return
+            sw["value"] = value
+        except Exception:  # noqa: BLE001
+            log.exception("setting %s failed", sw.get("key"))
+            svar.set(prev)
 
     def _switch_toggled(self, sw: dict, var) -> None:
         cb = sw.get("on_change")

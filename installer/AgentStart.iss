@@ -47,6 +47,14 @@ Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; AppUserModelID: "warren
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon; AppUserModelID: "warrenjbg.AgentStart"
 
+[Registry]
+; agentstart://game-off: the "Turn off Strata" button of the game toast starts AgentStart.exe with the URL, which hands
+; it to the running app (named event) and exits. Per-user (HKCU\Software\Classes), removed on uninstall.
+Root: HKCU; Subkey: "Software\Classes\agentstart"; ValueType: string; ValueName: ""; ValueData: "URL:Agent Start"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\agentstart"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\agentstart\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#AppExe},0"
+Root: HKCU; Subkey: "Software\Classes\agentstart\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+
 [Run]
 ; In-app update (updater.launch_installer passes /RELAUNCH=1): start the new version when the silent install ends.
 Filename: "{app}\{#AppExe}"; Flags: nowait; Check: ShouldRelaunch
