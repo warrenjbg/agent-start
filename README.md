@@ -52,6 +52,7 @@ script); the Settings dialog and the log show the same number.
 | Area | Shows |
 |---|---|
 | Status line | LED + state + a short summary: Idle (grey) *2 apps to close · 6.8 GB* · Starting (amber) *Loading experts into RAM* + timer · Serving (green) *model* · Low-RAM (amber) · Error (red) *what failed*. While Strata works on a request it shows the model state, like Strata's Monitor: **Reading** (blue) *12% · 10,752 / 87,072* with a thin progress bar under the line, **Generating** (green) *412 tokens · 98.4 tok/s*, **Queued** (amber) *2 waiting*; then back to Serving. Read from `/metrics` once a second while serving (paused while minimised). Click it to show or hide the detail line (remembered) |
+| ⇄ (left of ⚙) | **Switch model**: shown when your Strata folder has two or more `run-*.bat`. Pick one: while idle it becomes the launcher for the next Turn on; while serving, Strata stops and starts again with the new model (the apps closed for the old one stay closed). Disabled while starting/stopping |
 | ⚙ | **Settings**: Strata launcher, the Strata dashboard link + API address, Protected apps (see below). Disabled while starting/stopping |
 | Detail line | Optional: idle = which apps would be closed; serving = *Up 12 min · last reply 85 tok/s*. Always shown when it matters: loading (phase, *usually 0:58*, progress bar), Low-RAM mode, errors (click opens the log), notes such as *Stopped · freed 47 GB*, and the one-click *Reopen …* offer |
 | Button | **Turn on** · **Cancel** (while starting) · **Turn off** |
@@ -168,7 +169,7 @@ To serve another Strata model, pick its `run-*.bat` in ⚙ Settings — no hand-
   pre-ticked. Untick them or add them to the whitelist.
 - **VRAM per app is an estimate.** NVIDIA's NVML reports nothing per process on Windows; the app uses Windows' GPU
   memory counters, capped at the card's real usage. *VRAM freed* after a sweep is measured on the whole card.
-- **Stopping during a reply**: if the model is mid-answer, OFF asks before force-stopping. Stopping Strata ends any
+- **Stopping during a reply**: while Strata is reading or writing a reply, Turn off (and a model switch) asks first: *Turn off when it's done* waits until the model has been idle for 6 s (the toggle then reads *Stop now*, and the line under the status says *Turns off after this reply · click to cancel*), *Turn off now* cuts the reply off, *Keep running* does nothing. An agent working through tool calls sends its next request within a few seconds, so *when it's done* means after the current request, not after the whole task. Stopping Strata ends any
   chat session that is using it.
 - **First scan** after launch takes ~2 s (later ~0.3 s); it runs in the background.
 - **Launcher is parsed when you save it.** If you later edit that `.bat` (or Strata's updater rewrites it), open

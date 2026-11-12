@@ -28,6 +28,8 @@ import metrics_store
 import theme as T
 from graphs import BarGraph, LineGraph, StatRow, fmt_rate
 from metrics_store import MetricsStore
+from busy_dialog import BusyDialog
+from customtkinter.windows.widgets.core_widget_classes import DropdownMenu
 from settings_dialog import SettingsDialog
 from sweep_dialog import SweepDialog
 from version import __version__
@@ -79,6 +81,9 @@ BAR_H = 14                               # the expand bar at the bottom
 BAR_PAD = 5                              # above and below the bar
 STATE_SAVE_DEBOUNCE_MS = 300
 REOPEN_STAGGER_S = 1.0                   # pause between two reopened apps
+IDLE_GRACE_S = 6.0                       # "when it's done": stop after the model has been idle this long (an agent
+                                         # usually sends its next request within a few seconds of a tool call)
+SWITCH_GLYPH = "\uE8AB"                  # Segoe Fluent Icons "Switch"
 LIVE_POLL_S = 1.0                        # /metrics poll while serving (model state on the status line), as Strata's
                                          # own Monitor; stopped while the window is minimised
 ACT_BAR_X = 22                           # activity bar under the status line: starts at the state text...
@@ -260,6 +265,11 @@ class AgentStartApp(ctk.CTk):
         self._reopen_this = False                # this start's choice (read from the sweep dialog)
         self._reopen_offer: list = []            # records offered as a one-click "Reopen …" line while idle
         self._reopening = False
+        # Safe Turn off / model switch while Strata answers a request
+        self._stop_pending: tuple[str, Any] | None = None     # ("off", None) | ("switch", LauncherInfo)
+        self._idle_since: float | None = None
+        self._switching = False                  # a model switch is stopping Strata: no reopen, start again after
+        self._launchers: list[tuple[str, str]] = []           # (label, bat path) for the switch menu
         self._summary_text = ""
         self._detail_text = ""
         self._detail_color = T.TEXT_2
@@ -341,7 +351,13 @@ class AgentStartApp(ctk.CTk):
                                   font=ctk.CTkFont(family=T.icon_family(), size=14),
                                   fg_color="transparent", hover_color=T.RAISED, text_color=T.TEXT_2,
                                   text_color_disabled=T.HAIRLINE, command=self.open_settings)
-        self.gear.grid(row=0, column=5)
+        self.gear.grid(row=0, column=6)
+        self.switch_btn = ctk.CTkButton(top, text=SWITCH_GLYPH, width=28, height=28, corner_radius=8,
+                                        font=ctk.CTkFont(family=T.icon_family(), size=13),
+                                        fg_color="transparent", hover_color=T.RAISED, text_color=T.TEXT_2,
+                                        text_color_disabled=T.HAIRLINE, command=self.open_model_menu)
+        self._model_menu = DropdownMenu(self, values=[], command=self._on_model_menu, fg_color=T.SURFACE,
+                                        hover_color=T.RAISED, text_color=T.TEXT, font=self._font(12))
         # 2 px activity bar along the bottom of the status row (prompt read progress): no extra height
         self.act_track = tkinter.Frame(top, bg=T.HAIRLINE, height=2, highlightthickness=0, bd=0)
         self.act_fill = tkinter.Frame(self.act_track, bg=T.BLUE, highlightthickness=0, bd=0)
@@ -449,12 +465,16 @@ class AgentStartApp(ctk.CTk):
         if st in (IDLE, ERROR):
             self._style_toggle("Turn on", TOGGLE_ON, "normal")
         elif st == ACTIVE:
-            self._style_toggle("Turn off", TOGGLE_OFF, "normal")
+            label = "Turn off"
+            if self._stop_pending is not None:
+                label = "Switch now" if self._stop_pending[0] == "switch" else "Stop now"
+            self._style_toggle(label, TOGGLE_OFF, "normal")
         elif st == STARTING:
             self._style_toggle("Cancel", TOGGLE_CANCEL, "normal")
         else:
             self._style_toggle("Stopping…", TOGGLE_WAIT, "disabled")
         self.gear.configure(state="disabled" if st in (STARTING, STOPPING) else "normal")
+        self.switch_btn.configure(state="disabled" if st in (STARTING, STOPPING) else "normal")
         busy = st == STARTING and self._start_phase == "server"
         if not busy:
             self.progress.set(0)
@@ -497,7 +517,12 @@ class AgentStartApp(ctk.CTk):
             q = f" · {act['queued']} queued"
             if act["queued"] and summary.endswith(q) and not self._fits_summary(summary):
                 summary, detail = summary[: -len(q)], detail + q     # keep the numbers whole; queue goes below
-        if self.loaded is False:
+        link = False
+        if self._stop_pending is not None:
+            kind, info = self._stop_pending
+            what = "Turns off" if kind == "off" else "Switches model"     # the model is named in the dialog
+            detail, link = f"{what} after this reply · click to cancel", True
+        elif self.loaded is False:
             detail = "Still loading the model"
         elif self._pending_launcher is not None:      # a launcher saved while running waits for the next start
             detail = f"{_short(self._pending_launcher.bat_name, 28)} applies next start"
@@ -508,7 +533,7 @@ class AgentStartApp(ctk.CTk):
         self.pill.configure(text=title)
         self.led.configure(fg_color=led)
         self._set_act_bar(frac)
-        self._set_status(summary, detail, color=color)
+        self._set_status(summary, detail, color=color, link=link)
 
     @staticmethod
     def _activity_texts(act: dict, model: str) -> tuple[str, str, float | None]:
@@ -572,6 +597,8 @@ class AgentStartApp(ctk.CTk):
         used = self.pill.cget("font").measure(self.pill.cget("text"))
         # row margins 10+12, LED 8 + pads 6/8, summary pad 8, caret 12 + pad 4, timer pads 6+4, gear 28, 2 spare
         fixed = WIDTH - 22 - 22 - 8 - 16 - 10 - 28 - 2
+        if self.switch_btn.winfo_manager():
+            fixed -= 28 + 2
         timer = (self.elapsed.cget("font").measure(self.elapsed.cget("text")) + 10) if self.elapsed.cget("text") else 0
         return int(fixed - used - timer)
 
@@ -602,7 +629,8 @@ class AgentStartApp(ctk.CTk):
             return True
         if time.monotonic() < self._note_until:
             return True
-        return st == ACTIVE and (self.loaded is False or self._pending_launcher is not None or self._is_low_ram())
+        return st == ACTIVE and (self.loaded is False or self._pending_launcher is not None or self._is_low_ram()
+                                 or self._stop_pending is not None)
 
     def _layout(self) -> None:
         """Grid/hide the detail line, progress bar and caret for the current texts, then fit the window height."""
@@ -734,6 +762,9 @@ class AgentStartApp(ctk.CTk):
         self._run_worker("hc-reopen-click", _reopen_clicked, recs, self.post, self._reopen_done)
 
     def _on_preview_click(self, _event=None) -> None:
+        if self.state_name == ACTIVE and self._stop_pending is not None:
+            self.cancel_pending_stop()
+            return
         if self.state_name == IDLE and self._reopen_offer and self._detail_link:
             self._click_reopen_offer()
             return
@@ -813,6 +844,8 @@ class AgentStartApp(ctk.CTk):
             # Adopted a Strata we did not start (or one restarted outside the app): its request history is not ours
             self._metrics_epoch += 1
             self.metrics.reset()
+        if st != ACTIVE:
+            self._stop_pending, self._idle_since = None, None
         self.state_name = st
         self._state_seq += 1
         self._note_until = 0.0                   # a note belongs to the state it was shown in
@@ -1086,7 +1119,8 @@ class AgentStartApp(ctk.CTk):
             try:
                 # Every LIVE_POLL_S while serving: the status line shows what the model is doing (reading /
                 # generating / queued) and the stats graphs use the same documents.
-                if not self._iconic and self.state_name in (ACTIVE, STOPPING):
+                # minimised: paused, except while a stop waits for the reply to finish (it needs the idle signal)
+                if (not self._iconic or self._stop_pending is not None) and self.state_name in (ACTIVE, STOPPING):
                     epoch = self._metrics_epoch
                     root = config_store.server_root(str(self.cfg.get("endpoint_url") or ""))
                     # /metrics returns only the newest 12 requests: after a gap (section collapsed, window minimised,
@@ -1116,6 +1150,9 @@ class AgentStartApp(ctk.CTk):
                 self.vram.push_external(*self.metrics.hw_vram)
         if self.state_name == ACTIVE:
             self._show_serving()                          # model state on the status line
+            if isinstance(self.dialog, BusyDialog) and isinstance(data, dict):
+                self.dialog.update_activity(self.metrics.activity())
+            self._check_pending_stop(data_ok=isinstance(data, dict))
         self._refresh_stats()
 
     # ================================================================== progress / memory
@@ -1321,6 +1358,7 @@ class AgentStartApp(ctk.CTk):
     # ================================================================== periodic
     def _first_refresh(self) -> None:
         self._first_id = None
+        self._refresh_launchers()
         self._request_preview()
         self._run_worker("hc-reopen-load", self._load_reopen_offer)
 
@@ -1395,7 +1433,10 @@ class AgentStartApp(ctk.CTk):
         if st in (IDLE, ERROR):
             self.turn_on()
         elif st == ACTIVE:
-            self.turn_off()
+            if self._stop_pending is not None:   # "Stop now" while waiting for the reply to finish
+                self._run_pending(force=True)
+            else:
+                self.request_stop(("off", None))
         elif st == STARTING:
             self.cancel_start()
 
@@ -1618,7 +1659,159 @@ class AgentStartApp(ctk.CTk):
         self._set_preview("Unloading model and stopping Strata…" if not force else "Force stopping Strata…")
         if not self.endpoint.stop_endpoint(lambda r: self.post(self.on_stopped, r), force=force):
             log.info("stop_endpoint returned False; reconciling")
+            self._switching = False              # no stop happened: a model switch must not restart Strata later
             self._reconcile_now()
+
+    # ------------------------------------------------------------------ safe stop (busy model) + model switch
+    def request_stop(self, action: tuple[str, Any]) -> None:
+        """Turn off / switch: straight away when the model is idle, else ask (BusyDialog) - stopping mid-reply cuts
+        off whatever chat is using Strata."""
+        act = self.metrics.activity() if self._metrics_fails == 0 else None
+        if act is None:
+            self._execute(action, force=False)
+            return
+        switch_to = action[1].model_name if action[0] == "switch" else None
+        self.dialog = BusyDialog(self, act, lambda d: self._on_busy_decision(action, d), switch_to=switch_to)
+
+    def _on_busy_decision(self, action: tuple[str, Any], decision: str) -> None:
+        if isinstance(self.dialog, BusyDialog):
+            self.dialog = None
+        if self.state_name != ACTIVE:
+            return                               # Strata stopped while the dialog was open
+        if decision in ("now", "idle"):
+            self._execute(action, force=decision == "now")
+        elif decision == "when_idle":
+            self._stop_pending, self._idle_since = action, None
+            log.info("%s when the model is idle", "turn off" if action[0] == "off" else "switch model")
+            self._apply_state()
+
+    def cancel_pending_stop(self) -> None:
+        if self._stop_pending is None:
+            return
+        self._stop_pending, self._idle_since = None, None
+        log.info("pending stop cancelled")
+        self._apply_state()                      # the line goes, the toggle reads "Turn off" again
+
+    def _check_pending_stop(self, data_ok: bool) -> None:
+        """Every /metrics poll while a stop waits: run it once the model has been idle for IDLE_GRACE_S."""
+        if self._stop_pending is None or not data_ok:
+            return
+        if self.metrics.activity() is not None:
+            self._idle_since = None              # busy (again): wait for this request too
+            return
+        now = time.monotonic()
+        if self._idle_since is None:
+            self._idle_since = now
+        elif now - self._idle_since >= IDLE_GRACE_S:
+            self._run_pending(force=False)
+
+    def _run_pending(self, force: bool) -> None:
+        action, self._stop_pending, self._idle_since = self._stop_pending, None, None
+        if action is not None:
+            self._execute(action, force=force)
+
+    def _execute(self, action: tuple[str, Any], force: bool) -> None:
+        kind, info = action
+        if kind != "switch":
+            self.turn_off(force=force)
+            return
+
+        def saved(err: str | None) -> None:     # the launcher is saved only now, so "Keep running" changes nothing
+            if err:
+                self._set_note(err)
+                return
+            if self.state_name != ACTIVE:
+                return
+            self._pending_launcher = info        # applied by turn_on() once Strata has stopped
+            self._switching = True
+            self.turn_off(force=force)
+
+        self.save_launcher(info, saved)
+
+    def _switch_start(self) -> None:
+        if self.state_name in (IDLE, ERROR) and not self._destroyed:
+            self.turn_on()
+
+    # model menu
+    def _launcher_choices(self) -> list[tuple[str, str]]:
+        """(label, bat path) for every run-*.bat in the Strata folder; the current launcher's label ends with ✓."""
+        sdir = str(self.cfg.get("strata_dir") or "")
+        cur_bat = str(self.cfg.get("launcher_bat") or "")
+        cur = os.path.normcase(os.path.abspath(cur_bat if os.path.isabs(cur_bat) else os.path.join(sdir, cur_bat))) \
+            if cur_bat else ""
+        out = []
+        for path in launcher_bat.list_launchers(sdir):
+            try:
+                info = launcher_bat.parse_bat(path)
+                if launcher_bat.missing_files(info):
+                    continue
+                label = f"{info.model_name}  ·  {info.bat_name}"
+            except Exception:  # noqa: BLE001 - not a Strata launcher (Settings explains why); not offered here
+                continue
+            if os.path.normcase(os.path.abspath(path)) == cur:
+                label += "  ✓"
+            out.append((label, path))
+        return out
+
+    def _refresh_launchers(self) -> None:
+        """Listing a folder of a few small .bat files is fast enough for the Tk thread. Shows the switch button for
+        two or more launchers."""
+        try:
+            self._launchers = self._launcher_choices()
+        except Exception:  # noqa: BLE001
+            log.debug("listing launchers failed", exc_info=True)
+            self._launchers = []
+        show = len(self._launchers) >= 2
+        if show and not self.switch_btn.winfo_manager():
+            self.switch_btn.grid(row=0, column=5, padx=(0, 2))
+        elif not show and self.switch_btn.winfo_manager():
+            self.switch_btn.grid_remove()
+
+    def open_model_menu(self) -> None:
+        if self.state_name in (STARTING, STOPPING) or self._dialog_open():
+            return
+        self._refresh_launchers()
+        if not self._launchers:
+            return
+        self._model_menu.configure(values=[label for label, _ in self._launchers])
+        x = self.switch_btn.winfo_rootx()
+        y = self.switch_btn.winfo_rooty() + self.switch_btn.winfo_height()
+        self._model_menu.open(x, y)
+
+    def _on_model_menu(self, label: str) -> None:
+        path = dict(self._launchers).get(label)
+        if path:
+            self.switch_model(path)
+
+    def switch_model(self, bat_path: str) -> None:
+        """Pick another launcher. Idle: just set it. Serving: stop (asking first if a reply is running), then start
+        the new model; the apps closed for the old one stay closed."""
+        if self.state_name in (STARTING, STOPPING):
+            return
+        try:
+            info = launcher_bat.parse_bat(bat_path)
+            missing = launcher_bat.missing_files(info)
+            if missing:
+                raise launcher_bat.LauncherError(missing)
+        except Exception as exc:  # noqa: BLE001
+            self._set_note(f"Can't switch to {_short(os.path.basename(bat_path), 24)}\n{exc}")
+            return
+        if launcher_bat.same_launch(self.cfg, info) and self._pending_launcher is None:
+            return
+        log.info("model switch requested: %s (%s)", info.model_name, info.bat_name)
+
+        if self.state_name == ACTIVE:
+            self.request_stop(("switch", info))  # saves the launcher only if the switch goes ahead
+            return
+
+        def saved(err: str | None) -> None:
+            if err:
+                self._set_note(err)
+                return
+            self._refresh_launchers()
+            self._set_note(f"Model set to {_short(info.model_name, 26)}\nTurn on to start it")
+
+        self.save_launcher(info, saved)
 
     def on_stopped(self, result: dict) -> None:
         try:
@@ -1633,8 +1826,11 @@ class AgentStartApp(ctk.CTk):
                 self.turn_off(force=True)
             else:
                 self._exit_pending = False
+                self._switching = False
                 self._set_state(ACTIVE)
             return
+        if not (result.get("port_released") or result.get("cancelled_start")):
+            self._switching = False
         if result.get("cancelled_start") and not (result.get("ok") or result.get("port_released")):
             self.show_error(result.get("error") or "Cancel failed — Strata may still be running")
             return
@@ -1650,7 +1846,12 @@ class AgentStartApp(ctk.CTk):
             self._set_state(IDLE)
             self._set_note(f"Stopped · freed {_gb(result.get('ram_freed_mb'))}")
             self._request_preview()
-            if not self._exit_pending:
+            if self._switching and not self._exit_pending:
+                self._switching = False          # model switch: keep the closed apps closed, start the new model
+                log.info("model switch: starting %s", (self._pending_launcher.model_name
+                                                     if self._pending_launcher else self.cfg.get("model_name")))
+                self.after(300, self._switch_start)
+            elif not self._exit_pending:
                 self._reopening = True
                 self._run_worker("hc-reopen", self._reopen_worker)
         else:
@@ -1673,6 +1874,7 @@ class AgentStartApp(ctk.CTk):
     def _on_settings_closed(self) -> None:
         if isinstance(self.dialog, SettingsDialog):   # only the dialog that closed
             self.dialog = None
+        self._refresh_launchers()
         self._request_preview()
 
     def save_launcher(self, info: launcher_bat.LauncherInfo, done: Callable[[str | None], None]) -> None:

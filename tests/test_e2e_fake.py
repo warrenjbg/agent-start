@@ -33,6 +33,8 @@ from PIL import ImageGrab  # noqa: E402
 import config_store  # noqa: E402
 import launcher_bat  # noqa: E402
 import main  # noqa: E402
+import busy_dialog  # noqa: E402
+from busy_dialog import BusyDialog  # noqa: E402
 from detector import ProcessDetector  # noqa: E402
 from server_manager import EndpointManager  # noqa: E402
 from sweep_dialog import SweepDialog  # noqa: E402
@@ -111,6 +113,11 @@ def turn_on(app, port: int) -> bool:
 
 def turn_off(app, port: int) -> bool:
     app.on_toggle()
+    # The fake Strata reports "generating" in /metrics, so Turn off asks first (BusyDialog): answer "Turn off now"
+    # once the dialog accepts clicks (busy_dialog.ARM_S).
+    if pump_until(app, lambda: isinstance(app.dialog, BusyDialog), 2):
+        pump_until(app, lambda: False, busy_dialog.ARM_S + 0.2)
+        app.dialog.now_btn.invoke()
     return pump_until(app, lambda: app.state_name in ("IDLE", "ERROR"), 40) and app.state_name == "IDLE" \
         and not listening(port)
 
