@@ -283,6 +283,9 @@ class GraphContext:
     vram_mb: dict[int, float] | None = None       # per-pid, already clamped; None = PDH failed
     vram_cap_mb: float | None = None              # adapter-wide dedicated usage
     session_ok: Callable[[int], bool] = lambda pid: True
+    # engine_protects(info) -> True if the process belongs to the inference engine (never a sweep candidate).
+    # None = the built-in Strata rule (serve\server.py in the cmdline, or an exe under strata_dir).
+    engine_protects: Callable[["ProcInfo"], bool] | None = None
 
 
 # --------------------------------------------------------------------------------------------- graph
@@ -343,8 +346,8 @@ def compute_protection(procs: dict[int, ProcInfo], graph: ProcGraph,
                        ctx: GraphContext) -> tuple[set[int], set[int]]:
     """Return (hard_pids, rule_a_pids).
 
-    hard: self + validated ancestors + descendants of self, provider pids, Strata server processes +
-    descendants, exe under strata_dir.
+    hard: self + validated ancestors + descendants of self, provider pids, the engine's processes (for Strata:
+    server processes + descendants, exe under strata_dir).
     rule_a: validated descendants of TREE_PROTECTED processes and of HARD pids. Self's ancestors are HARD
     (never killed, Rule B) but do NOT seed Rule A — otherwise explorer.exe (ancestor when launched by
     double-click) would protect every desktop app.
@@ -361,7 +364,7 @@ def compute_protection(procs: dict[int, ProcInfo], graph: ProcGraph,
         hard.add(pid)
         seeds.add(pid)
     for pid, info in procs.items():
-        if is_strata_server_cmdline(info.cmdline) or under_dir(info.exe, ctx.strata_dir):
+        if _engine_process(info, ctx):
             hard.add(pid)
             seeds.add(pid)
         if _tree_name(info.nname, ctx):
@@ -375,6 +378,19 @@ def compute_protection(procs: dict[int, ProcInfo], graph: ProcGraph,
         if s in hard and s in procs:
             hard |= graph.descendants(s)
     return hard, rule_a
+
+
+def _engine_process(info: ProcInfo, ctx: GraphContext) -> bool:
+    """Engine-owned = always protected. An engine predicate that RAISES falls back to the built-in Strata rule.
+    (A predicate that wrongly answers no is the engine's own bug: its processes are then ordinary candidates,
+    still only closed if the user ticks them.)"""
+    builtin = is_strata_server_cmdline(info.cmdline) or under_dir(info.exe, ctx.strata_dir)
+    if ctx.engine_protects is None:
+        return builtin
+    try:
+        return bool(ctx.engine_protects(info))
+    except Exception:  # noqa: BLE001
+        return builtin
 
 
 def _tree_name(nname: str, ctx: GraphContext) -> bool:
@@ -593,8 +609,10 @@ class _PdhGpu:
 
 class ProcessDetector:
     def __init__(self, config: dict | None = None,
-                 protected_pids_provider: Callable[[], set[int]] | None = None) -> None:
+                 protected_pids_provider: Callable[[], set[int]] | None = None,
+                 engine: object | None = None) -> None:
         self.config = config if config is not None else config_store.load_config()
+        self._engine = engine                      # engines.Engine or None (None = built-in Strata rule)
         self._provider = protected_pids_provider
         self._lock = threading.Lock()
         self._pdh = _PdhGpu()
@@ -626,6 +644,13 @@ class ProcessDetector:
             return cache[pid]
         return ok
 
+    def _engine_protects(self) -> Callable[[ProcInfo], bool] | None:
+        eng, cfg = self._engine, self.config
+        fn = getattr(eng, "protects_process", None)
+        if fn is None:
+            return None
+        return lambda info: bool(fn(info.cmdline, info.exe, cfg))
+
     def _vram_snapshot(self) -> tuple[dict[int, float] | None, float | None]:
         cap = self._pdh.adapter_used_mb()
         per = self._pdh.process_used_mb()
@@ -655,6 +680,7 @@ class ProcessDetector:
             game_exclude=frozenset(norm(n) for n in (self.config.get("game_exclude") or []) if n),
             windows=windows, vram_mb=vram, vram_cap_mb=cap,
             session_ok=self._session_ok_factory(),
+            engine_protects=self._engine_protects(),
         )
         apps = build_apps(procs, ctx)
         t3 = time.perf_counter()

@@ -108,6 +108,7 @@ class UpdateHost:
     finish_exit: Callable[[], None]
     available: Callable[[], bool]                # installed (frozen) build with the extras: the updater may run
     frozen: Callable[[], bool]                   # installed build: the installer gets /DIR=<this exe's folder>
+    engine_name: Callable[[], str] = lambda: "Strata"   # the inference engine's name, for the texts
     stop_evt: Any = None                         # threading.Event set on app exit (cancels a download)
 
 
@@ -223,7 +224,7 @@ class UpdateController:
             log.info("update available: %s", new.version)
             if not shown:                        # Settings already says so where the user clicked
                 self.host.toast(APP_TITLE, f"Version {new.version} is available. Install it from Settings, or "
-                                           f"click the update line while Strata is off.")
+                                           f"click the update line while {self.host.engine_name()} is off.")
         self.host.request_preview()
 
     @staticmethod
@@ -260,12 +261,12 @@ class UpdateController:
         if info is None or self.updating or h.box_open():
             return
         if h.engine_state() in ("STARTING", "STOPPING"):
-            h.set_note("Update waits until Strata has started or stopped")
+            h.set_note(f"Update waits until {h.engine_name()} has started or stopped")
             return
         msg = (f"Install Agent Start {info.version}?\n\nIt downloads the installer from GitHub "
                f"(about {info.size / 1e6:.0f} MB), checks it, closes this app, upgrades it and starts it again.")
         if h.engine_state() == "ACTIVE":
-            msg += "\n\nStrata keeps running; the new version picks it up."
+            msg += f"\n\n{h.engine_name()} keeps running; the new version picks it up."
         if not h.ask(msg):
             return
         if h.engine_state() in ("STARTING", "STOPPING") or self.updating:

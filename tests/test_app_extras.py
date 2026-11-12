@@ -1104,6 +1104,95 @@ def test_memory_trigger() -> None:
     config_store.save_state({"memory_action": None})
 
 
+def test_engine_without_launcher_files(tmp: Path) -> None:
+    """An engine with no launcher files, no finder, no dashboard and no unload (shaped like llama-server): the
+    window and Settings cope. Settings offers program + arguments instead of a launcher-file picker."""
+    import ui_helpers as H
+    from engines.base import CommandLaunch, Engine, LaunchError, LaunchPlan, ServiceState
+
+    class Plain(Engine):
+        id, name, default_port, log_prefix = "plain", "llama.cpp", 9931, "llama"
+        capabilities = frozenset()
+
+        def is_server_process(self, name, cmdline):
+            return False
+
+        def verified_by_process(self, proc, cfg):
+            return False
+
+        def claims_port(self, cmdline, port, cfg):
+            return False
+
+        def probe(self, http, timeout):
+            return ServiceState()
+
+        def protects_process(self, cmdline, exe, cfg):
+            return False
+
+        def plan_launch(self, cfg):
+            cmd = [str(x) for x in (cfg.get("launch_cmd") or [])]
+            if not cmd or os.path.basename(cmd[0]).casefold() != "llama-server.exe":
+                raise LaunchError("Pick llama-server.exe")
+            if not os.path.isfile(cmd[0]):
+                raise LaunchError("llama-server.exe not found")
+            if "-m" not in cmd:
+                raise LaunchError("Add -m <model.gguf>")
+            return LaunchPlan(cmd=cmd, cwd=os.path.dirname(cmd[0]))
+
+    exe = tmp / "llama" / "llama-server.exe"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    exe.write_bytes(b"")
+    app, det, ep = U.new_app(dict(U.CFG, launch_cmd=[], backend="plain"))
+    saved = []
+    real_save = config_store.save_config
+    try:
+        app.engine = Plain()
+        app._refresh_launchers()
+        app._apply_state()
+        pump(app, 0.3)
+        check(not H.switch_button_visible(app), "no launcher files: no model-switch button")
+        app._finder_ran, app._no_finder = False, False
+        app._maybe_find_strata()
+        pump(app, 0.2)
+        check(app._finder_ran is False and "Looking for" not in status(app), "no finder: no first-start search")
+        d = H.open_settings(app)
+        check(d is not None and d._program_entry.winfo_manager() == "grid" and d._args_entry.winfo_manager() == "grid"
+              and d._menu.winfo_manager() == "", "Settings shows a program box and an arguments box, no launcher list")
+        texts = [w.cget("text") for w in d.winfo_children() if isinstance(w, main.ctk.CTkLabel)]
+        check("llama.cpp program and arguments" in texts and not any("Strata" in str(t_) for t_ in texts),
+              f"captions name the engine, not Strata ({[t_ for t_ in texts if t_][:3]})")
+        check(d._link_text.cget("text") == "llama.cpp endpoint", "no dashboard: the row is a plain endpoint line")
+        check(str(d._save_btn.cget("state")) == "disabled" and d._msg.cget("text") == "", "nothing typed: Save is off, no complaint")
+        d._program.set(str(tmp / "llama" / "other.exe"))
+        pump(app, 0.1)
+        check(str(d._save_btn.cget("state")) == "disabled" and d._msg.cget("text") == "Pick llama-server.exe",
+              f"the engine's own message says what is wrong ({d._msg.cget('text')!r})")
+        d.choose(str(exe))                       # what Browse… does
+        pump(app, 0.1)
+        check(d._msg.cget("text") == "Add -m <model.gguf>" and str(d._save_btn.cget("state")) == "disabled",
+              "a valid program with missing arguments is still refused")
+        d._args.set('-m "C:\\My Models\\a.gguf" --port 9931')
+        pump(app, 0.1)
+        check(str(d._save_btn.cget("state")) == "normal" and d._msg.cget("text") == "", "a launch the engine accepts can be saved")
+        U.shot(d, "extras_settings_command")
+        config_store.save_config = lambda cfg: saved.append(dict(cfg))
+        H.click_settings_button(d, "Save")
+        check(pump_until(app, lambda: saved and app.dialog is None, 4), "Save writes the config and closes")
+        want = [str(exe), "-m", "C:\\My Models\\a.gguf", "--port", "9931"]
+        check(bool(saved) and saved[-1].get("launch_cmd") == want and saved[-1].get("launch_cwd") == str(exe.parent),
+              f"saved as launch_cmd + launch_cwd ({saved[-1].get('launch_cmd') if saved else None})")
+        check(app.cfg.get("launch_cmd") == want, "and applied to the running app's config")
+        d = H.open_settings(app)
+        check(d._program.get() == str(exe) and d._args.get() == '-m "C:\\My Models\\a.gguf" --port 9931'
+              and str(d._save_btn.cget("state")) == "disabled",
+              "reopened: shows the saved command, Save is off until something changes")
+        check(isinstance(d._info, CommandLaunch), "the dialog's selection is a CommandLaunch")
+        H.close_settings(d)
+    finally:
+        config_store.save_config = real_save
+        close(app)
+
+
 def run() -> int:
     import tempfile
     main.TOGGLE_DEBOUNCE_S = 0.0
@@ -1117,7 +1206,8 @@ def run() -> int:
         for fn, args in ((test_tool_gap, ()), (test_tray, ()), (test_update_offer, ()),
                          (test_first_start_search, (tmp,)), (test_reopen_switch, ()),
                          (test_game_alert_and_tray_models, (tmp,)), (test_settings_switches, ()),
-                         (test_review_fixes, ()), (test_v181_review, ()), (test_memory_trigger, ())):
+                         (test_review_fixes, ()), (test_v181_review, ()), (test_memory_trigger, ()),
+                         (test_engine_without_launcher_files, (tmp,))):
             gc.collect()
             print(f"-- {fn.__name__}", flush=True)
             try:

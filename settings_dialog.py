@@ -1,25 +1,26 @@
-"""SettingsDialog: choose the Strata launcher (.bat) and reach the protected-apps list."""
+"""SettingsDialog: choose what the engine launches (a launcher file, or program + arguments for engines without
+launcher files) and reach the protected-apps list. Everything engine-specific is asked of the engine."""
 from __future__ import annotations
 
 import logging
 import os
 import webbrowser
 from tkinter import filedialog
-from typing import Callable
+from typing import Any, Callable
 
 import customtkinter as ctk
 
 import config_store
-import launcher_bat
+import engines
 import theme as T
-from launcher_bat import LauncherError, LauncherInfo
+from engines.base import CAP_LAUNCHER_FILES, CommandLaunch, LaunchError, join_args, split_args
 from sweep_dialog import apply_modal, center_over, later, release_modal, style_dialog
 from version import __version__
 from whitelist_modal import WhitelistModal
 
 log = logging.getLogger("agent_start")
 
-NO_LAUNCHERS = "No run-*.bat found"
+NO_LAUNCHERS = "No run-*.bat found"          # the Strata wording (tests); built per engine below
 CHECK_LABEL = "Check for updates"
 CHECK_LABEL_SOURCE = "Check for updates (installed app only)"   # the daily switch's wording when run from source
 CHECK_TEXTS = {                                  # the manual check's result, next to the button
@@ -39,7 +40,7 @@ class SettingsDialog(ctk.CTkToplevel):
     EXT_GLYPH = "\uE8A7"   # Segoe Fluent Icons "Open in new window"
 
     def __init__(self, master, cfg: dict, detector,
-                 on_save: Callable[[LauncherInfo, Callable[[str | None], None]], None],
+                 on_save: Callable[[Any, Callable[[str | None], None]], None],
                  on_closed: Callable[[], None] | None = None,
                  current_bat: str | None = None, running: bool = False,
                  on_whitelist_saved: Callable[[], None] | None = None,
@@ -49,7 +50,7 @@ class SettingsDialog(ctk.CTkToplevel):
                  on_update: Callable[[], None] | None = None,
                  switches: list[dict] | None = None,
                  on_check_updates: Callable[[Callable[[str, str | None], bool]], str] | None = None,
-                 can_check_updates: bool = True) -> None:
+                 can_check_updates: bool = True, engine=None) -> None:
         """on_check_updates(on_result) adds the "Check for updates" row under the title (none when it is None): it
         starts a check and returns "started" / "joined" (on_result(status, version) follows once, on the Tk thread,
         status "current" | "newer" | "error"; it returns True when the dialog showed it) or "busy" / "unavailable".
@@ -79,10 +80,13 @@ class SettingsDialog(ctk.CTkToplevel):
         self._closed = False
         self._saving = False
         self._child: WhitelistModal | None = None
-        self._info: LauncherInfo | None = None
-        self._paths: dict[str, str] = {}                 # dropdown label -> absolute .bat path
-        self._strata_dir = str(cfg.get("strata_dir") or "")
-        self._initial = current_bat or launcher_bat.configured_bat(cfg)
+        self._engine = engine if engine is not None else engines.get_engine(cfg)
+        self._cfg = cfg
+        self._files = self._engine.can(CAP_LAUNCHER_FILES)   # a launcher-file picker, else program + arguments
+        self._no_launchers = f"No {self._engine.launcher_kind} found"
+        self._info: Any = None
+        self._paths: dict[str, str] = {}                 # dropdown label -> absolute launcher path
+        self._initial = current_bat or (self._engine.current_launcher(cfg) if self._files else None)
         self._has_launch_cmd = bool(cfg.get("launch_cmd"))
 
         self.title("Settings")
@@ -129,19 +133,34 @@ class SettingsDialog(ctk.CTkToplevel):
                 state="normal" if self._can_check else "disabled")
             self._check_btn.grid(row=0, column=1, sticky="e", padx=(8, 0))
 
-        ctk.CTkLabel(self, text="Strata launcher", anchor="w", text_color=T.TEXT_2, font=small,
-                     height=16).grid(row=1, column=0, sticky="ew", padx=12, pady=(8, 4))
+        name = self._engine.name
+        ctk.CTkLabel(self, text=f"{name} launcher" if self._files else f"{name} program and arguments", anchor="w",
+                     text_color=T.TEXT_2, font=small, height=16).grid(row=1, column=0, sticky="ew", padx=12,
+                                                                      pady=(8, 4))
 
         pick = ctk.CTkFrame(self, fg_color="transparent")
         pick.grid(row=2, column=0, sticky="ew", padx=12)
         pick.grid_columnconfigure(0, weight=1)
-        self._choice = ctk.StringVar(value=NO_LAUNCHERS)
+        self._choice = ctk.StringVar(value=self._no_launchers)
         self._menu = ctk.CTkOptionMenu(
-            pick, variable=self._choice, values=[NO_LAUNCHERS], command=self._on_pick, height=28, corner_radius=8,
+            pick, variable=self._choice, values=[self._no_launchers], command=self._on_pick, height=28, corner_radius=8,
             dynamic_resizing=False, font=body, dropdown_font=body, fg_color=T.RAISED, button_color=T.RAISED,
             button_hover_color=T.RAISED_HOVER, text_color=T.TEXT, text_color_disabled=T.TEXT_3,
             dropdown_fg_color=T.SURFACE, dropdown_hover_color=T.RAISED, dropdown_text_color=T.TEXT)
-        self._menu.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        if self._files:
+            self._menu.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        # engines without launcher files: the program (an .exe) here, its arguments in the row below
+        cmd = [str(x) for x in (cfg.get("launch_cmd") or [])]
+        self._program = ctk.StringVar(value=cmd[0] if cmd else "")
+        self._args = ctk.StringVar(value=join_args(cmd[1:]))
+        self._program_entry = ctk.CTkEntry(pick, textvariable=self._program, height=28, corner_radius=8, font=mono,
+                                           fg_color=T.SURFACE, border_color=T.HAIRLINE, text_color=T.TEXT,
+                                           placeholder_text="Program (.exe)")
+        self._args_entry = ctk.CTkEntry(self, textvariable=self._args, height=28, corner_radius=8, font=mono,
+                                        fg_color=T.SURFACE, border_color=T.HAIRLINE, text_color=T.TEXT,
+                                        placeholder_text="Arguments")
+        if not self._files:
+            self._program_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self._browse_btn = ctk.CTkButton(pick, text="Browse…", width=76, height=28, corner_radius=8, font=body,
                                          fg_color=T.RAISED, hover_color=T.RAISED_HOVER, text_color=T.TEXT,
                                          command=self.browse)
@@ -150,7 +169,10 @@ class SettingsDialog(ctk.CTkToplevel):
         # read-only: what the chosen .bat will run (model · config · port) or why it cannot be used
         self._detail = ctk.CTkLabel(self, text="", anchor="nw", justify="left", font=mono, text_color=T.TEXT_2,
                                     wraplength=self.WIDTH - 24, height=30)
-        self._detail.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 0))
+        if self._files:
+            self._detail.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 0))
+        else:
+            self._args_entry.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 2))
 
         # ---- Endpoint: the running server's own web app (chat, Monitor, its settings) + the API address
         root = config_store.server_root(str(cfg.get("endpoint_url") or ""))
@@ -158,13 +180,16 @@ class SettingsDialog(ctk.CTkToplevel):
         self._api_url = str(cfg.get("endpoint_url") or "")
         ctk.CTkLabel(self, text="Endpoint", anchor="w", text_color=T.TEXT_2, font=small, height=16).grid(
             row=4, column=0, sticky="ew", padx=12, pady=(2, 4))
+        if not self._engine.has_dashboard:
+            self._dashboard_url = ""
         live = self._running and bool(self._dashboard_url)
         self._link = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=8, height=30)
         self._link.grid(row=5, column=0, sticky="ew", padx=12)
         self._link.grid_columnconfigure(2, weight=1)
         self._link_font = ctk.CTkFont(family=T.ui_family(), size=12)
         self._link_font_hover = ctk.CTkFont(family=T.ui_family(), size=12, underline=True)
-        self._link_text = ctk.CTkLabel(self._link, text="Open Strata dashboard", font=self._link_font, height=28,
+        self._link_text = ctk.CTkLabel(self._link, text=f"Open {name} dashboard" if self._engine.has_dashboard
+                                       else f"{name} endpoint", font=self._link_font, height=28,
                                        text_color=T.TEXT if live else T.TEXT_3, anchor="w")
         self._link_text.grid(row=0, column=0, padx=(10, 0), sticky="w")
         self._link_ext = ctk.CTkLabel(self._link, text=self.EXT_GLYPH, height=28, width=14,
@@ -304,22 +329,27 @@ class SettingsDialog(ctk.CTkToplevel):
         return label
 
     def _load_launchers(self) -> None:
-        for p in launcher_bat.list_launchers(self._strata_dir):
+        if not self._files:                      # program + arguments: check what is there, re-check on edits
+            self._command_changed(initial=True)
+            self._program.trace_add("write", lambda *_a: self._command_changed())
+            self._args.trace_add("write", lambda *_a: self._command_changed())
+            return
+        for p in self._engine.list_launchers(self._cfg):
             self._add_path(p)
         current = None
         if self._initial:
             current = self._add_path(self._initial)
         if not self._paths:
-            self._menu.configure(values=[NO_LAUNCHERS], state="disabled")
-            self._choice.set(NO_LAUNCHERS)
+            self._menu.configure(values=[self._no_launchers], state="disabled")
+            self._choice.set(self._no_launchers)
             hint = "Using launch_cmd from config.json." if self._has_launch_cmd else "No launcher configured."
-            self._show_detail(f"{hint} Browse… to pick a run-*.bat.", error=False)
+            self._show_detail(f"{hint} Browse… to pick a {self._engine.launcher_kind}.", error=False)
             return
         self._menu.configure(values=list(self._paths), state="normal")
         if current is None:
             self._choice.set("Choose a launcher…")
             self._show_detail("Using launch_cmd from config.json." if self._has_launch_cmd
-                              else "Pick the .bat that starts Strata.", error=False)
+                              else self._engine.launcher_pick_text, error=False)
             return
         self._choice.set(current)
         self._select(self._paths[current])
@@ -337,14 +367,11 @@ class SettingsDialog(ctk.CTkToplevel):
             self._select(path)
 
     def _select(self, path: str) -> None:
-        """Parse the chosen .bat (read only - it is never run) and show what it would launch, or why not."""
+        """Read the chosen launcher file (read only - it is never run) and show what it would launch, or why not."""
         self._info = None
         try:
-            info = launcher_bat.parse_bat(path)
-            problem = launcher_bat.missing_files(info)
-            if problem:
-                raise LauncherError(problem)
-        except LauncherError as exc:
+            info = self._engine.read_launcher(path)
+        except LaunchError as exc:
             self._show_detail(str(exc), error=True)
             self._enable_save(False)
             self._msg.configure(text="")
@@ -359,14 +386,49 @@ class SettingsDialog(ctk.CTkToplevel):
         if not self._saving:
             self._enable_save(True)
         changed = not self._same(path, self._initial)
-        self._msg.configure(text="Applies next start — Strata keeps running" if self._running and changed else "",
+        self._msg.configure(text=f"Applies next start — {self._engine.name} keeps running"
+                            if self._running and changed else "",
                             text_color=T.TEXT_2)
+
+    def _command_changed(self, initial: bool = False) -> None:
+        """Program + arguments (engines without launcher files): ask the engine whether this would launch; only
+        then can it be saved. Nothing is run."""
+        program = self._program.get().strip().strip('"')
+        info = CommandLaunch(program=program, args=tuple(split_args(self._args.get())))
+        self._info = None
+        if not program:
+            self._enable_save(False)
+            self._msg.configure(text="" if initial else "Choose the program to start", text_color=T.TEXT_2)
+            return
+        trial = dict(self._cfg)
+        self._engine.apply_launcher(trial, info)
+        try:
+            self._engine.plan_launch(trial)
+        except LaunchError as exc:
+            self._enable_save(False)
+            self._msg.configure(text=str(exc), text_color=T.RED_TEXT)
+            return
+        except Exception as exc:  # noqa: BLE001 - an engine bug must not take the dialog down
+            log.exception("checking the launch command failed")
+            self._enable_save(False)
+            self._msg.configure(text=f"Could not check the command: {exc}", text_color=T.RED_TEXT)
+            return
+        self._info = info
+        changed = not self._engine.same_launch(self._cfg, info)
+        if not self._saving:
+            self._enable_save(changed)
+        self._msg.configure(text=f"Applies next start — {self._engine.name} keeps running"
+                            if self._running and changed else "", text_color=T.TEXT_2)
 
     def selected_path(self) -> str | None:
         return self._paths.get(self._choice.get())
 
     def choose(self, path: str) -> None:
-        """Select a .bat by path (adds it to the dropdown if needed). Used by Browse… and tests."""
+        """Select a launcher by path (adds it to the dropdown if needed), or set the program for engines without
+        launcher files. Used by Browse… and tests."""
+        if not self._files:
+            self._program.set(os.path.normpath(path))
+            return
         label = self._add_path(os.path.normpath(path))
         self._menu.configure(values=list(self._paths), state="normal")
         self._choice.set(label)
@@ -375,13 +437,19 @@ class SettingsDialog(ctk.CTkToplevel):
     def browse(self) -> None:
         if self._saving:
             return
-        start = self._strata_dir if os.path.isdir(self._strata_dir) else ""
-        cur = self.selected_path() or self._initial
+        listed = next(iter(self._paths.values()), "")
+        start = os.path.dirname(listed) if listed and os.path.isdir(os.path.dirname(listed)) else ""
+        if not start:                            # nothing listed yet: the engine's configured install folder
+            guess = str(self._cfg.get("strata_dir") or "") if self._files else ""
+            start = guess if os.path.isdir(guess) else ""
+        cur = (self.selected_path() or self._initial) if self._files else self._program.get().strip()
         if cur and os.path.isdir(os.path.dirname(cur)):
             start = os.path.dirname(cur)
         path = filedialog.askopenfilename(
-            parent=self, title="Choose a Strata launcher", initialdir=start or None,
-            filetypes=[("Batch files", "*.bat *.cmd"), ("All files", "*.*")])
+            parent=self, initialdir=start or None,
+            title=(f"Choose a {self._engine.name} launcher" if self._files
+                   else f"Choose the {self._engine.name} program"),
+            filetypes=list(self._engine.launcher_filetypes if self._files else self._engine.program_filetypes))
         if path and self._alive():
             self.choose(path)
 

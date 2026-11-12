@@ -55,7 +55,7 @@ SYS_PING = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "PIN
 logging.basicConfig(filename=str(TMP / "test.log"), level=logging.DEBUG,
                     format="%(asctime)s %(threadName)s %(levelname)s %(message)s")
 
-RESULT_KEYS = {"ok", "port_released", "killed_pids", "ram_freed_mb", "unload", "error", "cancelled_start"}
+RESULT_KEYS = {"ok", "port_released", "killed_pids", "ram_freed_mb", "unload", "error", "cancelled_start", "released"}
 STATUS_KEYS = {"state", "pid", "model_id", "adopted", "log_path", "loaded"}
 ALL_CBS: list["CB"] = []          # (CB, expected_calls) registry for the exactly-one-callback invariant
 
@@ -193,6 +193,7 @@ class CB:
 def check_result_shape(res: dict) -> None:
     assert set(res) == RESULT_KEYS, f"result keys {sorted(res)}"
     assert isinstance(res["ok"], bool) and isinstance(res["port_released"], bool)
+    assert res["released"] is res["port_released"], "released (engine-neutral) mirrors port_released for Strata"
     assert isinstance(res["killed_pids"], list) and all(isinstance(x, int) for x in res["killed_pids"])
     assert isinstance(res["ram_freed_mb"], float)
     assert res["unload"] in ("ok", "busy", "unavailable", "skipped")
@@ -443,7 +444,7 @@ def t_busy_then_force():
     assert m.stop_endpoint(cbs.stopped, force=False)
     _, res = cbs.wait(30)
     check_result_shape(res)
-    assert res == {"ok": False, "port_released": False, "killed_pids": [], "ram_freed_mb": 0.0,
+    assert res == {"ok": False, "released": False, "port_released": False, "killed_pids": [], "ram_freed_mb": 0.0,
                    "unload": "busy", "error": "busy", "cancelled_start": False}, res
     assert alive(tree) == tree and listening(port)
     note(f"busy (no force) in {time.monotonic() - t0:.2f} s -> {res}")

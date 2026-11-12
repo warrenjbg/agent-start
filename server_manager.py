@@ -1,7 +1,10 @@
-"""Start / stop / monitor the local Strata inference server (Contract 2 of SPEC.md).
+"""Start / stop / monitor the local inference server (Contract 2 of SPEC.md).
 
-`EndpointManager` launches Strata, waits until the model is loaded, and tears it down again (unload, kill the
-process tree, verify the port is released, toast). All slow work runs on daemon worker threads; results are
+`EndpointManager` launches the engine, waits until the model is loaded, and tears it down again (unload, kill
+the process tree, verify the port is released, toast). Everything engine-specific - what the server process
+looks like, how its HTTP answers are read, how it is launched and unloaded - comes from an `engines.Engine`
+(Strata by default); this module is the engine-neutral supervisor and the only place that kills.
+All slow work runs on daemon worker threads; results are
 delivered through callbacks invoked on those worker threads.
 """
 from __future__ import annotations
@@ -11,7 +14,6 @@ import datetime as _dt
 import json
 import logging
 import os
-import re
 import socket
 import struct
 import subprocess
@@ -27,19 +29,32 @@ import psutil
 
 import config_store
 from config_store import LOG_DIR, load_config, server_root
+from engines import get_engine
+from engines.base import (
+    CAP_LOAD_NUDGE,
+    CAP_UNLOAD,
+    NO_ANSWER,
+    UNLOAD_BUSY,
+    UNLOAD_UNAVAILABLE,
+    UNLOAD_UNSUPPORTED,
+    Engine,
+    HttpReply,
+    LaunchError,
+    ServiceState,
+)
+from engines.base import dir_prefix as _dir_prefix  # noqa: F401  (kept importable under the old names)
+from engines.base import explicit_port as _explicit_port  # noqa: F401
+from engines.base import norm_name as _norm_name
+from engines.base import path_under as _path_under  # noqa: F401
+from engines.strata import is_strata_cmd as _is_strata_cmd  # noqa: F401  (tests pin the strict Strata rule)
 
 log = logging.getLogger("agent_start")
 
-_STRATA_MARK = os.path.normcase("serve\\server.py")
 _LOG_KEEP = 5
-_DEFAULT_PORT = 8080
 _HEALTH_TIMEOUT_S = 2.0
 _PROBE_TIMEOUT_S = 1.0
 _PROBE_MIN_INTERVAL_S = 5.0
 _PROBE_VALID_S = 10.0
-_RUN_BAT_ABS_RE = re.compile(r'"([A-Za-z]:[\\/][^"]*?run-[^"\\/]*\.bat)"|([A-Za-z]:[\\/][^\s"]*?run-[^\s"\\/]*\.bat)',
-                             re.IGNORECASE)
-_RUN_BAT_REL_RE = re.compile(r"(?:^|[\s\"])(run-[^\s\"\\/<>|*?]*\.bat)", re.IGNORECASE)
 _SIO_TCP_INITIAL_RTO = 0x98000011
 _RTO_PARAMS = struct.pack("<HBx", 0xFFFF, 0xFE)   # TCP_INITIAL_RTO_UNSPECIFIED_RTT, ..._NO_SYN_RETRANSMISSIONS
 
@@ -73,109 +88,11 @@ def _is_listen_entry(c, port: int) -> bool:
     return c.status == psutil.CONN_LISTEN or (c.status == psutil.CONN_NONE and not c.raddr)
 
 
-_PY_NAMES = frozenset({"python", "pythonw", "py", "pyw"})
-
-
-def _is_strata_cmd(name: str | None, cmd: list[str] | None) -> bool:
-    """STRICT identity for the kill path: a python interpreter whose argv (after argv[0]) has a token that ENDS
-    with serve\\server.py. A substring match on the joined cmdline would also match e.g.
-    `hermes chat -q "... serve\\server.py ..."`, `bash -c "python serve/server.py"`, or an editor with the file
-    open - and those (plus their whole trees) would be killed on OFF. The detector keeps the loose match because
-    there it only PROTECTS."""
-    n = (name or "").casefold()
-    if n.endswith(".exe"):
-        n = n[:-4]
-    if n not in _PY_NAMES and not n.startswith("python"):
-        return False
-    def _hit(tok: str) -> bool:
-        t = os.path.normcase(str(tok).strip('"'))
-        return t == _STRATA_MARK or t.endswith(os.sep + _STRATA_MARK)   # whole path segments only
-    return any(_hit(t) for t in (cmd or [])[1:])
-
-
-def _is_strata_proc(proc: psutil.Process) -> bool:
-    try:
-        return _is_strata_cmd(proc.name(), proc.cmdline())
-    except (psutil.Error, OSError):
-        return False
-
-
-def _norm_name(name: str | None) -> str:
-    """casefold + strip ONE trailing '.exe' (same normalisation as detector.norm / user_whitelist entries)."""
-    n = (name or "").casefold()
-    return n[:-4] if n.endswith(".exe") else n
-
-
-def _dir_prefix(d: str | None) -> str:
-    """normcase(abspath(d)) + sep, or '' when d is empty/unusable - for whole-segment `startswith` checks."""
-    d = str(d or "").strip()
-    if not d:
-        return ""
-    try:
-        return os.path.normcase(os.path.abspath(d)).rstrip(os.sep) + os.sep
-    except (OSError, ValueError):
-        return ""
-
-
-def _path_under(path: str | None, prefix: str) -> bool:
-    if not path or not prefix:
-        return False
-    try:
-        full = os.path.normcase(os.path.realpath(str(path).strip('"')))
-        plain = os.path.normcase(os.path.abspath(str(path).strip('"')))
-    except (OSError, ValueError):
-        return False
-    real_prefix = _dir_prefix(os.path.realpath(prefix.rstrip(os.sep)))
-    return any(x.startswith(pre) for x in (full, plain) for pre in (prefix, real_prefix) if pre)
-
-
-def _strata_scripts(proc: psutil.Process) -> list[str]:
-    """Absolute paths of the serve\\server.py tokens in proc's argv (relative ones resolved against its cwd)."""
-    try:
-        cmd = proc.cmdline() or []
-    except (psutil.Error, OSError):
-        return []
-    out = []
-    cwd = None
-    for tok in cmd[1:]:
-        t = str(tok).strip('"')
-        nt = os.path.normcase(t)
-        if not (nt == _STRATA_MARK or nt.endswith(os.sep + _STRATA_MARK)):
-            continue
-        if not os.path.isabs(t):
-            if cwd is None:
-                try:
-                    cwd = proc.cwd() or ""
-                except (psutil.Error, OSError):
-                    cwd = ""
-            if not cwd:
-                continue
-            t = os.path.join(cwd, t)
-        out.append(t)
-    return out
-
-
 def _avail_mb() -> float | None:
     try:
         return psutil.virtual_memory().available / (1024 * 1024)
     except Exception:  # noqa: BLE001
         return None
-
-
-def _explicit_port(cmd: list[str]) -> int | None:
-    """`--port N` / `--port=N` if present, else None (no default - used where a guess could kill)."""
-    for i, tok in enumerate(cmd):
-        if tok == "--port" and i + 1 < len(cmd):
-            try:
-                return int(cmd[i + 1])
-            except ValueError:
-                return None
-        if tok.startswith("--port="):
-            try:
-                return int(tok.split("=", 1)[1])
-            except ValueError:
-                return None
-    return None
 
 
 def _proc_label(proc: psutil.Process) -> str:
@@ -186,7 +103,7 @@ def _proc_label(proc: psutil.Process) -> str:
 
 
 class EndpointManager:
-    """Owns the lifecycle of one Strata server on `config["port"]`.
+    """Owns the lifecycle of one engine server on `config["port"]`.
 
     Extra keyword-only knobs (defaults match SPEC.md; tests shorten them):
       log_dir          directory for strata-*.log files (default: config_store.LOG_DIR, read at spawn time)
@@ -197,8 +114,10 @@ class EndpointManager:
     def __init__(self, config: dict | None = None, notify: bool = True, *,
                  log_dir: str | os.PathLike | None = None,
                  poll_interval_s: float = 1.0,
-                 load_nudge_s: float = 15.0) -> None:
+                 load_nudge_s: float = 15.0,
+                 engine: Engine | None = None) -> None:
         self._cfg = config if config is not None else load_config()
+        self._engine: Engine = engine if engine is not None else get_engine(self._cfg)
         self._notify = notify
         self._log_dir = Path(log_dir) if log_dir is not None else None
         self._poll_s = max(0.05, float(poll_interval_s))
@@ -233,9 +152,9 @@ class EndpointManager:
     @property
     def _port(self) -> int:
         try:
-            return int(self._cfg.get("port", _DEFAULT_PORT))
+            return int(self._cfg.get("port", self._engine.default_port))
         except (TypeError, ValueError):
-            return _DEFAULT_PORT
+            return self._engine.default_port
 
     @property
     def _root_url(self) -> str:
@@ -273,7 +192,7 @@ class EndpointManager:
             self._adopted = False
             self._loaded = None
             t = threading.Thread(target=self._start_worker, args=(on_ready_callback, on_error_callback),
-                                 name="strata-start", daemon=True)
+                                 name=f"{self._engine.id}-start", daemon=True)
             self._start_thread = t
             t.start()
         return True
@@ -290,7 +209,7 @@ class EndpointManager:
             self._state = "stopping"
             t = threading.Thread(target=self._stop_worker,
                                  args=(on_stopped_callback, bool(force), cancelling, self._start_thread),
-                                 name="strata-stop", daemon=True)
+                                 name=f"{self._engine.id}-stop", daemon=True)
             t.start()
         return True
 
@@ -339,12 +258,16 @@ class EndpointManager:
             log.exception("protected_pids failed")
             return set()
 
-    def strata_memory_mb(self) -> float | None:
-        """Physical RAM held by the running Strata tree: the sum of working sets.
+    @property
+    def engine(self) -> Engine:
+        return self._engine
+
+    def engine_memory_mb(self) -> float | None:
+        """Physical RAM held by the running engine tree: the sum of working sets.
 
         Not private commit: in full-RAM mode strata.exe commits far more than it has resident (measured: working set
         48.7 GB, private commit 63.3 GB on a 64 GB PC), so max(rss, private) booked the whole machine to Strata.
-        None when no Strata server is found. Cheap (no HTTP); call from a worker thread.
+        None when no engine server is found. Cheap (no HTTP); call from a worker thread.
         """
         try:
             root, _foreign = self._locate_root(fallback=False)
@@ -359,63 +282,105 @@ class EndpointManager:
                     continue
             return round(total / (1024 * 1024), 1)
         except Exception:  # noqa: BLE001
-            log.debug("strata_memory_mb failed", exc_info=True)
+            log.debug("engine_memory_mb failed", exc_info=True)
             return None
 
+    strata_memory_mb = engine_memory_mb          # the name used before engines existed
+
     # ------------------------------------------------------------------ HTTP
-    def _request(self, method: str, path: str, timeout: float) -> tuple[int | None, object]:
+    def _http(self, method: str, path: str, timeout: float, extra_headers: dict | None = None) -> HttpReply:
+        """One request to the engine's port (loopback, no proxy). Never raises; code None = no answer."""
         url = self._root_url + path
         data = None
         headers = {}
         if method == "POST":
             data = b"{}"
             headers = {"Content-Type": "application/json", "Content-Length": str(len(data))}
+        headers.update(extra_headers or {})
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with self._opener.open(req, timeout=timeout) as resp:
                 raw = resp.read()
                 code = resp.status
+                hdrs = resp.headers
         except urllib.error.HTTPError as e:
             try:
                 raw = e.read()
             except Exception:  # noqa: BLE001
                 raw = b""
             code = e.code
+            hdrs = e.headers
         except Exception as e:  # noqa: BLE001 - URLError, timeouts, resets
             log.debug("%s %s failed: %s", method, url, e)
-            return None, None
+            return HttpReply()
         try:
             body = json.loads(raw.decode("utf-8", "replace")) if raw else None
         except ValueError:
             body = None
-        return code, body
+        try:
+            hmap = {str(k).lower(): str(v) for k, v in (hdrs.items() if hdrs is not None else ())}
+        except Exception:  # noqa: BLE001
+            hmap = {}
+        return HttpReply(code=code, json=body, headers=hmap)
 
-    def _health(self, timeout: float = _HEALTH_TIMEOUT_S) -> dict | None:
-        code, body = self._request("GET", "/health", timeout)
-        if code == 200 and isinstance(body, dict):
-            return body
-        return None
+    def _http_id(self, method: str, path: str, timeout: float) -> HttpReply:
+        """A request to a port ALREADY identified as the engine: adds the engine's own headers (an API key).
+        The identity probe uses plain _http, so a foreign program on the port is never sent them."""
+        try:
+            extra = {str(k): str(v) for k, v in (self._engine.request_headers(self._cfg) or {}).items()}
+        except Exception:  # noqa: BLE001
+            extra = {}
+        if extra and not self._probe(_PROBE_TIMEOUT_S).is_engine:
+            # A process can be verified from process facts alone (listener PID hidden) while something else
+            # answers on the port: the key only goes out when the port's own answer says it is the engine.
+            log.warning("not sending the %s request headers: the port did not identify itself", self._engine.name)
+            extra = {}
+        return self._http(method, path, timeout, extra)
 
-    def _fetch_model_id(self, health: dict | None) -> str | None:
-        code, body = self._request("GET", "/v1/models", _HEALTH_TIMEOUT_S)
-        if code == 200 and isinstance(body, dict):
-            data = body.get("data")
-            if isinstance(data, list) and data and isinstance(data[0], dict) and data[0].get("id"):
-                return str(data[0]["id"])
-        if health and health.get("model"):
-            return str(health["model"])
-        return None
+    def _probe(self, timeout: float = _HEALTH_TIMEOUT_S) -> ServiceState:
+        """What the port says it is (engine.probe). Never raises: a failing engine probe counts as no answer."""
+        try:
+            st = self._engine.probe(self._http, timeout)
+        except Exception:  # noqa: BLE001
+            log.debug("engine probe failed", exc_info=True)
+            return NO_ANSWER
+        return st if isinstance(st, ServiceState) else NO_ANSWER
+
+    def _fetch_model_id(self, state: ServiceState) -> str | None:
+        try:
+            return self._engine.fetch_model_id(self._http_id, state) or None
+        except Exception:  # noqa: BLE001
+            log.debug("model id lookup failed", exc_info=True)
+            return state.model
 
     def _unload(self, force: bool) -> str:
-        if force:
-            code, _ = self._request("POST", "/unload", 5.0)
-        else:
-            code, _ = self._request("POST", "/unload?wait=10", 15.0)
-        if code == 200:
-            return "ok"
-        if code == 409:
-            return "busy"
-        return "unavailable"
+        """Ask the engine to release the model. Engines without an unload call answer 'unsupported': for them
+        the model is released by ending the process."""
+        if not self._engine.can(CAP_UNLOAD):
+            return UNLOAD_UNSUPPORTED
+        try:
+            return str(self._engine.unload(self._http_id, force))
+        except Exception:  # noqa: BLE001
+            log.debug("unload failed", exc_info=True)
+            return UNLOAD_UNAVAILABLE
+
+    def _engine_busy(self) -> bool:
+        """engine.is_busy for engines without an unload call; unknown or an error = not busy (the stop goes on)."""
+        try:
+            return self._engine.is_busy(self._http_id) is True
+        except Exception:  # noqa: BLE001
+            log.debug("busy check failed", exc_info=True)
+            return False
+
+    def _is_engine_proc(self, proc: psutil.Process) -> bool:
+        """STRICT process identity (engine.is_server_process); unknown = no."""
+        try:
+            return bool(self._engine.is_server_process(proc.name(), proc.cmdline()))
+        except (psutil.Error, OSError):
+            return False
+        except Exception:  # noqa: BLE001 - an engine bug must never widen a kill
+            log.exception("engine identity check failed")
+            return False
 
     # ------------------------------------------------------------------ process helpers
     def _listener_pids(self) -> list[int] | None:
@@ -426,13 +391,12 @@ class EndpointManager:
         port = self._port
         return sorted({c.pid for c in conns if c.pid and _is_listen_entry(c, port)})
 
-    @staticmethod
-    def _topmost_strata(proc: psutil.Process) -> psutil.Process:
+    def _topmost_engine(self, proc: psutil.Process) -> psutil.Process:
         cur = proc
         for _ in range(64):
             try:
                 par = cur.parent()
-                if par is None or par.create_time() > cur.create_time() or not _is_strata_proc(par):
+                if par is None or par.create_time() > cur.create_time() or not self._is_engine_proc(par):
                     break
             except (psutil.Error, OSError):
                 break
@@ -440,7 +404,7 @@ class EndpointManager:
         return cur
 
     def _locate_root(self, fallback: bool = True) -> tuple[psutil.Process | None, str | None]:
-        """Return (top-most Strata server process for our port, None) or (None, foreign-listener message)."""
+        """Return (top-most engine server process for our port, None) or (None, foreign-listener message)."""
         port = self._port
         pids = self._listener_pids()
         if pids:
@@ -450,13 +414,12 @@ class EndpointManager:
                     p = psutil.Process(pid)
                 except psutil.Error:
                     continue
-                if _is_strata_proc(p):
-                    return self._topmost_strata(p), None
+                if self._is_engine_proc(p):
+                    return self._topmost_engine(p), None
                 if first_foreign is None:
                     first_foreign = p
             if first_foreign is not None:
-                return None, (f"port {port} held by {_proc_label(first_foreign)} "
-                              f"(pid {first_foreign.pid}), not Strata")
+                return None, self._not_engine_msg(port, first_foreign)
         if not fallback:
             return None, None
         sp = self._spawn_proc
@@ -467,26 +430,26 @@ class EndpointManager:
             except psutil.Error:
                 pass
         found: list[psutil.Process] = []
-        sdir = str(self._cfg.get("strata_dir") or "")
-        sdir_n = os.path.normcase(os.path.abspath(sdir)).rstrip(os.sep) + os.sep if sdir else ""
         # NB: plain process_iter() + direct calls (not attrs/p.info) so a concurrent detector scan that shares
         # psutil's cached Process objects cannot clobber .info underneath either caller.
         for p in psutil.process_iter():
             try:
                 cmd = p.cmdline() or []
-                if not _is_strata_cmd(p.name(), cmd):
+                if not self._is_engine_proc(p):
                     continue
-                port_ok = _explicit_port(cmd) == port
-                in_dir = bool(sdir_n) and any(os.path.normcase(os.path.abspath(str(t).strip('"'))).startswith(sdir_n)
-                                              for t in cmd[1:] if str(t).casefold().endswith(".py"))
-                if port_ok or (in_dir and _explicit_port(cmd) in (None, port) and port == _DEFAULT_PORT):
+                try:
+                    claims = bool(self._engine.claims_port(cmd, port, self._cfg))
+                except Exception:  # noqa: BLE001 - an engine bug: unknown = not ours
+                    log.exception("engine port check failed")
+                    claims = False
+                if claims:
                     found.append(p)
             except (psutil.Error, OSError, ValueError):
                 continue
         if found:
             roots = {}
             for p in found:
-                r = self._topmost_strata(p)
+                r = self._topmost_engine(p)
                 roots[r.pid] = r
             def _ctime(r: psutil.Process) -> float:
                 try:
@@ -509,14 +472,15 @@ class EndpointManager:
         return {_norm_name(n) for n in (self._cfg.get("user_whitelist") or []) if isinstance(n, str) and n.strip()}
 
     def _kill_targets(self, root: psutil.Process, log_skips: bool = True) -> list[psutil.Process]:
-        """The part of root's tree that OFF may kill. `root` (already identified as Strata) is always kept; a
-        descendant is kept only if it is Strata: a python running serve\\server.py, an exe under strata_dir
-        (engine\\strata.exe, strata-vision.exe, the venv python), or a conhost.exe whose parent is kept.
-        Everything else - e.g. the browser that `--open` / webbrowser.open() starts as a child of Strata's python -
+        """The part of root's tree that OFF may kill. `root` (already identified as the engine) is always kept; a
+        descendant is kept only if it is the engine's: a server process (engine.is_server_process), a helper the
+        engine claims (engine.owns_child - for Strata an exe under strata_dir: engine\\strata.exe,
+        strata-vision.exe, the venv python), or a conhost.exe whose parent is kept.
+        Everything else - e.g. the browser that `--open` / webbrowser.open() starts as a child of the server -
         is left running, and so is any process whose name is in user_whitelist (unless its cmdline identifies it
-        as the Strata server itself). The unfiltered _tree() stays in use where processes are only PROTECTED."""
+        as the engine server itself). The unfiltered _tree() stays in use where processes are only PROTECTED.
+        The engine only answers yes/no about members of root's tree: it cannot add a process from outside it."""
         tree = self._tree(root)
-        prefix = _dir_prefix(self._cfg.get("strata_dir"))
         wl = self._whitelist()
         kept: set[int] = {root.pid}
         pending: list[tuple[psutil.Process, str]] = []
@@ -528,19 +492,17 @@ class EndpointManager:
                 continue
             except (psutil.Error, OSError):
                 name = ""
-            if _is_strata_proc(p):
+            if self._is_engine_proc(p):
                 kept.add(p.pid)
                 continue
             if _norm_name(name) in wl:
                 skipped.append((name, p.pid, "user_whitelist"))
                 continue
-            exe = ""
-            if prefix:
-                try:
-                    exe = p.exe() or ""
-                except (psutil.Error, OSError):
-                    exe = ""
-            if exe and _path_under(exe, prefix):
+            try:
+                owned = bool(self._engine.owns_child(p, self._cfg))
+            except Exception:  # noqa: BLE001 - unknown = not ours
+                owned = False
+            if owned:
                 kept.add(p.pid)
                 continue
             pending.append((p, name))
@@ -559,7 +521,7 @@ class EndpointManager:
                     kept.add(p.pid)
                     pending.remove(item)
                     changed = True
-        skipped.extend((name or "unknown process", p.pid, "not Strata") for p, name in pending)
+        skipped.extend((name or "unknown process", p.pid, f"not {self._engine.name}") for p, name in pending)
         if log_skips:
             for name, pid, why in skipped:
                 log.info("stop: leaving %s (pid %s) running - %s", name, pid, why)
@@ -572,63 +534,43 @@ class EndpointManager:
         except psutil.Error:
             return False
 
-    def _script_in_strata_dir(self, proc: psutil.Process) -> bool:
-        prefix = _dir_prefix(self._cfg.get("strata_dir"))
-        return bool(prefix) and any(_path_under(s, prefix) for s in _strata_scripts(proc))
-
-    def _verified_strata(self, root: psutil.Process, health: dict | None = None,
-                         probe_health: bool = True) -> bool:
+    def _verified_engine(self, root: psutil.Process, state: ServiceState | None = None,
+                         probe: bool = True) -> bool:
         """Kill/unload-grade identity for a process _locate_root() matched by cmdline: the server we spawned,
-        OR its serve\\server.py lives under strata_dir, OR GET /health on the port says service == 'strata'.
-        A different project's serve/server.py on the port passes none of these."""
-        if self._is_own_spawn(root) or self._script_in_strata_dir(root):
+        OR the engine proves it from process facts (Strata: its serve\\server.py lives under strata_dir), OR
+        the port's own answer identifies the engine (Strata: GET /health says service == 'strata').
+        A different project's look-alike on the port passes none of these."""
+        if self._is_own_spawn(root):
             return True
-        if health is None and probe_health:
-            health = self._health()
-        return health is not None and health.get("service") == "strata"
+        try:
+            if self._engine.verified_by_process(root, self._cfg):
+                return True
+        except Exception:  # noqa: BLE001 - unknown = not verified
+            log.exception("engine verification failed")
+        if state is None and probe:
+            state = self._probe()
+        return state is not None and state.is_engine
 
-    @staticmethod
-    def _not_strata_msg(port: int, proc: psutil.Process) -> str:
-        return f"port {port} held by {_proc_label(proc)} (pid {proc.pid}), not Strata"
+    def _not_engine_msg(self, port: int, proc: psutil.Process) -> str:
+        return f"port {port} held by {_proc_label(proc)} (pid {proc.pid}), not {self._engine.name}"
 
     def _launcher_cmd(self, root: psutil.Process) -> psutil.Process | None:
-        """cmd.exe /c "<strata_dir>\\run-*.bat" (or the configured launcher .bat) that launched `root`, else None."""
-        sdir = str(self._cfg.get("strata_dir") or "").strip()
-        bat = str(self._cfg.get("launcher_bat") or "").strip()
-        own_bat = os.path.normcase(os.path.abspath(bat)) if bat and os.path.isabs(bat) else None
-        if not sdir and own_bat is None:
-            return None
-        prefix = os.path.normcase(os.path.abspath(sdir)) + os.sep if sdir else None
+        """The wrapper process that launched `root` and ends with it (Strata: cmd.exe /c "...\\run-*.bat"), as
+        named by the engine - accepted only if it really is root's direct, older parent."""
         try:
+            cand = self._engine.launcher_process(root, self._cfg)
+            if cand is None:
+                return None
             par = root.parent()
-            if par is None or par.create_time() > root.create_time():
+            if par is None or cand != par or cand.pid != par.pid or par.create_time() > root.create_time():
+                log.warning("stop: ignoring launcher %r - not the direct parent of pid %s", cand, root.pid)
                 return None
-            from_name = par.name().casefold()
-            if from_name.endswith(".exe"):
-                from_name = from_name[:-4]
-            if from_name != "cmd":
-                return None
-            joined = " ".join(par.cmdline() or [])
+            return par
         except (psutil.Error, OSError):
             return None
-        if not re.search(r"(^|\s)/c(\s|$)", joined, re.IGNORECASE):
+        except Exception:  # noqa: BLE001 - an engine bug must never widen a kill
+            log.exception("engine launcher lookup failed")
             return None
-        cands = [m.group(1) or m.group(2) for m in _RUN_BAT_ABS_RE.finditer(joined)]
-        if not cands:
-            try:
-                cwd = par.cwd()
-            except (psutil.Error, OSError):
-                cwd = ""
-            if cwd:
-                cands = [os.path.join(cwd, m.group(1)) for m in _RUN_BAT_REL_RE.finditer(joined)]
-        for cand in cands:
-            try:
-                full = os.path.normcase(os.path.abspath(cand.strip()))
-            except (OSError, ValueError):
-                continue
-            if (prefix is not None and full.startswith(prefix)) or full == own_bat:
-                return par
-        return None
 
     @staticmethod
     def _kill(procs: list[psutil.Process]) -> tuple[list[int], list[str]]:
@@ -681,18 +623,17 @@ class EndpointManager:
         d = self._log_dir if self._log_dir is not None else Path(config_store.LOG_DIR or LOG_DIR)
         d.mkdir(parents=True, exist_ok=True)
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = d / f"strata-{stamp}.log"
+        path = d / f"{self._engine.log_prefix}-{stamp}.log"
         n = 1
         while path.exists():
-            path = d / f"strata-{stamp}-{n}.log"
+            path = d / f"{self._engine.log_prefix}-{stamp}-{n}.log"
             n += 1
         return path
 
-    @staticmethod
-    def _prune_logs(d: Path, keep_path: Path) -> None:
+    def _prune_logs(self, d: Path, keep_path: Path) -> None:
         try:
             files = []
-            for f in d.glob("strata-*.log"):
+            for f in d.glob(f"{self._engine.log_prefix}-*.log"):
                 try:
                     files.append((f.stat().st_mtime, f.name, f))
                 except OSError:
@@ -739,34 +680,27 @@ class EndpointManager:
             return
         kind, msg = outcome
         if kind == "ready":
-            log.info("Strata ready: model=%s adopted=%s", self._model_id, self._adopted)
+            log.info("%s ready: model=%s adopted=%s", self._engine.name, self._model_id, self._adopted)
             self._fire(on_ready)
         else:
-            log.warning("Strata start failed: %s", msg)
+            log.warning("%s start failed: %s", self._engine.name, msg)
             self._fire(on_error, msg)
 
     def _do_start(self, abort: threading.Event) -> tuple[str, str] | None:
         if self.is_running():
             return self._adopt(abort)
-        cmd = [str(x) for x in (self._cfg.get("launch_cmd") or [])]
-        if not cmd:
-            return "error", "No Strata launcher chosen yet · open Settings (gear) and pick your run-*.bat"
-        if not cmd[0].strip().casefold().endswith(".exe"):
-            # never hand a .bat/.cmd/script to CreateProcess: that runs it through cmd.exe (hand-edited config.json)
-            return "error", (f"Launch command must start with python.exe (the Strata venv interpreter), "
-                             f"not {os.path.basename(cmd[0]) or cmd[0]!r} - re-select the run-*.bat in Settings")
-        if not os.path.isfile(cmd[0]):
-            return "error", f"launcher not found: {cmd[0]}"
-        sdir = str(self._cfg.get("strata_dir") or "")
-        if not sdir or not os.path.isdir(sdir):
-            return "error", f"strata_dir not found: {sdir or '(empty)'}"
-        # the directory the chosen run-*.bat starts the server from (its `cd /d`); v1.0 configs have none
-        cwd = str(self._cfg.get("launch_cwd") or "")
-        if not cwd or not os.path.isdir(cwd):
-            cwd = sdir
+        name = self._engine.name
+        try:
+            plan = self._engine.plan_launch(self._cfg)
+        except LaunchError as e:
+            return "error", str(e)
+        cmd, cwd = [str(x) for x in plan.cmd], plan.cwd
+        if not cmd or not cmd[0].strip().casefold().endswith(".exe") or not os.path.isfile(cmd[0]):
+            # whatever the engine planned: never hand a .bat/.cmd/script to CreateProcess (it runs via cmd.exe)
+            return "error", f"launch command is not an existing .exe: {cmd[0] if cmd else '(empty)'}"
         log_path = self._new_log_path()
         env = dict(os.environ)
-        env.update(PYTHONUTF8="1", PYTHONUNBUFFERED="1")
+        env.update({str(k): str(v) for k, v in (plan.env or {}).items()})
         flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         with self._lock:
             if abort.is_set():
@@ -779,7 +713,7 @@ class EndpointManager:
                 popen = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=fh,
                                          stderr=subprocess.STDOUT, creationflags=flags, env=env)
             except OSError as e:
-                return "error", f"failed to launch Strata: {e}"
+                return "error", f"failed to launch {name}: {e}"
             finally:
                 fh.close()
             self._popen = popen
@@ -790,7 +724,7 @@ class EndpointManager:
             self._log_path = str(log_path)
             self._last_pid = popen.pid
         self._prune_logs(log_path.parent, log_path)
-        log.info("launched Strata pid=%s log=%s", popen.pid, log_path)
+        log.info("launched %s pid=%s log=%s", name, popen.pid, log_path)
 
         timeout = self._timeout_cfg("ready_timeout_s", 180)
         deadline = time.monotonic() + timeout
@@ -801,10 +735,10 @@ class EndpointManager:
                 return None
             rc = popen.poll()
             if rc is not None:
-                return "error", f"Strata exited (code {rc}) — see {log_path}"
-            h = self._health()
-            if h is not None and h.get("service") == "strata":
-                loaded = h.get("loaded") is True
+                return "error", f"{name} exited (code {rc}) — see {log_path}"
+            h = self._probe()
+            if h.is_engine:
+                loaded = h.loaded is True
                 with self._lock:
                     self._loaded = loaded
                 if loaded:
@@ -817,9 +751,12 @@ class EndpointManager:
                 now = time.monotonic()
                 if unloaded_since is None:
                     unloaded_since = now
-                elif not nudged and now - unloaded_since > self._nudge_s:
+                elif not nudged and now - unloaded_since > self._nudge_s and self._engine.can(CAP_LOAD_NUDGE):
                     nudged = True
-                    code, _ = self._request("POST", "/load", 3.0)
+                    try:
+                        code = self._engine.nudge_load(self._http_id)
+                    except Exception:  # noqa: BLE001
+                        code = None
                     log.info("sent POST /load (status %s)", code)
             if time.monotonic() >= deadline:
                 if abort.is_set():
@@ -827,7 +764,7 @@ class EndpointManager:
                 if self._spawn_proc is not None:
                     killed, errs = self._kill(self._kill_targets(self._spawn_proc))
                     log.warning("ready timeout: killed %s %s", killed, errs)
-                return "error", f"Strata not ready after {timeout:g} s — see {log_path}"
+                return "error", f"{name} not ready after {timeout:g} s — see {log_path}"
             abort.wait(self._poll_s)
 
     def _adopt(self, abort: threading.Event) -> tuple[str, str] | None:
@@ -841,20 +778,20 @@ class EndpointManager:
             if abort.is_set():
                 return None
             if not self.is_running():
-                return "error", f"port {port} stopped listening while waiting for Strata"
-            h = self._health()
-            health_strata = h is not None and h.get("service") == "strata"
+                return "error", f"port {port} stopped listening while waiting for {self._engine.name}"
+            h = self._probe()
+            health_strata = h.is_engine
             root, foreign = self._locate_root(fallback=False)
             if foreign and not health_strata:
                 return "error", foreign
-            if root is not None and h is not None and not health_strata \
-                    and not self._verified_strata(root, h, probe_health=False):
-                return "error", self._not_strata_msg(port, root)   # another project's serve/server.py
+            if root is not None and h.answered and not health_strata \
+                    and not self._verified_engine(root, h, probe=False):
+                return "error", self._not_engine_msg(port, root)   # another project's look-alike server
             if root is not None:
                 with self._lock:
                     self._last_pid = root.pid
             if health_strata:
-                loaded = h.get("loaded") is True
+                loaded = h.loaded is True
                 with self._lock:
                     self._loaded = loaded
                 if loaded:
@@ -865,13 +802,15 @@ class EndpointManager:
                     self._prime_probe(model)
                     return "ready", ""
             if time.monotonic() >= deadline:
-                return "error", (f"Strata already running on port {port} but not ready after {timeout:g} s "
-                                 f"(left running)")
+                return "error", (f"{self._engine.name} already running on port {port} but not ready after "
+                                 f"{timeout:g} s (left running)")
             abort.wait(self._poll_s)
 
     # ------------------------------------------------------------------ stop worker
     def _new_result(self, cancelling: bool) -> dict:
-        return {"ok": False, "port_released": False, "killed_pids": [], "ram_freed_mb": 0.0,
+        # "released": the engine no longer holds the model - the engine-neutral fact the UI acts on. For an
+        # engine that is a process we end (Strata) it equals "port_released", which stays for diagnostics.
+        return {"ok": False, "released": False, "port_released": False, "killed_pids": [], "ram_freed_mb": 0.0,
                 "unload": "skipped", "error": None, "cancelled_start": cancelling}
 
     def _stop_worker(self, cb: Callable[[dict], None], force: bool, cancelling: bool,
@@ -886,6 +825,7 @@ class EndpointManager:
             log.exception("stop worker failed")
             result["ok"] = False
             result["error"] = f"stop failed: {e}"
+        result["released"] = bool(result.get("port_released"))
         with self._lock:
             self._state = "idle"
         log.info("stop result: %s", result)
@@ -929,29 +869,30 @@ class EndpointManager:
         if foreign:
             result["error"] = foreign
             return
-        if root is not None and not self._verified_strata(root):
-            # a python running SOME serve\\server.py that is not under strata_dir and whose /health is not Strata:
-            # never /unload or kill it
-            result["error"] = self._not_strata_msg(self._port, root)
+        if root is not None and not self._verified_engine(root):
+            # a look-alike (Strata: a python running SOME serve\\server.py that is not under strata_dir and whose
+            # /health is not Strata): never unload or kill it
+            result["error"] = self._not_engine_msg(self._port, root)
             result["port_released"] = not self.is_running()
-            log.warning("stop refused: %s (cmdline %s)", result["error"], _strata_scripts(root))
+            log.warning("stop refused: %s", result["error"])
             return
         # measure BEFORE /unload: the unload itself releases the model, so a post-unload RSS reads ~0.2 GB
         pre_unload_mb = self._rss_mb(self._kill_targets(root, log_skips=False)) if root is not None else 0.0
         avail_before = _avail_mb()
         if root is None:
-            # No Strata process found for the port (listener PID hidden / not ours). Only talk to the port if
-            # /health says it IS Strata - never POST /unload at an unidentified service.
-            h = self._health()
-            if h is None or h.get("service") != "strata":
+            # No engine process found for the port (listener PID hidden / not ours). Only talk to the port if
+            # its own answer says it IS the engine - never send an unload to an unidentified service.
+            if not self._probe().is_engine:
                 result["unload"] = "unavailable"
                 result["port_released"] = not self.is_running()
                 result["ok"] = result["port_released"]
                 if not result["ok"]:
-                    result["error"] = f"could not identify a Strata server on port {self._port}"
+                    result["error"] = f"could not identify a {self._engine.name} server on port {self._port}"
                 return
         result["unload"] = self._unload(force)
-        if result["unload"] == "busy" and not force:
+        if result["unload"] == UNLOAD_UNSUPPORTED and not force and self._engine_busy():
+            result["unload"] = UNLOAD_BUSY          # no unload call to refuse for it: the engine says a reply runs
+        if result["unload"] == UNLOAD_BUSY and not force:
             result["error"] = "busy"
             return
         stop_timeout = self._timeout_cfg("stop_timeout_s", 20)
@@ -965,7 +906,7 @@ class EndpointManager:
             killed, errors = self._kill(procs)
             result["killed_pids"] = killed
         else:
-            errors.append(f"could not locate the Strata process for port {self._port}")
+            errors.append(f"could not locate the {self._engine.name} process for port {self._port}")
         released = self._wait_port_released(stop_timeout)
         result["port_released"] = released
         if released and avail_before is not None:
@@ -999,7 +940,8 @@ class EndpointManager:
             result["error"] = "; ".join(errors)
 
     def _toast(self, model: str, note: tuple[str, str] | None = None, freed_mb: float | None = None) -> None:
-        title, msg = "Strata stopped", f"Strata stopped: {model} unloaded and memory freed."
+        name = self._engine.name
+        title, msg = f"{name} stopped", f"{name} stopped: {model} unloaded and memory freed."
         if note:
             freed = f"{freed_mb / 1024:.1f} GB" if isinstance(freed_mb, (int, float)) and freed_mb > 0 else "its memory"
             try:
@@ -1046,15 +988,15 @@ class EndpointManager:
             self._identity_probe_body()
 
     def _identity_probe_body(self) -> None:
-        h = self._health(_PROBE_TIMEOUT_S)
+        h = self._probe(_PROBE_TIMEOUT_S)
         root, _foreign = self._locate_root(fallback=False)
-        health_strata = h is not None and h.get("service") == "strata"
-        strata = health_strata or (root is not None and self._verified_strata(root, h, probe_health=False))
+        health_strata = h.is_engine
+        strata = health_strata or (root is not None and self._verified_engine(root, h, probe=False))
         with self._probe_lock:
             if strata:
                 self._confirmed_at = time.monotonic()
                 self._probe_pid = root.pid if root is not None else None
-                self._probe_model = str(h.get("model")) if h and h.get("model") else None
-                self._probe_loaded = (h.get("loaded") is True) if h is not None else None
+                self._probe_model = h.model or None
+                self._probe_loaded = (h.loaded is True) if h.answered else None
             else:
                 self._confirmed_at = 0.0

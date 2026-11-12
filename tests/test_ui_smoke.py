@@ -857,7 +857,7 @@ def test_low_ram(app, det, ep) -> None:
     old_cmd = app.cfg.get("launch_cmd")
     app.cfg["launch_cmd"] = ["python.exe", "server.py", "--config", str(cfg_json), "--port", str(TEST_PORT)]
     try:
-        check(app._strata_config_path() == str(cfg_json), "config path from launch_cmd --config")
+        check(app.engine.config_path(app.cfg) == str(cfg_json), "config path from launch_cmd --config")
         plan = app._ram_plan([dict(c) for c in CANDS])
         check(plan is not None and abs(plan.need_mb - (46.84 + ram_plan.DEFAULT_HEADROOM_GIB) * 1024) < 1, f"plan uses the learned arena ({plan})")
 
@@ -993,9 +993,9 @@ def test_review_fixes(app, det, ep) -> None:
         main.TOGGLE_DEBOUNCE_S = 0.0
     # 2) a launcher saved while ANOTHER program holds the old port is applied (not stuck forever)
     applied = []
-    real_apply = main.launcher_bat.apply_to_config
-    main.launcher_bat.apply_to_config = lambda cfg, info: applied.append(info.bat_name)
-    info = SimpleNamespace(bat_name="run-x.bat", bat_path=r"C:\x\run-x.bat", model_name="m", port=8081,
+    real_apply = app.engine.apply_launcher
+    app.engine.apply_launcher = lambda cfg, info: applied.append(info.file_name)
+    info = SimpleNamespace(file_name="run-x.bat", path=r"C:\x\run-x.bat", model_name="m", port=8081,
                            summary=lambda: "m · port 8081")
     try:
         ep.status_value = {**IDLE_STATUS, "state": "active"}          # port answers...
@@ -1012,7 +1012,7 @@ def test_review_fixes(app, det, ep) -> None:
               "Strata on the old port: the launcher waits")
         check("applies when Strata on port" in status(app), f"and says so ({status(app)!r})")
     finally:
-        main.launcher_bat.apply_to_config = real_apply
+        app.engine.apply_launcher = real_apply
         ep.protected_pids = real_prot
         app._pending_launcher = None
         ep.status_value = dict(IDLE_STATUS)

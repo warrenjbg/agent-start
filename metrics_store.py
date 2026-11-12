@@ -1,9 +1,16 @@
-"""Strata `GET /metrics` (JSON) -> the series the stats section draws.
+"""Engine metrics -> the series the stats section draws, plus Strata's side of it.
+
+Two layers:
+  engine-neutral   `MetricsStore` only ever sees `engines.base.MetricsSample` objects: it keeps the last 30 finished
+                   requests by key, the live values of the latest poll, `activity()` for the status line.
+  Strata           `strata_sample()` turns one Strata `GET /metrics` JSON document into a MetricsSample (decode_rate /
+                   prompt_rate clean the per-request speeds); `StrataPoller` fetches it (+ GET /status when a request
+                   just ended) and is what `engines.strata.StrataEngine.metrics_poller()` returns.
 
 Strata returns only its newest 12 finished requests per poll (newest first), so `MetricsStore` accumulates them by
 request id across polls and keeps the last 30. `fetch_metrics(..., all_requests=True)` asks for every request Strata
-keeps (`?requests=all`, up to 500) - the catch-up after the section was collapsed. Pure data handling; `fetch_metrics` is the only I/O and is always
-called from a worker thread.
+keeps (`?requests=all`, up to 500) - the catch-up after the section was collapsed. `fetch_metrics` / `fetch_status`
+are the only I/O and are always called from a worker thread.
 """
 from __future__ import annotations
 
@@ -12,6 +19,10 @@ import logging
 import math
 import urllib.request
 from collections import OrderedDict
+from dataclasses import replace
+from typing import Any, Callable
+
+from engines.base import LiveSample, MetricsPoller, MetricsSample, RequestEnd, RequestSample
 
 log = logging.getLogger("agent_start")
 
@@ -26,14 +37,14 @@ _MB = 1024.0 * 1024.0
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))     # never through a system proxy
 
 
-def _num(v) -> float | None:
+def _num(v: Any) -> float | None:
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
     v = float(v)
     return v if math.isfinite(v) else None
 
 
-def decode_rate(req: dict) -> float | None:
+def decode_rate(req: dict[str, Any]) -> float | None:
     """Decode tok/s of one finished request (Strata computes it; None for 0/1-token answers).
 
     None as well when fewer than MIN_DECODE_TOKENS were generated (`engine_generated`, else `output_tokens`): the
@@ -50,7 +61,7 @@ def decode_rate(req: dict) -> float | None:
     return v
 
 
-def prompt_rate(req: dict) -> float | None:
+def prompt_rate(req: dict[str, Any]) -> float | None:
     """Prompt-reading tok/s of one finished request: tokens actually read / prompt seconds.
 
     `prompt_read` is preferred; older engines do not report it, then the whole prompt minus the reused (cached)
@@ -70,19 +81,106 @@ def prompt_rate(req: dict) -> float | None:
     return read / (ms / 1000.0)
 
 
+# ------------------------------------------------------------------------------------------------ Strata converter
+_TOOL_WRITING = "writing a tool call"     # Strata phase while the model writes a tool call ("...: <name>" when known)
+_TOOL_DONE = "tool call complete"         # Strata phase once that call is written (the request ends in it)
+
+
+def _req_key(req: dict[str, Any]) -> str | None:
+    """A Strata request's identity across polls: its id, else (time, output_tokens); None = cannot be tracked."""
+    rid = req.get("id")
+    if rid not in (None, ""):
+        return str(rid)
+    t = _num(req.get("time"))
+    return None if t is None else f"t{t!r}/{req.get('output_tokens')!r}"
+
+
+def _phase_tool(phase: Any) -> tuple[bool, str | None]:
+    """(ends in a tool call, tool name) from one Strata phase string: 'writing a tool call[: <name>]' or
+    'tool call complete' -> True; the name is the text after the first ':' (None when empty / absent)."""
+    if not isinstance(phase, str) or not (phase.startswith(_TOOL_WRITING) or phase == _TOOL_DONE):
+        return False, None
+    name = phase.split(":", 1)[1].strip() if ":" in phase else ""
+    return True, name or None
+
+
+def strata_request_end(phase: Any, tool: Any = None) -> RequestEnd:
+    """How a request ended, from Strata's GET /status `phase` / `tool` (read while idle: the last request's final
+    phase). A named `tool` wins over the name in the phase text."""
+    tool_call, name = _phase_tool(phase)
+    if not tool_call:
+        return RequestEnd(tool_call=False)
+    return RequestEnd(tool_call=True, tool=tool if isinstance(tool, str) and tool else name)
+
+
+def _strata_live(live: Any) -> LiveSample | None:
+    if not isinstance(live, dict):
+        return None
+    state, phase = live.get("state"), live.get("phase")
+    phase = phase if isinstance(phase, str) else None
+    tool_call, tool = _phase_tool(phase)
+    tok_s = _num(live.get("tok_s"))
+    return LiveSample(
+        state=state if isinstance(state, str) else None,
+        queued=int(_num(live.get("queued")) or 0),
+        phase=phase, in_tool_call=tool_call, tool=tool,
+        prompt_read=_num(live.get("prompt_read")), prompt_total=_num(live.get("prompt_total")),
+        prompt_tokens=_num(live.get("prompt_tokens")), generated=_num(live.get("generated")),
+        max_tokens=_num(live.get("max_tokens")),
+        decode_tps=tok_s if tok_s is not None and tok_s > 0 else None,
+        decode_tps_mean=_num(live.get("tok_s_mean")),
+        prompt_tps_mean=_num(live.get("prefill_tok_s_mean")))
+
+
+def strata_sample(doc: Any) -> MetricsSample | None:
+    """One Strata GET /metrics JSON document -> MetricsSample (None for a non-dict). Pure; never raises on junk.
+
+    A `_last_end` key ({"phase", "tool"} from GET /status, put there by a caller) becomes `last_end`."""
+    if not isinstance(doc, dict):
+        return None
+    engine = doc.get("engine")
+    model = engine.get("model") if isinstance(engine, dict) else None
+    requests: list[RequestSample] = []
+    reqs = doc.get("requests")
+    if isinstance(reqs, list):
+        for req in reqs:
+            if not isinstance(req, dict):
+                continue
+            key = _req_key(req)
+            if key is None:
+                continue
+            requests.append(RequestSample(key=key, time=_num(req.get("time")), decode_tps=decode_rate(req),
+                                          prompt_tps=prompt_rate(req)))
+    hw = doc.get("hardware")
+    used = _num(hw.get("gpu_mem_used")) if isinstance(hw, dict) else None
+    total = _num(hw.get("gpu_mem_total")) if isinstance(hw, dict) else None
+    end = doc.get("_last_end")
+    return MetricsSample(
+        model=model if isinstance(model, str) else None,
+        requests=tuple(requests),
+        live=_strata_live(doc.get("live")),
+        clock=_num(doc.get("time")),
+        vram_mb=(used / _MB, total / _MB) if used is not None and total and total > 0 else None,
+        last_end=strata_request_end(end.get("phase"), end.get("tool")) if isinstance(end, dict) else None)
+
+
+# ------------------------------------------------------------------------------------------------ neutral store
 class MetricsStore:
-    """Accumulated per-request speeds + the live values of the latest poll. Main-thread only (no locking)."""
+    """Accumulated per-request speeds + the live values of the latest poll. Main-thread only (no locking).
+
+    Engine-neutral: it only reads MetricsSample fields (a Strata /metrics dict passed to ingest() is converted
+    with strata_sample() first)."""
 
     def __init__(self, max_requests: int = MAX_REQUESTS) -> None:
         self.max_requests = max(1, int(max_requests))
-        # key -> (sort key (time, id), decode rate, prompt rate); kept sorted oldest -> newest
+        # key -> (sort key (time, key), decode rate, prompt rate); kept sorted oldest -> newest
         self._reqs: "OrderedDict[str, tuple[tuple[float, str], float | None, float | None]]" = OrderedDict()
         self.live_state: str | None = None
         self.live: dict = {}                         # what the model is doing now (see activity())
         self.live_decode: float | None = None
         self.live_prompt: float | None = None
         self.model: str | None = None
-        self.hw_vram: tuple[float, float] | None = None      # (used MB, total MB) from Strata's hardware block
+        self.hw_vram: tuple[float, float] | None = None      # (used MB, total MB) as the engine reports the GPU
         self.polls = 0
         self._read_prev: tuple[float, float, float] | None = None      # (clock, prompt_read, prompt_total)
         self._read_seen: tuple[float | None, float | None] | None = None  # (prompt_read, prompt_total) of the last
@@ -105,30 +203,18 @@ class MetricsStore:
         self._read_seen = None
         self._read_fresh = False
 
-    @staticmethod
-    def _key(req: dict) -> str | None:
-        rid = req.get("id")
-        if rid not in (None, ""):
-            return str(rid)
-        t = _num(req.get("time"))
-        return None if t is None else f"t{t!r}/{req.get('output_tokens')!r}"
+    def ingest(self, data: MetricsSample | dict | None, now: float | None = None) -> int:
+        """Merge one poll: a MetricsSample, or a Strata /metrics document (converted with strata_sample) - the
+        default 12 requests or a `?requests=all` list of any length.
 
-    @staticmethod
-    def _order(req: dict, key: str) -> tuple[float, str]:
-        t = _num(req.get("time"))
-        return (t if t is not None else -math.inf, key)
-
-    def ingest(self, data: dict | None, now: float | None = None) -> int:
-        """Merge one /metrics document (the default 12 or a `?requests=all` list of any length).
-
-        Returns how many new finished requests it contributed to the kept window. A document from a different
-        model than the previous one (engine.model changed: another server / a model switch) resets the history
-        first, so stale bars never mix with the new model's.
+        Returns how many new finished requests it contributed to the kept window. A sample from a different model
+        than the previous one (another server / a model switch) resets the history first, so stale bars never mix
+        with the new model's. `now`: the clock for the live reading rate (default: the sample's own clock).
         """
-        if not isinstance(data, dict):
+        sample = data if isinstance(data, MetricsSample) else strata_sample(data)
+        if sample is None:
             return 0
-        engine = data.get("engine")
-        model = engine.get("model") if isinstance(engine, dict) else None
+        model = sample.model
         if isinstance(model, str):
             if self.model is not None and model != self.model:
                 log.debug("metrics: model changed %r -> %r, history reset", self.model, model)
@@ -136,48 +222,51 @@ class MetricsStore:
             self.model = model
         self.polls += 1
         new: set[str] = set()
-        reqs = data.get("requests")
-        if isinstance(reqs, list):
-            for req in reqs:
-                if not isinstance(req, dict):
-                    continue
-                key = self._key(req)
-                if key is None or key in self._reqs:
-                    continue
-                self._reqs[key] = (self._order(req, key), decode_rate(req), prompt_rate(req))
-                new.add(key)
-            if new:                                          # newest max_requests by (time, id), oldest -> newest
-                kept = sorted(self._reqs.items(), key=lambda kv: kv[1][0])[-self.max_requests:]
-                self._reqs = OrderedDict(kept)
+        for r in sample.requests or ():
+            key = getattr(r, "key", None)
+            if not isinstance(key, str) or not key or key in self._reqs:
+                continue
+            t = _num(r.time)
+            self._reqs[key] = ((t if t is not None else -math.inf, key), _num(r.decode_tps), _num(r.prompt_tps))
+            new.add(key)
+        if new:                                              # newest max_requests by (time, key), oldest -> newest
+            kept = sorted(self._reqs.items(), key=lambda kv: kv[1][0])[-self.max_requests:]
+            self._reqs = OrderedDict(kept)
         added = sum(1 for k in new if k in self._reqs)
-        self._ingest_live(data.get("live"), _num(data.get("time")) if now is None else now)
-        hw = data.get("hardware")
-        used = _num(hw.get("gpu_mem_used")) if isinstance(hw, dict) else None
-        total = _num(hw.get("gpu_mem_total")) if isinstance(hw, dict) else None
-        self.hw_vram = (used / _MB, total / _MB) if used is not None and total and total > 0 else None
+        self._ingest_live(sample.live, _num(sample.clock) if now is None else now)
+        self.hw_vram = self._vram(sample.vram_mb)
         return added
 
-    def _ingest_live(self, live, clock: float | None) -> None:
+    @staticmethod
+    def _vram(v: Any) -> tuple[float, float] | None:
+        if not isinstance(v, tuple) or len(v) != 2:
+            return None
+        used, total = _num(v[0]), _num(v[1])
+        return (used, total) if used is not None and total and total > 0 else None
+
+    def _ingest_live(self, live: LiveSample | None, clock: float | None) -> None:
         self.live_decode = self.live_prompt = None
-        if not isinstance(live, dict):
+        if not isinstance(live, LiveSample):
             self.live_state, self._read_prev = None, None
             return
-        state = live.get("state")
-        self.live_state = state if isinstance(state, str) else None
-        self.live = {"state": self.live_state, "queued": int(_num(live.get("queued")) or 0),
-                     "phase": live.get("phase") if isinstance(live.get("phase"), str) else None,
-                     **{k: _num(live.get(k)) for k in ("prompt_read", "prompt_total", "prompt_tokens", "generated",
-                                                       "max_tokens")}}
-        if state == "generating":                            # parallel mode forces this with tok_s None: stays blank
-            v = _num(live.get("tok_s"))
+        state = live.state if isinstance(live.state, str) else None
+        self.live_state = state
+        phase = live.phase if isinstance(live.phase, str) else None
+        self.live = {"state": state, "queued": int(_num(live.queued) or 0), "phase": phase,
+                     "prompt_read": _num(live.prompt_read), "prompt_total": _num(live.prompt_total),
+                     "prompt_tokens": _num(live.prompt_tokens), "generated": _num(live.generated),
+                     "max_tokens": _num(live.max_tokens), "in_tool_call": live.in_tool_call is True,
+                     "tool": live.tool if isinstance(live.tool, str) and live.tool else None}
+        if state == "generating":                            # parallel mode forces this with no rate: stays blank
+            v = _num(live.decode_tps)
             if v is None or v <= 0:
-                v = _num(live.get("tok_s_mean"))
+                v = _num(live.decode_tps_mean)
             self.live_decode = v if v is not None and v > 0 else None
         if state != "reading":
             self._read_prev = None
             self._read_seen, self._read_fresh = None, False
             return
-        read, total = _num(live.get("prompt_read")), _num(live.get("prompt_total"))
+        read, total = self.live["prompt_read"], self.live["prompt_total"]
         # On Strata's batched path the engine's prefill_tok_s_mean (and progress) keep the previous request's values
         # until the new prompt's first progress line: trust the mean only once prompt_read/total moved between two
         # reading polls (a new progress line arrived, which also set the mean).
@@ -185,7 +274,7 @@ class MetricsStore:
         if read is not None and self._read_seen is not None and seen != self._read_seen:
             self._read_fresh = True
         self._read_seen = seen
-        v = _num(live.get("prefill_tok_s_mean")) if self._read_fresh else None
+        v = _num(live.prompt_tps_mean) if self._read_fresh else None
         if (v is None or v <= 0) and read is not None and clock is not None:
             prev = self._read_prev                           # rate from the read progress between two polls
             if prev is not None and prev[2] == (total or 0.0) and clock - prev[0] > 0.2 and read > prev[1]:
@@ -197,9 +286,10 @@ class MetricsStore:
 
     # ------------------------------------------------------------------ views
     def activity(self) -> dict | None:
-        """What the model is doing right now, from the latest /metrics `live` block (Strata's Monitor "Model state"),
+        """What the model is doing right now, from the latest poll's live values (Strata's Monitor "Model state"),
         or None when it is idle / unknown. Keys: kind ('reading' | 'generating' | 'queued'), queued (int),
-        frac (0..1 or None: prompt read progress), read, total, tokens, rate (tok/s or None), phase (str or None)."""
+        frac (0..1 or None: prompt read progress), read, total, tokens, rate (tok/s or None), phase (str or None),
+        tool_call (bool: the model is writing a tool call, the request will end in it), tool (its name or None)."""
         lv = self.live or {}
         kind = lv.get("state")
         queued = int(lv.get("queued") or 0)
@@ -207,13 +297,16 @@ class MetricsStore:
             read, total = lv.get("prompt_read"), lv.get("prompt_total")
             frac = min(1.0, max(0.0, read / total)) if read is not None and total else None
             return {"kind": "reading", "queued": queued, "frac": frac, "read": read, "total": total,
-                    "tokens": lv.get("prompt_tokens"), "rate": self.live_prompt, "phase": None}
+                    "tokens": lv.get("prompt_tokens"), "rate": self.live_prompt, "phase": None,
+                    "tool_call": False, "tool": None}
         if kind == "generating":
+            tool_call = lv.get("in_tool_call") is True
             return {"kind": "generating", "queued": queued, "frac": None, "read": None, "total": None,
-                    "tokens": lv.get("generated"), "rate": self.live_decode, "phase": lv.get("phase")}
+                    "tokens": lv.get("generated"), "rate": self.live_decode, "phase": lv.get("phase"),
+                    "tool_call": tool_call, "tool": lv.get("tool") if tool_call else None}
         if kind == "idle" and queued > 0:
             return {"kind": "queued", "queued": queued, "frac": None, "read": None, "total": None, "tokens": None,
-                    "rate": None, "phase": None}
+                    "rate": None, "phase": None, "tool_call": False, "tool": None}
         return None
 
     def __len__(self) -> int:
@@ -272,3 +365,62 @@ def fetch_status(root_url: str, timeout: float = FETCH_TIMEOUT_S) -> dict | None
         log.debug("GET %s failed: %s", url, exc)
         return None
     return data if isinstance(data, dict) else None
+
+
+# ------------------------------------------------------------------------------------------------ Strata poller
+def _no_status(_root_url: str) -> dict | None:
+    return None
+
+
+class StrataPoller(MetricsPoller):
+    """GET /metrics once per poll; when Strata's finished-request counter (totals.requests) grew since the previous
+    poll and the (non-parallel) server is idle, GET /status for how that request ended - Strata keeps the last
+    request's final phase there while idle ("tool call complete" = the agent comes back), which a 1 s sample of the
+    short tool-call phase misses most of the time.
+
+    fetch_metrics(root_url[, all_requests=True]) / fetch_status(root_url) are test seams (None = the real HTTP
+    fetchers). A fake fetch_metrics without a fetch_status gets NO /status (never the real HTTP one)."""
+
+    def __init__(self, fetch_metrics: Callable[..., Any] | None = None,
+                 fetch_status: Callable[[str], Any] | None = None) -> None:
+        self._fetch_metrics = fetch_metrics
+        if fetch_status is not None:
+            self._fetch_status: Callable[[str], Any] | None = fetch_status
+        else:
+            self._fetch_status = None if fetch_metrics is None else _no_status   # None = the module's fetch_status
+        self._done_n: int | None = None          # Strata's finished-request count at the previous poll
+
+    def reset(self, log_path: str | None = None) -> None:
+        self._done_n = None
+
+    def poll(self, root_url: str, catch_up: bool = False) -> MetricsSample | None:
+        if not root_url:
+            return None
+        fm = self._fetch_metrics or fetch_metrics
+        try:
+            data = fm(root_url, all_requests=True) if catch_up else fm(root_url)
+        except Exception:  # noqa: BLE001 - a broken fetcher is "no answer", never an exception in the worker
+            log.debug("metrics fetch failed", exc_info=True)
+            return None
+        if not isinstance(data, dict):
+            return None
+        end: RequestEnd | None = None
+        totals, live = data.get("totals"), data.get("live")
+        n = totals.get("requests") if isinstance(totals, dict) else None
+        live = live if isinstance(live, dict) else {}
+        if isinstance(n, int) and self._done_n is not None and n > self._done_n and not live.get("parallel") \
+                and live.get("state") == "idle":
+            fs = self._fetch_status or fetch_status
+            try:
+                st = fs(root_url)
+            except Exception:  # noqa: BLE001
+                log.debug("status fetch failed", exc_info=True)
+                st = None
+            if isinstance(st, dict) and not st.get("busy"):
+                end = strata_request_end(st.get("phase"), st.get("tool"))
+        if isinstance(n, int):
+            self._done_n = n
+        sample = strata_sample(data)
+        if sample is None:                       # unreachable for a dict; keeps the type checker honest
+            return None
+        return replace(sample, last_end=end) if end is not None else sample

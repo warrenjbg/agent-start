@@ -49,6 +49,15 @@ works from the notification centre after you alt-tab, for 30 min, for that Strat
 it off. Launchers, SteamVR and redistributable installers don't count. Windows holds toasts back during full-screen
 games (Do Not Disturb), which is why the default acts instead of asking.
 
+**When memory runs low** (Settings; default *Ask me*): games are found by their install folder, so a game
+installed elsewhere, or any other heavy program, is not noticed by the rule above. A second check watches for
+an app that was started after Strata became ready, holds a lot of memory (4 GB for the whole app by default)
+and coincides with the PC running short of available memory for 15 seconds. *Ask me* shows a toast naming the
+app and its memory, with the same **Turn off Strata** button; *Turn Strata off* does the same safe turn-off as
+for a game; *Do nothing* switches the check off. It only observes: it never closes anything. Apps on your
+protected list, system processes and apps that were already open never trigger it, and an app is reported
+once per Strata session. The thresholds are `mem_watch_*` keys in `config.json`.
+
 **Updates:** once a day the app asks GitHub for the latest release (one small request, no data about you). When a
 newer version exists, the idle line says *Update to x.y.z available · click to install*. Click → confirm → it
 downloads the installer from this repo's Releases, checks its size and SHA-256 against what GitHub lists, closes,
@@ -105,8 +114,12 @@ script); the Settings dialog and the log show the same number.
   (`…/v1`) with **Copy**, for pasting into Hermes or other clients.
 - **Protected apps…** — the whitelist: apps that are never offered for closing.
 - **Switches** (apply at once): *Reopen closed apps after Turn off* (same as the start dialog's checkbox; off = the
-  closed apps are offered as one click instead), *Keep running in the tray*, *Start with Windows*, *Tell me when a
-  game starts while Strata runs*, *Check for updates daily*.
+  closed apps are offered as one click instead), *Keep running in the tray*, *Start with Windows*, *When a game
+  starts*, *When memory runs low*, *Check for updates daily*.
+- **Check for updates** (top right, under the version) — asks GitHub now, whatever the daily switch says, and
+  shows the answer next to the button: up to date, a new version (the version label becomes the install link),
+  or that GitHub could not be reached. It only checks; installing still asks first. Greyed out when the app
+  runs from source.
 
 ## Stats section
 
@@ -191,6 +204,9 @@ started*, then *Reopened 3 apps*.
 | `min_ram_mb`, `min_vram_mb`, `min_game_ram_mb` | 250 / 200 / 50 |
 | `game_dirs`, `game_exclude` | Game folders; exe names never treated as games (Wallpaper Engine) |
 | `user_whitelist` | Edited by the ⚙ dialog |
+| `backend` | The inference engine: `strata` (the only one today; a missing or unknown value means `strata`). See `docs/engines.md` |
+| `mem_watch_app_mb`, `mem_watch_sustain_s` | Memory-pressure check: an app's memory that counts as large (4096), and how long both conditions must hold (15) |
+| `mem_watch_floor_baseline_pct`, `mem_watch_floor_total_pct` | "Running short" = available memory below the smaller of this share of what was available when Strata became ready (50) and this share of installed RAM (6) |
 
 To serve another Strata model, pick its `run-*.bat` in ⚙ Settings — no hand-editing needed. `state.json` (next to
 `config.json`) remembers the last cold-load time and whether the stats section is open.
@@ -248,6 +264,11 @@ notification area on a runner). *Local* suites open the real window and take scr
 | `tests\test_autostart.py` | CI | Start with Windows in a throwaway HKCU key: quoting, Task Manager's disabled flag, refresh |
 | `tests\test_toasts.py` | CI | Toast titles/messages are data, never code (PowerShell only parses the XML back; no toast shown) |
 | `tests\test_updater.py` | CI | GitHub release check + download against a local server: size/SHA-256, redirects, cancel, path checks, installer argv; a throwaway Inno Setup installer when ISCC is present |
+| `tests\test_update_controller.py` | Local | The update flow as its own controller, with a stubbed updater and a fake app: daily check, the manual "Check for updates" (ignores the interval, one request at a time), offer, confirm, download, install hand-off; the Settings button states (one invisible window) |
+| `tests\test_mem_watch.py` | CI | Memory-pressure trigger: the decision function on fake process lists (both conditions, sustain, once per session, protected and system apps, games already reported), config fallbacks, the shared scan |
+| `tests\test_kill_path.py` | CI | What a stop may kill and when it refuses, on fake processes: kill targets, the launcher cmd.exe, identity, foreign listeners, busy, force |
+| `tests\test_engines.py` | CI | The engine interface: registry and `backend`, the Strata engine's answers, and a fake llama-server-shaped engine driving the supervisor (no unload, no launcher; an engine cannot widen a kill; API key never sent with the identity probe) |
+| `tests\test_metrics_sample.py` | CI | Engine-neutral metrics samples: the Strata converter, old-vs-new store equivalence, a non-Strata sample, the Strata poller with fake fetchers |
 | `tests\test_server_manager.py` | CI | Fake Strata on a random port: start/ready/timeout/lazy-load/adopt/busy+force/cancel/foreign-listener/launcher topology/launch from a parsed `.bat` (shows one real toast) |
 | `tests\test_detector.py` | Advisory | Real-system scan + dry run (asserts nothing protected is ever listed), synthetic graph rules, kill test on its own throwaway process only |
 | `tests\test_tray.py` | Advisory | Tray icon on its own thread: status icon, menu + Switch model submenu, balloon clicks, callbacks, no GDI leaks (shows one balloon) |

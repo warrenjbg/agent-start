@@ -149,6 +149,15 @@ class LauncherInfo:
     def bat_name(self) -> str:
         return os.path.basename(self.bat_path)
 
+    # engine-neutral names (engines/base.py: what every launcher-info object offers)
+    @property
+    def path(self) -> str:
+        return self.bat_path
+
+    @property
+    def file_name(self) -> str:
+        return self.bat_name
+
     def summary(self) -> str:
         """One read-only line for the Settings dialog: model · config file · port."""
         parts = [self.model_name]

@@ -19,10 +19,10 @@ DECISIONS = ("when_idle", "now", "cancel")
 ARM_S = 0.4
 
 
-def describe(act: dict | None) -> str:
+def describe(act: dict | None, engine_name: str = "Strata") -> str:
     """One line for what the model is doing (a metrics_store.activity() dict)."""
     if not act:
-        return "Strata is working on a request."
+        return f"{engine_name} is working on a request."
     q = act.get("queued") or 0
     queued = f" · {q} more waiting" if q else ""
     if act.get("kind") == "tool":
@@ -47,7 +47,8 @@ class BusyDialog(ctk.CTkToplevel):
     WIDTH = 340
     HEIGHT = 176
 
-    def __init__(self, master, act: dict | None, on_decision: Callable[[str], None], switch_to: str | None = None) -> None:
+    def __init__(self, master, act: dict | None, on_decision: Callable[[str], None], switch_to: str | None = None,
+                 engine_name: str = "Strata") -> None:
         """switch_to: the model being switched to (a model switch), or None (Turn off)."""
         super().__init__(master, fg_color=T.BG)
         style_dialog(self)
@@ -56,17 +57,18 @@ class BusyDialog(ctk.CTkToplevel):
         self._armed_at = time.monotonic() + ARM_S
         self._decided = False
         verb = "Switch" if switch_to else "Turn off"
-        self.title("Strata is busy")
+        self._engine_name = engine_name
+        self.title(f"{engine_name} is busy")
         self.resizable(False, False)
         center_over(self, master, self.WIDTH, self.HEIGHT)
         self.protocol("WM_DELETE_WINDOW", lambda: self._decide("cancel"))
         self.bind("<Escape>", lambda _e: self._decide("cancel"))
         self.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(self, text="Strata is busy", anchor="w",
+        ctk.CTkLabel(self, text=f"{engine_name} is busy", anchor="w",
                      font=ctk.CTkFont(family=T.ui_family(), size=14, weight="bold")).grid(
             row=0, column=0, sticky="ew", padx=12, pady=(10, 0))
-        self.activity = ctk.CTkLabel(self, text=describe(act), anchor="w", text_color=T.TEXT_2, height=16,
+        self.activity = ctk.CTkLabel(self, text=describe(act, engine_name), anchor="w", text_color=T.TEXT_2, height=16,
                                      font=ctk.CTkFont(family=T.ui_family(), size=12))
         self.activity.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 0))
         what = f"to {switch_to}" if switch_to else ""
@@ -105,7 +107,7 @@ class BusyDialog(ctk.CTkToplevel):
             else:
                 self._decide("idle", user=False)
             return
-        self.activity.configure(text=describe(act))
+        self.activity.configure(text=describe(act, self._engine_name))
 
     def _decide(self, decision: str, user: bool = True) -> None:
         if self._decided or (user and time.monotonic() < self._armed_at):

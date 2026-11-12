@@ -132,12 +132,13 @@ class SweepDialog(ctk.CTkToplevel):
 
     def __init__(self, master, candidates: list[dict],
                  on_decision: Callable[[str, list[tuple[int, float]]], None], ram=None,
-                 reopen_default: bool | None = None) -> None:
+                 reopen_default: bool | None = None, engine_name: str = "Strata") -> None:
         """ram: an optional ram_plan.RamPlan. When it knows Strata's full-RAM requirement, its pre-ticks replace the
         detector's and a live line says whether the ticked apps free enough for the fast full-RAM mode."""
         super().__init__(master, fg_color=_BG)
         style_dialog(self)
         self._on_decision = on_decision
+        self._engine_name = engine_name
         self._decided = False
         self._rows: list[tuple[ctk.BooleanVar, dict]] = []
         self._ram = ram if ram is not None and getattr(ram, "need_mb", 0) > 0 else None
@@ -199,7 +200,7 @@ class SweepDialog(ctk.CTkToplevel):
             self._rows.append((var, cand))
 
         if self._reopen_var is not None:
-            ctk.CTkCheckBox(self, text="Reopen these when Strata stops (games: one click)", variable=self._reopen_var,
+            ctk.CTkCheckBox(self, text=f"Reopen these when {engine_name} stops (games: one click)", variable=self._reopen_var,
                             font=small, text_color=_MUTED, fg_color=T.TEXT, hover_color=T.PRIMARY_HOVER,
                             checkmark_color=T.BG, border_color=T.TEXT_3, corner_radius=4,
                             checkbox_width=16, checkbox_height=16).grid(
@@ -245,7 +246,7 @@ class SweepDialog(ctk.CTkToplevel):
         r = self._ram
         if r.enough_now:
             self._ram_head.configure(text_color=T.ACCENT)
-            self._ram_live.configure(text="Strata will load in full-RAM mode (fast)", text_color=_MUTED)
+            self._ram_live.configure(text=f"{self._engine_name} will load in full-RAM mode (fast)", text_color=_MUTED)
             return
         self._ram_head.configure(text_color=_WARN)
         gap = r.need_mb - r.available_mb - freed_mb

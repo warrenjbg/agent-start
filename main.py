@@ -19,13 +19,23 @@ import customtkinter as ctk
 import psutil
 
 import config_store
-import engine_log
-import launcher_bat
+import engines
 import load_progress
 import ram_plan
 import reopen
-import metrics_store
 import theme as T
+from engines.base import (
+    CAP_FIND_INSTALL,
+    CAP_LAUNCHER_FILES,
+    CAP_LIVE_ACTIVITY,
+    CAP_LOAD_PROGRESS,
+    CAP_RAM_MODES,
+    CAP_REQUEST_END,
+    CAP_REQUEST_HISTORY,
+    LoadReport,
+    MetricsSample,
+    RequestEnd,
+)
 from graphs import BarGraph, LineGraph, StatRow, fmt_rate
 from metrics_store import MetricsStore
 from busy_dialog import BusyDialog
@@ -89,7 +99,12 @@ IDLE_GRACE_S = 6.0                       # "when it's done": stop after the mode
 GAME_STOP_METRICS_FAILS = 5              # a game stop runs anyway after this many failed /metrics polls
 GAME_ALERT_VALID_S = 1800.0              # the "Turn off Strata" button of a game toast works this long after it
 GAME_ACTIONS = ("off", "ask", "none")    # Settings "When a game starts": turn Strata off / ask / do nothing
-GAME_ACTION_LABELS = {"off": "Turn Strata off", "ask": "Ask me", "none": "Do nothing"}
+GAME_ACTION_LABELS = {"off": "Turn Strata off", "ask": "Ask me", "none": "Do nothing"}   # the Strata wording
+
+
+def action_labels(engine_name: str) -> dict[str, str]:
+    """The three choices of the "When a game starts" / "When memory runs low" settings, naming the engine."""
+    return {"off": f"Turn {engine_name} off", "ask": "Ask me", "none": "Do nothing"}
 PROTOCOL = "agentstart"                  # agentstart://game-off (toast button; registered by the installer)
 TOOL_WAIT_S = 600.0                      # after a request that ended in a tool call the agent comes back with the tool's
                                          # result; "when it's done" waits up to this long for that next request
@@ -167,6 +182,12 @@ def format_preview(res: dict) -> str:
     return f"{line1}\n{line2}" if line2 else line1
 
 
+def _released(result: dict) -> bool:
+    """A stop result's verdict: the engine no longer holds the model. 'released' is the engine-neutral field;
+    'port_released' (the process is gone and its port is free) is what it means for engines we end."""
+    return bool(result.get("released", result.get("port_released")))
+
+
 def _stop_info(title: str, reason: str = "game") -> dict:
     """What a pending stop carries when an app caused it: the app's name, plus why when it was not a game start."""
     return {"game": title} if reason == "game" else {"game": title, "reason": reason}
@@ -231,13 +252,13 @@ def _release_singleton() -> None:
             log.debug("mutex release failed", exc_info=True)
 
 
-def _find_strata_worker(post: Callable, done: Callable, stop_evt) -> None:
+def _find_install_worker(engine, post: Callable, done: Callable, stop_evt) -> None:
+    """Worker: the engine's bounded, read-only search for an install on this PC."""
     found = []
     try:
-        import strata_finder
-        found = strata_finder.find_strata(strata_finder.default_roots(), time_budget_s=8.0, stop_evt=stop_evt)
+        found = list(engine.find_installs(stop_evt) or [])
     except Exception:  # noqa: BLE001
-        log.exception("searching for Strata failed")
+        log.exception("searching for %s failed", engine.name)
     post(done, found)
 
 
@@ -273,8 +294,8 @@ def _build_real_deps(cfg: dict) -> tuple[Any, Any]:
     from server_manager import EndpointManager
     from detector import ProcessDetector
 
-    endpoint = EndpointManager(cfg)
-    detector = ProcessDetector(cfg, protected_pids_provider=endpoint.protected_pids)
+    endpoint = EndpointManager(cfg)                 # picks the engine named by cfg["backend"]
+    detector = ProcessDetector(cfg, protected_pids_provider=endpoint.protected_pids, engine=endpoint.engine)
     return detector, endpoint
 
 
@@ -282,7 +303,8 @@ class AgentStartApp(ctk.CTk):
     def __init__(self, detector=None, endpoint=None, config: dict | None = None,
                  metrics_fetcher: Callable[[str], dict | None] | None = None, vram_sampler=None,
                  extras: bool | None = None, status_fetcher: Callable[[str], dict | None] | None = None) -> None:
-        """metrics_fetcher(root_url) and vram_sampler are test seams (defaults: Strata /metrics over HTTP, NVML).
+        """metrics_fetcher(root_url) / status_fetcher(root_url) and vram_sampler are test seams (defaults: the
+        engine's own monitoring over HTTP, NVML); the fetchers are handed to the engine's metrics poller.
         extras: tray icon, daily GitHub update check, first-start Strata search. Default: on for the real app, off
         when test stubs are passed (no network, no disk scan, no tray icon from a test run)."""
         if extras is None:
@@ -303,6 +325,9 @@ class AgentStartApp(ctk.CTk):
         self.cfg = cfg
         self.detector = detector
         self.endpoint = endpoint
+        # Everything that differs between inference engines (identity, launch, launcher files, load progress,
+        # metrics, memory needs) is asked of the engine; optional features are checked with engine.can(CAP_...).
+        self.engine = getattr(endpoint, "engine", None) or engines.get_engine(cfg)
 
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._destroyed = False
@@ -339,11 +364,12 @@ class AgentStartApp(ctk.CTk):
                                   else list(DEFAULT_PINNED))
         self._pin_btns: dict[str, Any] = {}
         self._panel_hover: str | None = None
-        self._pending_launcher: launcher_bat.LauncherInfo | None = None   # saved while Strata runs
-        self._fetch_metrics = metrics_fetcher or metrics_store.fetch_metrics
-        # GET /status after a request ended (how it ended). Tests with a fake /metrics pass their own or get none.
-        self._fetch_status = status_fetcher or (metrics_store.fetch_status if metrics_fetcher is None
-                                                else (lambda _root: None))
+        self._pending_launcher: Any = None       # launcher info saved while the engine runs (applies next start)
+        # Test seams for the engine's metrics poller (None = the engine's own HTTP fetchers). A test with a fake
+        # metrics fetcher and no status fetcher gets no 'how did the request end' lookups at all.
+        self._fetch_metrics = metrics_fetcher
+        self._fetch_status = status_fetcher if status_fetcher is not None or metrics_fetcher is None \
+            else (lambda _root: None)
         self.metrics = MetricsStore()
         self._metrics_fails = 0
         self._metrics_epoch = 0                  # bumped per start: a late poll of the old server is dropped
@@ -351,9 +377,9 @@ class AgentStartApp(ctk.CTk):
         self._spans: list[list[float | None]] = []   # [start, end|None] (monotonic) while Strata was running
         self._avail_at_launch: float | None = None
         self._launch_wall = 0.0                  # time.time() at launch: rejects a previous run's log
-        # Engine-log verdict for the current run (engine_log.EngineLoad): full-RAM vs slow Low-RAM (SSD) mode.
+        # The engine's verdict for the current run (engines.base.LoadReport): e.g. full-RAM vs slow Low-RAM mode.
         # Written by worker threads as one atomic attribute swap, read on the Tk thread.
-        self._engine_load: engine_log.EngineLoad | None = None
+        self._engine_load: LoadReport | None = None
         self._toggle_at = 0.0                    # monotonic time of the last accepted ON/OFF click
         self._state_save_id = None               # pending debounced state.json save
         self._state_pending: dict = {}           # keys waiting for that save
@@ -366,7 +392,7 @@ class AgentStartApp(ctk.CTk):
         # Safe Turn off / model switch while Strata answers a request
         self._stop_pending: tuple[str, Any] | None = None     # ("off", None) | ("switch", LauncherInfo)
         self._idle_since: float | None = None
-        self._req_phase: str | None = None       # phase of the request running now ("writing a tool call: x", ...)
+        self._req_end: RequestEnd | None = None  # how the request running now will end, as sampled while it runs
         self._was_busy = False
         self._tool_wait: tuple[str, float] | None = None   # (tool, since): last request ended in a tool call
         self._switching = False                  # a model switch is stopping Strata: no reopen, start again after
@@ -415,10 +441,11 @@ class AgentStartApp(ctk.CTk):
                        box_open=lambda: self._box_open, release_singleton=_release_singleton,
                        finish_exit=self._finish_exit,
                        available=lambda: self._extras and config_store.FROZEN,
-                       frozen=lambda: config_store.FROZEN, stop_evt=self._stop_evt),
+                       frozen=lambda: config_store.FROZEN, stop_evt=self._stop_evt,
+                       engine_name=lambda: self.engine.name),
             __version__, daily=saved.get("update_check", True) is not False,
             checked_at=saved.get("update_checked_at"))
-        self._found_strata = None                # strata_finder.Found offered on first start
+        self._found_strata = None                # an install the engine found, offered on first start
         self._finder_ran = False
         self._summary_text = ""
         self._detail_text = ""
@@ -577,7 +604,7 @@ class AgentStartApp(ctk.CTk):
         legend = ctk.CTkFrame(card, fg_color="transparent")
         legend.grid(row=2, column=0, sticky="ew", pady=(8, 10))
         self.legend = {}
-        for col, (key, color, label) in enumerate((("apps", T.APPS_SEG, "Apps"), ("strata", T.ACCENT, "Strata"),
+        for col, (key, color, label) in enumerate((("apps", T.APPS_SEG, "Apps"), ("strata", T.ACCENT, self.engine.name),
                                                    ("free", T.RAISED, "Free"))):
             cell = ctk.CTkFrame(legend, fg_color="transparent")
             cell.grid(row=0, column=col, sticky="w", padx=(0, 14))
@@ -705,11 +732,11 @@ class AgentStartApp(ctk.CTk):
         if self.loaded is False:
             detail = "Still loading the model"
         elif self._pending_launcher is not None:      # a launcher saved while running waits for the next start
-            detail = f"{_short(self._pending_launcher.bat_name, 28)} applies next start"
+            detail = f"{_short(self._pending_launcher.file_name, 28)} applies next start"
         elif self._is_low_ram():
             detail, color = self._low_ram_line(), T.AMBER
             if act is None:
-                summary = "Low-RAM mode"
+                summary = self.engine.low_ram_label
         self.pill.configure(text=title)
         self.led.configure(fg_color=led)
         self._set_act_bar(frac)
@@ -969,7 +996,7 @@ class AgentStartApp(ctk.CTk):
         self._run_worker("hc-reopen-click", _reopen_clicked, recs, self.post, self._reopen_done)
 
     def _on_preview_click(self, _event=None) -> None:
-        if self.state_name == IDLE and self._detail_link and "Strata found" == self._summary_text:
+        if self.state_name == IDLE and self._detail_link and f"{self.engine.name} found" == self._summary_text:
             self.open_settings(found=self._found_strata)
             return
         if self.state_name == IDLE and self._detail_link and self.updates.offer is not None and \
@@ -993,31 +1020,22 @@ class AgentStartApp(ctk.CTk):
             head, rest = "", head + (f" · {rest}" if rest else "")
         self._set_status(head, rest.replace("\n", " · "), color=color)
 
-    def _strata_config_path(self) -> str | None:
-        """The Strata config JSON from launch_cmd's --config (its "log" field names the engine log)."""
-        cmd = list(self.cfg.get("launch_cmd") or [])
-        for i, a in enumerate(cmd[:-1]):
-            if str(a) == "--config":
-                return str(cmd[i + 1])
-        return None
-
     def _low_ram_line(self) -> str:
         ld = self._engine_load
         short = f" · ~{ld.short_gib:.1f} GB short" if ld and ld.short_gib else ""
-        return f"Reading from SSD (slower){short}"
+        return f"{self.engine.low_ram_serving}{short}"
 
     def _check_engine_log(self, token: int) -> None:
         """Worker: one engine-log verdict once serving. Our own start: the run since launch; adopted: the latest run."""
-        cfg_path = self._strata_config_path()
-        if not cfg_path:
+        if not self.engine.can(CAP_RAM_MODES):
             return
         since = self._launch_wall if self._launch_wall and token == self._start_token else None
         try:
-            load = engine_log.current(cfg_path, since)
+            load = self.engine.load_report(self.cfg, since)
         except Exception:  # noqa: BLE001
             log.debug("engine log check failed", exc_info=True)
             return
-        if load.mode != "unknown":
+        if load is not None and load.mode != "unknown":
             self.post(self._set_engine_load, load)
 
     def _set_engine_load(self, load) -> None:
@@ -1026,9 +1044,9 @@ class AgentStartApp(ctk.CTk):
         changed = (self._engine_load is None) or (self._engine_load.mode != load.mode)
         self._engine_load = load
         if changed:
-            log.info("engine load mode: %s (arena %s GiB, available %s GiB, short %s GiB, GPU slots %s%s)",
-                     load.mode, load.arena_gib, load.available_gib, load.short_gib, load.gpu_slots,
-                     ", GPU cache shrunk" if load.gpu_shrunk else "")
+            log.info("engine load mode: %s (needs %s GiB, available %s GiB, short %s GiB%s)",
+                     load.mode, load.need_gib, load.available_gib, load.short_gib,
+                     f", {load.detail}" if load.detail else "")
             if self.state_name == ACTIVE:
                 self._apply_state()
 
@@ -1057,7 +1075,7 @@ class AgentStartApp(ctk.CTk):
             self.metrics.reset()
         if st != ACTIVE:
             self._stop_pending, self._idle_since = None, None
-            self._tool_wait, self._req_phase, self._was_busy = None, None, False
+            self._tool_wait, self._req_end, self._was_busy = None, None, False
         if st == STARTING or (st == ACTIVE and getattr(self, "state_name", None) in (IDLE, ERROR)):
             # a new Strata session: nothing of an earlier stop's wording / reopen choice may leak into it
             self._skip_reopen_once, self._stop_toast, self._last_stop_game = False, None, None
@@ -1313,7 +1331,7 @@ class AgentStartApp(ctk.CTk):
         elif polling:
             empty_d, empty_p = "No requests yet", "No prompt reads yet"
         else:
-            empty_d = empty_p = "Strata is off"
+            empty_d = empty_p = f"{self.engine.name} is off"
         self._fill_rate_row(self.row_decode, self.metrics.decode_series(), self.metrics.live_decode, empty_d)
         self._fill_rate_row(self.row_prompt, self.metrics.prompt_series(), self.metrics.live_prompt, empty_p)
 
@@ -1327,67 +1345,78 @@ class AgentStartApp(ctk.CTk):
         else:
             row.set_value("–", T.TEXT_3)
 
+    def _metrics_poller(self):
+        """The engine's poller. The test seams are looked up per call (tests swap the fetchers after building the
+        app); without seams the engine uses its own HTTP fetchers."""
+        seams = {}
+        if self._fetch_metrics is not None:
+            seams["fetch_metrics"] = lambda r, **kw: self._fetch_metrics(r, **kw)
+            seams["fetch_status"] = lambda r: self._fetch_status(r) if self._fetch_status is not None else None
+        return self.engine.metrics_poller(self.cfg, **seams)
+
+    def _run_log_path(self) -> str | None:
+        """The server log of the run this app started (None for an adopted server): some engines only report
+        per-request figures there."""
+        try:
+            st = self.endpoint.status()
+            return None if st.get("adopted") else (st.get("log_path") or None)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _metrics_loop(self) -> None:
-        """Worker: poll Strata's /metrics every 2 s, only while it is serving AND the stats section is open."""
+        """Worker: poll the engine's monitoring data every LIVE_POLL_S while it is serving."""
         last_poll = 0.0
         last_epoch = None
-        done_n = None                            # Strata's finished-request count at the previous poll
+        poller = None
         while not self._stop_evt.is_set():
             try:
                 # Every LIVE_POLL_S while serving: the status line shows what the model is doing (reading /
-                # generating / queued) and the stats graphs use the same documents.
+                # generating / queued) and the stats graphs use the same samples.
                 # Also while minimised / hidden in the tray: Turn off from the tray must still know whether a reply
                 # or an agent's tool call is running (the request phases are only seen by polling).
                 if self.state_name in (ACTIVE, STOPPING):
                     epoch = self._metrics_epoch
                     root = config_store.server_root(str(self.cfg.get("endpoint_url") or ""))
-                    # /metrics returns only the newest 12 requests: after a gap (section collapsed, window minimised,
-                    # a new server) ask once for all of them so the 30 bars are complete.
+                    reports = any(self.engine.can(c) for c in (CAP_LIVE_ACTIVITY, CAP_REQUEST_HISTORY,
+                                                               CAP_REQUEST_END))
+                    if poller is None:
+                        poller = self._metrics_poller()
+                    # Engines return only their newest finished requests per poll: after a gap (section collapsed,
+                    # window minimised, a new server) ask once for all of them so the 30 bars are complete.
                     now = time.monotonic()
                     catch_up = epoch != last_epoch or now - last_poll > 3 * STATS_MS / 1000.0
-                    data = None
-                    if root:
-                        data = (self._fetch_metrics(root, all_requests=True) if catch_up
-                                else self._fetch_metrics(root))
-                    if epoch != last_epoch:
-                        done_n = None
-                    if isinstance(data, dict):
-                        # A request finished since the last poll: ask /status how it ended. Strata keeps the last
-                        # request's final phase there while idle ("tool call complete" = the agent comes back),
-                        # which a 1 s sample of the short tool-call phase misses most of the time.
-                        n = (data.get("totals") or {}).get("requests")
-                        live = data.get("live") or {}
-                        if isinstance(n, int) and done_n is not None and n > done_n and not live.get("parallel") \
-                                and live.get("state") == "idle" and root:
-                            st = self._fetch_status(root)
-                            if isinstance(st, dict) and not st.get("busy"):
-                                data["_last_end"] = {"phase": st.get("phase"), "tool": st.get("tool")}
-                        if isinstance(n, int):
-                            done_n = n
+                    if epoch != last_epoch:          # a new server run: forget the previous one's counters
+                        poller.reset(log_path=self._run_log_path())
+                    if reports:
+                        sample = poller.poll(root, catch_up) if root else None
+                    else:
+                        # nothing to ask: an empty sample ("nothing reported"), not a failed poll - a pending
+                        # stop then waits the engine's idle time instead of being treated as a dead server
+                        sample = MetricsSample()
                     last_poll, last_epoch = now, epoch
-                    self.post(self._apply_metrics, epoch, data)
+                    self.post(self._apply_metrics, epoch, sample)
             except Exception:  # noqa: BLE001
                 log.debug("metrics poll failed", exc_info=True)
             self._stop_evt.wait(LIVE_POLL_S)
 
-    def _apply_metrics(self, epoch: int, data: dict | None) -> None:
+    def _apply_metrics(self, epoch: int, sample: MetricsSample | None) -> None:
         if epoch != self._metrics_epoch or self.state_name not in (ACTIVE, STOPPING):
             return                                        # answer of a previous server / arrived after the stop
-        if not isinstance(data, dict):
+        ok = sample is not None
+        if not ok:
             self._metrics_fails += 1
             self.metrics.clear_live()
         else:
             self._metrics_fails = 0
-            self.metrics.ingest(data, now=time.monotonic())
+            self.metrics.ingest(sample, now=time.monotonic())
             if self.metrics.hw_vram is not None:          # fallback VRAM source when NVML is unavailable
                 self.vram.push_external(*self.metrics.hw_vram)
-        if isinstance(data, dict):
-            self._track_request_end(data.get("_last_end"))
+            self._track_request_end(sample.last_end)
         if self.state_name == ACTIVE:
             self._show_serving()                          # model state on the status line
-            if isinstance(self.dialog, BusyDialog) and isinstance(data, dict):
+            if isinstance(self.dialog, BusyDialog) and ok:
                 self.dialog.update_activity(self._busy_activity())
-            self._check_pending_stop(data_ok=isinstance(data, dict))
+            self._check_pending_stop(data_ok=ok)
         if not self._iconic:                              # hidden / minimised: no graph redraws
             self._refresh_stats()
 
@@ -1398,7 +1427,7 @@ class AgentStartApp(ctk.CTk):
         if self._destroyed or not (self.state_name == STARTING and self._start_phase == "server"):
             return
         elapsed = time.monotonic() - self._server_t0
-        label, frac, detail = load_progress.parse(self._log_text, elapsed, self._expected_s)
+        label, frac, detail = self.engine.load_progress(self._log_text, elapsed, self._expected_s)
         if frac < self._prog_best[1]:            # a phase line scrolled out of the tail: never go backwards
             label, frac, detail = self._prog_best
         self._prog_best = (label, frac, detail)
@@ -1406,10 +1435,10 @@ class AgentStartApp(ctk.CTk):
         warn = False
         if ld is not None and ld.mode == "waiting_for_ram":
             label, warn = "Waiting for RAM", True
-            if ld.arena_gib and ld.available_gib:
-                detail = f"needs {ld.arena_gib:.0f} GB, {ld.available_gib:.0f} GB free"
+            if ld.need_gib and ld.available_gib:
+                detail = f"needs {ld.need_gib:.0f} GB, {ld.available_gib:.0f} GB free"
         elif ld is not None and ld.mode == "low_ram":
-            label, detail, warn = "Low-RAM mode", "reading experts from SSD · slower", True
+            label, detail, warn = self.engine.low_ram_label, self.engine.low_ram_loading, True
         self.progress.set(frac)
         self.elapsed.configure(text=load_progress.fmt_elapsed(elapsed))
         note = self._start_note
@@ -1430,13 +1459,12 @@ class AgentStartApp(ctk.CTk):
                     path = None
             except Exception:  # noqa: BLE001
                 path = None
-            if path:
+            if path and self.engine.can(CAP_LOAD_PROGRESS):
                 self._log_text = load_progress.read_tail(path)
-            cfg_path = self._strata_config_path()
-            if cfg_path:
+            if self.engine.can(CAP_RAM_MODES):
                 try:
-                    load = engine_log.current(cfg_path, self._launch_wall)
-                    if load.mode != "unknown":
+                    load = self.engine.load_report(self.cfg, self._launch_wall)
+                    if load is not None and load.mode != "unknown":
                         self._engine_load = load     # atomic swap; the progress tick reads it on the Tk thread
                 except Exception:  # noqa: BLE001
                     log.debug("engine log read failed", exc_info=True)
@@ -1473,7 +1501,8 @@ class AgentStartApp(ctk.CTk):
                     total, avail = vm.total / 1048576.0, vm.available / 1048576.0
                     if self.state_name in (ACTIVE, STARTING, STOPPING):
                         if n % 5 == 0:                   # process-tree walk every ~10 s, not every tick
-                            fn = getattr(self.endpoint, "strata_memory_mb", None)
+                            fn = getattr(self.endpoint, "engine_memory_mb", None) \
+                                or getattr(self.endpoint, "strata_memory_mb", None)
                             rss = fn() if fn else None
                         n += 1
                     else:
@@ -1656,8 +1685,9 @@ class AgentStartApp(ctk.CTk):
             return
         if "_error" in res:
             self._set_preview(f"Scan failed: {res['_error']}")
-        elif self._found_strata is not None and not self.cfg.get("launch_cmd"):
-            self._set_status("Strata found", f"{_tail(self._found_strata.strata_dir, 30)} · click to set up",
+        elif self._found_strata is not None and not self.engine.is_configured(self.cfg):
+            self._set_status(f"{self.engine.name} found",
+                             f"{_tail(self.engine.install_dir_of(self._found_strata), 30)} · click to set up",
                              color=T.TEXT_2, link=True)
         elif self._reopen_offer and not self._reopening:
             head = format_preview(res).partition("\n")[0]
@@ -1699,7 +1729,7 @@ class AgentStartApp(ctk.CTk):
         if self.updates.updating:
             self._set_note("Installing an update · try again after the restart")
             return
-        if not self.cfg.get("launch_cmd") and self._pending_launcher is None:
+        if not self.engine.is_configured(self.cfg) and self._pending_launcher is None:
             self.open_settings(found=self._found_strata)     # nothing to start yet: pick the Strata launcher first
             return
         self._sweep_note = ""
@@ -1732,9 +1762,7 @@ class AgentStartApp(ctk.CTk):
     def _ram_plan(self, cands: list[dict]):
         """Worker: does Strata get its fast full-RAM mode, and which apps would get it there? None if unknown."""
         try:
-            cfg_path = self._strata_config_path()
-            log_path = engine_log.config_log_path(cfg_path) if cfg_path else None
-            arena = engine_log.learned_arena_gib(log_path) if log_path else None
+            arena = self.engine.memory_need_gib(self.cfg) if self.engine.can(CAP_RAM_MODES) else None
             if not arena:
                 return None
             avail = psutil.virtual_memory().available / 1048576.0
@@ -1761,7 +1789,7 @@ class AgentStartApp(ctk.CTk):
         self._set_preview(f"{len(cands)} app(s) could be closed — choose in the dialog")
         ref: dict = {}
         self.dialog = SweepDialog(self, cands, lambda d, t: self._on_sweep_decision(token, d, t, ref.get("dlg")),
-                                  ram=plan, reopen_default=self._reopen_pref)
+                                  ram=plan, reopen_default=self._reopen_pref, engine_name=self.engine.name)
         ref["dlg"] = self.dialog
 
     def _on_sweep_decision(self, token: int, decision: str, targets: list[tuple[int, float]], dlg=None) -> None:
@@ -1839,7 +1867,7 @@ class AgentStartApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             self._avail_at_launch = None
         self._apply_state()                      # shows the progress bar now that the server phase began
-        self._set_preview("Launching Strata…")
+        self._set_preview(f"Launching {self.engine.name}…")
         self._run_worker("hc-log-reader", self._log_reader, token)
         if self._progress_id is None:
             self._progress_id = self.after(PROGRESS_MS, self._progress_tick)
@@ -1925,7 +1953,8 @@ class AgentStartApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             pass
         self._set_state(STOPPING)
-        self._set_preview("Unloading model and stopping Strata…" if not force else "Force stopping Strata…")
+        name = self.engine.name
+        self._set_preview(f"Unloading model and stopping {name}…" if not force else f"Force stopping {name}…")
         if not self.endpoint.stop_endpoint(lambda r: self.post(self.on_stopped, r), force=force):
             log.info("stop_endpoint returned False; reconciling")
             self._switching = False              # no stop happened: a model switch must not restart Strata later
@@ -1941,7 +1970,8 @@ class AgentStartApp(ctk.CTk):
             self._execute(action, force=False)
             return
         switch_to = action[1].model_name if action[0] == "switch" else None
-        self.dialog = BusyDialog(self, act, lambda d: self._on_busy_decision(action, d), switch_to=switch_to)
+        self.dialog = BusyDialog(self, act, lambda d: self._on_busy_decision(action, d), switch_to=switch_to,
+                                 engine_name=self.engine.name)
 
     def _on_busy_decision(self, action: tuple[str, Any], decision: str) -> None:
         if isinstance(self.dialog, BusyDialog):
@@ -1964,31 +1994,30 @@ class AgentStartApp(ctk.CTk):
         log.info("pending stop cancelled")
         self._apply_state()                      # the line goes, the toggle reads "Turn off" again
 
-    def _track_request_end(self, last_end: dict | None = None) -> None:
+    def _track_request_end(self, last_end: RequestEnd | None = None) -> None:
         """Remember how the last request ended. An agent turn is several requests: the model writes a tool call,
-        the request ends, the agent runs the tool (Strata idle meanwhile), then sends the result as a new request.
-        A request that ended in a tool call therefore means 'more is coming'.
-        last_end: {"phase", "tool"} from GET /status right after a request finished (authoritative). Without it
-        (Strata with an API key, parallel mode) the phase sampled while generating is used."""
+        the request ends, the agent runs the tool (the engine idle meanwhile), then sends the result as a new
+        request. A request that ended in a tool call therefore means 'more is coming'.
+        last_end: from the engine right after a request finished (authoritative; needs CAP_REQUEST_END). Without it
+        the ending sampled while the request was generating is used."""
         act = self.metrics.activity()
         if act is not None:
             if act.get("kind") == "reading":
-                self._req_phase = None           # a new request: the previous one's phase says nothing about it
-            elif act.get("kind") == "generating" and act.get("phase"):
-                self._req_phase = str(act["phase"])
+                self._req_end = None             # a new request: the previous one's sample says nothing about it
+            elif act.get("kind") == "generating" and (act.get("phase") or act.get("tool_call")):
+                self._req_end = RequestEnd(tool_call=bool(act.get("tool_call")), tool=act.get("tool"))
             self._was_busy = True
             return
         if last_end is not None or self._was_busy:          # a request just finished
-            ph = str((last_end or {}).get("phase") or "") if last_end is not None else (self._req_phase or "")
-            if ph.startswith("writing a tool call") or ph == "tool call complete":
-                tool = (last_end or {}).get("tool") or (ph.split(":", 1)[1].strip() if ":" in ph else "")
-                if not tool and (self._req_phase or "").startswith("writing a tool call:"):
-                    tool = self._req_phase.split(":", 1)[1].strip()
+            end = last_end if last_end is not None else (self._req_end or RequestEnd())
+            if end.tool_call:
+                sampled = self._req_end
+                tool = end.tool or (sampled.tool if sampled is not None and sampled.tool_call else None)
                 self._tool_wait = (tool or "a tool", time.monotonic())
                 log.info("request ended in a tool call (%s): the agent should send another", tool or "?")
             else:
                 self._tool_wait = None
-            self._req_phase, self._was_busy = None, False
+            self._req_end, self._was_busy = None, False
         wait_s = float(self.cfg.get("tool_wait_s") or TOOL_WAIT_S)
         if self._tool_wait is not None and time.monotonic() - self._tool_wait[1] > wait_s:
             log.info("the agent did not come back within %.0f s after %s", wait_s, self._tool_wait[0])
@@ -2023,10 +2052,11 @@ class AgentStartApp(ctk.CTk):
         now = time.monotonic()
         if self._idle_since is None:
             self._idle_since = now
-        elif now - self._idle_since >= IDLE_GRACE_S:
+        elif now - self._idle_since >= (self.engine.idle_grace_s or IDLE_GRACE_S):   # engines that cannot see tool calls wait longer
             if self._stop_pending is not None and self._stop_pending[0] == "off" and self._stop_toast is None:
                 # the toast says why it stopped now (the window may be hidden in the tray)
-                self._stop_toast = ("Strata turned off", "Turned off after the reply finished · freed {freed}.")
+                self._stop_toast = (f"{self.engine.name} turned off",
+                                    "Turned off after the reply finished · freed {freed}.")
             self._run_pending(force=False)
 
     def _run_pending(self, force: bool) -> None:
@@ -2039,8 +2069,9 @@ class AgentStartApp(ctk.CTk):
             self._last_stop_reason = why = str(action[1].get("reason") or "game")
             closed = bool(reopen.load_pending())
             what = "needed the memory" if why == "memory" else "started"
-            self._stop_toast = ("Strata turned off", f"{_short(game, 40)} {what} · freed {{freed}} for it."
-                                + (" The apps closed for Strata are in Agent Start (Reopen)." if closed else ""))
+            name = self.engine.name
+            self._stop_toast = (f"{name} turned off", f"{_short(game, 40)} {what} · freed {{freed}} for it."
+                                + (f" The apps closed for {name} are in Agent Start (Reopen)." if closed else ""))
         self._execute(("off", None) if game else action, force=force)
 
     def _execute(self, action: tuple[str, Any], force: bool) -> None:
@@ -2067,19 +2098,19 @@ class AgentStartApp(ctk.CTk):
 
     # model menu
     def _launcher_choices(self) -> list[tuple[str, str]]:
-        """(label, bat path) for every run-*.bat in the Strata folder; the current launcher's label ends with ✓."""
-        sdir = str(self.cfg.get("strata_dir") or "")
-        cur_bat = str(self.cfg.get("launcher_bat") or "")
-        cur = os.path.normcase(os.path.abspath(cur_bat if os.path.isabs(cur_bat) else os.path.join(sdir, cur_bat))) \
-            if cur_bat else ""
+        """(label, launcher path) for every usable launcher file of the install; the current one's label ends with
+        a check mark. Empty for an engine without launcher files."""
+        eng = self.engine
+        if not eng.can(CAP_LAUNCHER_FILES):
+            return []
+        cur_path = eng.current_launcher(self.cfg)
+        cur = os.path.normcase(os.path.abspath(cur_path)) if cur_path else ""
         out = []
-        for path in launcher_bat.list_launchers(sdir):
+        for path in eng.list_launchers(self.cfg):
             try:
-                info = launcher_bat.parse_bat(path)
-                if launcher_bat.missing_files(info):
-                    continue
-                label = f"{info.model_name}  ·  {info.bat_name}"
-            except Exception:  # noqa: BLE001 - not a Strata launcher (Settings explains why); not offered here
+                info = eng.read_launcher(path)
+                label = f"{info.model_name}  ·  {info.file_name}"
+            except Exception:  # noqa: BLE001 - not a usable launcher (Settings explains why); not offered here
                 continue
             if os.path.normcase(os.path.abspath(path)) == cur:
                 label += "  ✓"
@@ -2087,7 +2118,7 @@ class AgentStartApp(ctk.CTk):
         return out
 
     def _refresh_launchers(self) -> None:
-        """Listing a folder of a few small .bat files is fast enough for the Tk thread. Shows the switch button for
+        """Listing a folder of a few small launcher files is fast enough for the Tk thread. Shows the switch button for
         two or more launchers."""
         try:
             self._launchers = self._launcher_choices()
@@ -2122,16 +2153,13 @@ class AgentStartApp(ctk.CTk):
         if self.state_name in (STARTING, STOPPING):
             return
         try:
-            info = launcher_bat.parse_bat(bat_path)
-            missing = launcher_bat.missing_files(info)
-            if missing:
-                raise launcher_bat.LauncherError(missing)
+            info = self.engine.read_launcher(bat_path)
         except Exception as exc:  # noqa: BLE001
             self._set_note(f"Can't switch to {_short(os.path.basename(bat_path), 24)}\n{exc}")
             return
-        if launcher_bat.same_launch(self.cfg, info) and self._pending_launcher is None:
+        if self.engine.same_launch(self.cfg, info) and self._pending_launcher is None:
             return
-        log.info("model switch requested: %s (%s)", info.model_name, info.bat_name)
+        log.info("model switch requested: %s (%s)", info.model_name, info.file_name)
 
         if self.state_name == ACTIVE:
             self.request_stop(("switch", info))  # saves the launcher only if the switch goes ahead
@@ -2172,17 +2200,18 @@ class AgentStartApp(ctk.CTk):
                 self._set_state(ACTIVE)
             return
         self._last_stop_game = None
-        if not (result.get("port_released") or result.get("cancelled_start")):
+        released = _released(result)             # the engine no longer holds the model (however it got there)
+        if not (released or result.get("cancelled_start")):
             self._switching = False
-        if result.get("cancelled_start") and not (result.get("ok") or result.get("port_released")):
-            self.show_error(result.get("error") or "Cancel failed — Strata may still be running")
+        if result.get("cancelled_start") and not (result.get("ok") or released):
+            self.show_error(result.get("error") or f"Cancel failed — {self.engine.name} may still be running")
             return
         if result.get("cancelled_start"):
             self.model_id, self.loaded = None, None
             self._set_state(IDLE)
             self._set_note("Start cancelled")
             self._request_preview()
-        elif result.get("port_released"):
+        elif released:
             self.model_id, self.loaded = None, None
             self._avail_at_launch = None
             self.add_freed(result.get("ram_freed_mb"))
@@ -2209,16 +2238,15 @@ class AgentStartApp(ctk.CTk):
     # ================================================================== dialogs / exit
     def open_settings(self, found=None) -> None:
         """Gear: launcher choice + protected apps. Not while STARTING/STOPPING (the launch config is in use).
-        found: a strata_finder.Found to offer (first start, no launcher configured yet)."""
+        found: an install the engine found, to offer (first start, nothing configured yet)."""
         if self.state_name in (STARTING, STOPPING) or self._dialog_open():
             return
         self.show_window()
         pending = self._pending_launcher
-        cfg, current = self.cfg, pending.bat_path if pending is not None else None
-        if found is not None and not self.cfg.get("launch_cmd"):
-            import strata_finder
-            cfg = dict(self.cfg, strata_dir=found.strata_dir)
-            current = strata_finder.best_launcher(found)
+        cfg, current = self.cfg, pending.path if pending is not None else None
+        if found is not None and not self.engine.is_configured(self.cfg):
+            cfg = dict(self.cfg, **self.engine.install_settings(found))
+            current = self.engine.preferred_launcher(found)
         self.dialog = SettingsDialog(
             self, cfg, self.detector, on_save=self.save_launcher, on_closed=self._on_settings_closed,
             current_bat=current,
@@ -2226,7 +2254,8 @@ class AgentStartApp(ctk.CTk):
             reopen_after=self._reopen_pref, on_reopen_changed=self.set_reopen_pref,
             update_version=self.updates.offer_version(),
             on_update=self.updates.install, switches=self._settings_switches(),
-            on_check_updates=self.updates.check_now, can_check_updates=self.updates.available())
+            on_check_updates=self.updates.check_now, can_check_updates=self.updates.available(),
+            engine=self.engine)
 
     # ------------------------------------------------------------------ system tray
     def _start_tray(self) -> None:
@@ -2318,23 +2347,25 @@ class AgentStartApp(ctk.CTk):
         finally:
             self._box_open = False
 
-    # ------------------------------------------------------------------ first start: find Strata
+    # ------------------------------------------------------------------ first start: find an install
     def _maybe_find_strata(self) -> None:
-        if self._finder_ran or self.cfg.get("launch_cmd") or getattr(self, "_no_finder", False):
+        if self._finder_ran or self.engine.is_configured(self.cfg) or getattr(self, "_no_finder", False) \
+                or not self.engine.can(CAP_FIND_INSTALL):
             return
         self._finder_ran = True
-        self._set_note("Looking for Strata on this PC…")
-        self._run_worker("hc-find-strata", _find_strata_worker, self.post, self._on_strata_found, self._stop_evt)
+        self._set_note(f"Looking for {self.engine.name} on this PC…")
+        self._run_worker("hc-find-install", _find_install_worker, self.engine, self.post, self._on_strata_found,
+                         self._stop_evt)
 
     def _on_strata_found(self, found) -> None:
         self._found_strata = found[0] if found else None
         if found:
-            log.info("found Strata: %s", [f.strata_dir for f in found])
+            log.info("found %s: %s", self.engine.name, [self.engine.install_dir_of(f) for f in found])
         else:
-            log.info("no Strata found on this PC")
+            log.info("no %s found on this PC", self.engine.name)
         self._note_until = 0.0
         if self._found_strata is None and self.state_name == IDLE:
-            self._set_note("No Strata found\nOpen Settings (gear) and pick your run-*.bat")
+            self._set_note(f"No {self.engine.name} found\n{self.engine.setup_hint}")
         self._request_preview()
 
     def _tray_switch(self, bat_path: str) -> None:
@@ -2379,8 +2410,8 @@ class AgentStartApp(ctk.CTk):
                 self._stop_pending = ("off", _stop_info(title, reason))
             return                               # a pending model switch is the user's explicit choice
         self._stop_pending, self._idle_since = ("off", _stop_info(title, reason)), None
-        log.info("%s (%s): turning Strata off when the model is idle",
-                 "memory needed" if reason == "memory" else "game started", title)
+        log.info("%s (%s): turning %s off when the model is idle",
+                 "memory needed" if reason == "memory" else "game started", title, self.engine.name)
         if self._metrics_fails:                  # no idle signal to wait for
             self._run_pending(force=False)
             return
@@ -2411,7 +2442,8 @@ class AgentStartApp(ctk.CTk):
                 self.memwatch = mem_watch.MemWatcher(
                     self.cfg,                          # the dict the detector reads: protected-list edits apply live
                     on_app=lambda r: post(self._on_memory_app, r.title, r.ram_mb, r.why()),
-                    protected_pids=self.endpoint.protected_pids)
+                    protected_pids=self.endpoint.protected_pids,
+                    engine_protects=lambda i: self.engine.protects_process(i.cmdline, i.exe, self.cfg))
             except Exception:  # noqa: BLE001
                 self.memwatch = None
                 log.exception("memory watcher unavailable")
@@ -2474,15 +2506,15 @@ class AgentStartApp(ctk.CTk):
             self._stop_for_game(title, reason="memory")   # the stop's own toast says why
             return
         self._game_alert = (time.monotonic(), self._start_token, title, "memory")
-        buttons = [("Turn off Strata", f"{PROTOCOL}://game-off")] if config_store.FROZEN and _protocol_registered() \
+        buttons = [(f"Turn off {self.engine.name}", f"{PROTOCOL}://game-off")] if config_store.FROZEN and _protocol_registered() \
             else []
         self._run_worker("hc-toast", _toast_worker, "Memory is running low",
-                         f"{_short(title, 40)} is using {ram_mb / 1024:.1f} GB while Strata is running."
+                         f"{_short(title, 40)} is using {ram_mb / 1024:.1f} GB while {self.engine.name} is running."
                          + ("" if buttons else " Open Agent Start to turn it off."), buttons)
 
     def set_memory_action(self, action: str) -> bool:
         if action not in GAME_ACTIONS:
-            action = {v: k for k, v in GAME_ACTION_LABELS.items()}.get(action, "ask")
+            action = {v: k for k, v in action_labels(self.engine.name).items()}.get(action, "ask")
         self._mem_action = action
         self._save_state_later("memory_action", action)
         self._arm_memory(self.state_name == ACTIVE and self.loaded is True)
@@ -2495,8 +2527,9 @@ class AgentStartApp(ctk.CTk):
         if self.state_name == STARTING and self._start_phase == "server" and self._game_action == "off" \
                 and not self._exit_pending:
             log.info("game started during the load (%s): cancelling the start", title)
-            self._run_worker("hc-toast", _toast_worker, "Strata start cancelled",
-                             f"{_short(title, 40)} started, so Strata stopped loading and left the memory to it.")
+            name = self.engine.name
+            self._run_worker("hc-toast", _toast_worker, f"{name} start cancelled",
+                             f"{_short(title, 40)} started, so {name} stopped loading and left the memory to it.")
             self.cancel_start()
             return
         if self.state_name == STARTING or (self.state_name == ACTIVE and self.loaded is False):
@@ -2516,10 +2549,10 @@ class AgentStartApp(ctk.CTk):
         # ask: a real Windows toast (tray balloons are not shown on Windows 11, and during a full-screen game toasts
         # wait in the notification centre) with a button that works from there
         self._game_alert = (time.monotonic(), self._start_token, title)
-        buttons = [("Turn off Strata", f"{PROTOCOL}://game-off")] if config_store.FROZEN and _protocol_registered() \
+        buttons = [(f"Turn off {self.engine.name}", f"{PROTOCOL}://game-off")] if config_store.FROZEN and _protocol_registered() \
             else []
         self._run_worker("hc-toast", _toast_worker, "Game started",
-                         f"{_short(title, 40)} started while Strata is running ({free})."
+                         f"{_short(title, 40)} started while {self.engine.name} is running ({free})."
                          + ("" if buttons else " Open Agent Start to turn it off."), buttons)
 
     # ------------------------------------------------------------------ settings switches
@@ -2541,7 +2574,7 @@ class AgentStartApp(ctk.CTk):
 
     def set_game_action(self, action: str) -> bool:
         if action not in GAME_ACTIONS:
-            action = {v: k for k, v in GAME_ACTION_LABELS.items()}.get(action, "off")
+            action = {v: k for k, v in action_labels(self.engine.name).items()}.get(action, "off")
         self._game_action = action
         self._save_state_later("game_action", action)
         return self.set_game_pref(action != "none", save=False)
@@ -2569,6 +2602,7 @@ class AgentStartApp(ctk.CTk):
 
     def _settings_switches(self) -> list[dict]:
         frozen = config_store.FROZEN
+        labels = action_labels(self.engine.name)
         auto_on = False
         if frozen:
             try:
@@ -2582,11 +2616,11 @@ class AgentStartApp(ctk.CTk):
             {"key": "autostart", "label": "Start with Windows (in the tray)" if frozen
              else "Start with Windows (installed app only)", "value": auto_on,
              "on_change": self.set_autostart_pref, "enabled": frozen and self._extras},
-            {"key": "games", "label": "When a game starts", "choices": [GAME_ACTION_LABELS[a] for a in GAME_ACTIONS],
-             "value": GAME_ACTION_LABELS[self._game_action], "on_change": self.set_game_action,
+            {"key": "games", "label": "When a game starts", "choices": [labels[a] for a in GAME_ACTIONS],
+             "value": labels[self._game_action], "on_change": self.set_game_action,
              "enabled": self._extras},
-            {"key": "memory", "label": "When memory runs low", "choices": [GAME_ACTION_LABELS[a] for a in GAME_ACTIONS],
-             "value": GAME_ACTION_LABELS[self._mem_action], "on_change": self.set_memory_action,
+            {"key": "memory", "label": "When memory runs low", "choices": [labels[a] for a in GAME_ACTIONS],
+             "value": labels[self._mem_action], "on_change": self.set_memory_action,
              "enabled": self._extras},
             {"key": "updates", "label": "Check for updates daily" if frozen
              else "Check for updates daily (installed app only)", "value": self.updates.daily,
@@ -2606,13 +2640,13 @@ class AgentStartApp(ctk.CTk):
         self._refresh_launchers()
         self._request_preview()
 
-    def save_launcher(self, info: launcher_bat.LauncherInfo, done: Callable[[str | None], None]) -> None:
+    def save_launcher(self, info: Any, done: Callable[[str | None], None]) -> None:
         """Persist the chosen launcher to config.json on a worker, then apply it (now, or at the next start)."""
         def work() -> None:
             err = None
             try:
                 disk = config_store.load_config()         # re-read: keep whatever else changed on disk
-                launcher_bat.apply_to_config(disk, info)
+                self.engine.apply_launcher(disk, info)
                 config_store.save_config(disk)
             except Exception as exc:  # noqa: BLE001
                 log.exception("saving the launcher failed")
@@ -2621,15 +2655,15 @@ class AgentStartApp(ctk.CTk):
 
         self._run_worker("hc-save-launcher", work)
 
-    def _launcher_saved(self, info: launcher_bat.LauncherInfo, err: str | None,
+    def _launcher_saved(self, info: Any, err: str | None,
                         done: Callable[[str | None], None]) -> None:
         if err is None:
-            if launcher_bat.same_launch(self.cfg, info):
+            if self.engine.same_launch(self.cfg, info):
                 self._pending_launcher = None             # back to what is already loaded: nothing to apply
             else:
                 self._pending_launcher = info
                 self._apply_pending_launcher(note=True)
-            log.info("launcher saved: %s (%s)", info.bat_path,
+            log.info("launcher saved: %s (%s)", info.path,
                      "applies next start" if self._pending_launcher is not None else "applied")
         done(err)
         if err is None and self.state_name == ACTIVE:
@@ -2649,17 +2683,17 @@ class AgentStartApp(ctk.CTk):
             # block the switch forever: the new launcher may well use another port. (Review finding, v1.1.)
             if self.endpoint.is_running() and self.endpoint.protected_pids():
                 if note:                          # at save time; never over an ERROR message
-                    self._set_note(f"{_short(info.bat_name, 28)} applies when Strata on port "
+                    self._set_note(f"{_short(info.file_name, 28)} applies when {self.engine.name} on port "
                                    f"{self.cfg.get('port', '?')} has stopped")
                 return False
         except Exception:  # noqa: BLE001
             log.debug("is_running/protected_pids failed", exc_info=True)
             return False
-        launcher_bat.apply_to_config(self.cfg, info)
+        self.engine.apply_launcher(self.cfg, info)
         self._pending_launcher = None
-        log.info("launcher applied: %s -> %s on port %s", info.bat_name, info.model_name, info.port)
+        log.info("launcher applied: %s -> %s on port %s", info.file_name, info.model_name, self.cfg.get("port"))
         if note and self.state_name == IDLE:
-            self._set_note(f"Launcher set to {_short(info.bat_name, 30)}\n{info.summary()}")
+            self._set_note(f"Launcher set to {_short(info.file_name, 30)}\n{info.summary()}")
         return True
 
     def open_whitelist(self) -> None:
@@ -2737,7 +2771,7 @@ class AgentStartApp(ctk.CTk):
             self._finish_exit()
             return
         if st == ACTIVE:
-            ans = self._ask(messagebox.askyesnocancel, "Stop Strata before exit?")
+            ans = self._ask(messagebox.askyesnocancel, f"Stop {self.engine.name} before exit?")
             if ans is None:
                 return
             if self.state_name != ACTIVE:       # state changed under the modal box (monitor/pump kept running)
@@ -2878,6 +2912,9 @@ def _selftest() -> int:
         import game_watch  # noqa: F401
         import mem_watch  # noqa: F401
         import toasts  # noqa: F401
+        import engines.strata  # noqa: F401
+        if "strata" not in engines.available():      # discovery imports every engine module of the build
+            return 5
         import strata_finder  # noqa: F401
         import tray
         import update_controller  # noqa: F401
