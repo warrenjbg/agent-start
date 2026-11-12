@@ -5,7 +5,6 @@ The HTTP part talks ONLY to tests/fixtures/fake_strata_server.py on a free rando
 """
 from __future__ import annotations
 
-import json
 import socket
 import subprocess
 import sys

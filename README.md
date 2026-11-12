@@ -214,36 +214,63 @@ To serve another Strata model, pick its `run-*.bat` in ⚙ Settings — no hand-
 
 ## Tests
 
-Run from this folder with `.venv\Scripts\python.exe`:
+Each `tests\test_*.py` is a standalone script: run it from this folder with the project venv, it prints `[PASS]` /
+`[FAIL]` lines and a summary, and exits 0 when everything passed. There is no pytest.
 
-| Script | What it covers |
+```bat
+.venv\Scripts\python.exe tests\test_stats.py
+.venv\Scripts\python.exe tools\run_tests.py --list
+.venv\Scripts\python.exe tools\run_tests.py --ci
+.venv\Scripts\python.exe tools\run_tests.py test_ui_smoke test_tray
+```
+`tools\run_tests.py` runs suites one after another and prints a summary table: `--list` shows every suite and
+whether CI runs it, `--ci` runs the headless suites with the same switches as CI, or name the suites you want.
+
+Lint and type check (dev tools: `pip install -r requirements-dev.txt`; config in `pyproject.toml`):
+`.venv\Scripts\python.exe -m ruff check .` and `.venv\Scripts\python.exe -m mypy`.
+
+**CI** (`.github/workflows/ci.yml`, Windows runner, Python 3.11 and 3.14): ruff, mypy, then the suites marked *CI*
+below. *Advisory* suites run too, but a failure there does not fail the build (no GPU, timing limits, no guaranteed
+notification area on a runner). *Local* suites open the real window and take screenshots, so they need a desktop.
+
+| Script | CI | What it covers |
+|---|---|---|
+| `tests\test_config_store.py` | CI | The one-time move of the pre-v1.5 data folder ("Hermes Controller") to the new name |
+| `tests\test_identity.py` | CI | Strict Strata identity for the stop path (a process that merely *mentions* `serve\server.py` is never killed) |
+| `tests\test_load_progress.py` | CI | Strata log → phase/progress (plus the newest log in `logs\`, when there is one) |
+| `tests\test_launcher_bat.py` | CI | The `run-*.bat` parser: continuations, variables, relative paths, shims, rejections (+ your real `.bat` files with `STRATA_DIR`) |
+| `tests\test_engine_log.py` | CI | Full-RAM vs low-RAM (SSD) detection from Strata's engine log: real-log fixtures + edge cases |
+| `tests\test_ram_plan.py` | CI | Which apps to pre-tick so Strata reaches its full-RAM mode |
+| `tests\test_stats.py` | CI | `/metrics` accumulation and speed maths, fetch against the fake Strata, VRAM sampler with and without NVML, version files in sync |
+| `tests\test_reopen.py` | CI | Reopening closed apps: launch rules and refusals, against its own dummy processes only |
+| `tests\test_game_watch.py` | CI | Game-launch detection: baseline, launchers, one alert per install, real throwaway "game" process |
+| `tests\test_strata_finder.py` | CI | The Strata search: depth/time limits, decoys, skipped folders, junctions, hostile UNC paths |
+| `tests\test_autostart.py` | CI | Start with Windows in a throwaway HKCU key: quoting, Task Manager's disabled flag, refresh |
+| `tests\test_toasts.py` | CI | Toast titles/messages are data, never code (PowerShell only parses the XML back; no toast shown) |
+| `tests\test_updater.py` | CI | GitHub release check + download against a local server: size/SHA-256, redirects, cancel, path checks, installer argv; a throwaway Inno Setup installer when ISCC is present |
+| `tests\test_server_manager.py` | CI | Fake Strata on a random port: start/ready/timeout/lazy-load/adopt/busy+force/cancel/foreign-listener/launcher topology/launch from a parsed `.bat` (shows one real toast) |
+| `tests\test_detector.py` | Advisory | Real-system scan + dry run (asserts nothing protected is ever listed), synthetic graph rules, kill test on its own throwaway process only |
+| `tests\test_tray.py` | Advisory | Tray icon on its own thread: status icon, menu + Switch model submenu, balloon clicks, callbacks, no GDI leaks (shows one balloon) |
+| `tests\test_ui_smoke.py` | Local | UI with stub backends, every state, Settings dialog, stats section (100 % and 150 % scaling), screenshots `tests\ui_*.png` |
+| `tests\test_busy_switch.py` | Local | Safe Turn off during a reply (busy dialog / stop when idle) and the quick model switch, stub backends, screenshots `tests\ui_busy_*.png` |
+| `tests\test_e2e_fake.py` | Local | The real app + real manager/detector/NVML against a fake Strata started from a parsed `.bat`: ON → graphs fill → change launcher → OFF → ON |
+| `tests\test_app_extras.py` | Local | Tool-call-aware safe Turn off, tray wiring, update offer/install flow (stubbed), first-start Strata search, the reopen switch |
+| `tests\run_real_idle.py` | Never | **Real** backends: the real app against your real setup, IDLE only, no clicks, no kills, screenshot |
+| `tests\run_real_onoff.py` | Never | **Real** Strata ON → OFF through the app (only with explicit intent; closes no apps) |
+| `tests\run_installed_onoff.py` | Never | **Real** Strata through the **installed** `AgentStart.exe`, driven with mouse clicks (only with explicit intent) |
+
+None of the `test_*.py` suites touch the real Strata, port 8080, or any app they did not start; fake servers use free
+random ports. The `run_*.py` scripts do use the real Strata and are never run by CI or `tools\run_tests.py`.
+
+Environment switches:
+
+| Variable | Effect |
 |---|---|
-| `tests\test_detector.py` | Real-system scan + dry run (asserts nothing protected is ever listed), synthetic graph rules, kill test on its own throwaway process only |
-| `tests\test_server_manager.py` | Fake Strata on a random port: start/ready/timeout/lazy-load/adopt/busy+force/cancel/foreign-listener/launcher topology/launch from a parsed `.bat` |
-| `tests\test_ui_smoke.py` | UI with stub backends, every state, Settings dialog, stats section (100 % and 150 % scaling), screenshots `tests\ui_*.png` |
-| `tests\test_launcher_bat.py` | The `.bat` parser: the five real `run-*.bat` (read only), continuations, variables, relative paths, rejections |
-| `tests\test_stats.py` | `/metrics` accumulation and speed maths, fetch against the fake Strata, VRAM sampler with and without NVML, version files in sync |
-| `tests\test_e2e_fake.py` | The real app + real manager/detector/NVML against a fake Strata started from a parsed `.bat`: ON → graphs fill → change launcher → OFF → ON |
-| `tests\test_identity.py` | Strict Strata identity for the stop path (a process that merely *mentions* `serve\server.py` is never killed) |
-| `tests\test_load_progress.py` | Strata log → phase/progress (incl. the newest real log) |
-| `tests\test_app_extras.py` | Tool-call-aware safe Turn off, tray wiring, update offer/install flow (stubbed), first-start Strata search, the reopen switch |
-| `tests\test_updater.py` | GitHub release check + download against a local server: size/SHA-256, redirects, cancel, path checks, installer argv (never runs it) |
-| `tests\test_strata_finder.py` | The Strata search: depth/time limits, decoys, skipped folders, junctions |
-| `tests\test_tray.py` | Tray icon on its own thread: status icon, menu + Switch model submenu, balloon clicks, callbacks, no GDI leaks |
-| `tests\test_game_watch.py` | Game-launch detection: baseline, launchers, one alert per install, real throwaway "game" process |
-| `tests\test_autostart.py` | Start with Windows in a test registry key: quoting, Task Manager's disabled flag, refresh |
-| `tests\run_real_idle.py` | Real backends, IDLE only, no clicks |
-| `tests\run_real_onoff.py` | **Real** Strata ON → OFF (only with your OK; closes no apps) |
-
-None of the tests touch the real Strata, port 8080, or any app they did not start.
+| `AGENTSTART_TEST_OFFLINE=1` | `test_updater` skips its one read-only request to api.github.com (set in CI) |
+| `AGENTSTART_TEST_NO_INNO=1` | `test_updater` skips compiling and running its throwaway Inno Setup installer (set in CI) |
+| `STRATA_DIR=<your Strata folder>` | Optional: `test_launcher_bat`, `test_strata_finder` and `test_engine_log` also check your real install (read only). Unset in CI |
 
 Design and contracts: `SPEC.md` (v1 and the advisor review history in `docs\`).
-
-## Tests
-
-Each `tests\test_*.py` is a standalone script (`.venv\Scripts\python.exe tests\test_ui_smoke.py`). The UI and e2e
-suites open windows and take screenshots; none of the suites contact a real Strata or close real apps. Set
-`STRATA_DIR` to your Strata folder to also check the parser against your real `run-*.bat` files.
 
 ## License
 

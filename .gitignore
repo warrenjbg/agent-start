@@ -2,9 +2,13 @@
 build/
 dist/
 __pycache__/
+.mypy_cache/
+.ruff_cache/
 logs/
 tests/*.png
 *.log
+# engine-log parser fixtures (tests/test_engine_log.py) are test data, not runtime logs
+!tests/fixtures/engine_logs/*.log
 state.json
 # personal / machine-specific (config.default.json is the shipped default)
 config.json

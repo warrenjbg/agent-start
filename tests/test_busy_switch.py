@@ -582,7 +582,7 @@ def test_switch_button(S: Strata) -> None:
         app.on_toggle()
         check(app.state_name == "STARTING" and str(app.switch_btn.cget("state")) == "disabled",
               f"STARTING: switch button disabled ({app.switch_btn.cget('state')})")
-        n0, s0 = len(ep.stop_calls), len(ep.start_calls)
+        n0 = len(ep.stop_calls)
         app.switch_model(S.bat_b)
         pump(app, 0.3)
         check(S.on_a(app) and app.state_name == "STARTING" and len(ep.stop_calls) == n0,

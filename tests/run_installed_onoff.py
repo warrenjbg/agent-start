@@ -1,6 +1,6 @@
 """Integrator check (user-approved): drive the INSTALLED AgentStart.exe like a user (mouse clicks):
 Turn on -> 'Start without closing' -> wait Serving -> Turn off -> Idle -> close. Screenshots tests/inst_*.png."""
-import os, time, socket, subprocess, sys
+import os, time, socket, subprocess
 import win32api, win32con, win32gui, win32process
 from PIL import ImageGrab
 

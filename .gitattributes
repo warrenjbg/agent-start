@@ -1,0 +1,2 @@
+# parser fixtures: keep bytes as committed (no CRLF conversion on checkout)
+tests/fixtures/engine_logs/*.log -text

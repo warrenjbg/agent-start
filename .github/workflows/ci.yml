@@ -1,0 +1,76 @@
+# Lint, type check and the headless test suites on a GitHub-hosted Windows runner.
+# Every tests/test_*.py is a standalone script (exit code 0 = pass); tools/run_tests.py runs a list of them.
+#
+# Suites NOT run here (they need what a CI runner cannot promise; run them locally, see README "Tests"):
+#   test_ui_smoke, test_busy_switch, test_e2e_fake, test_app_extras
+#       open the real app window (CustomTkinter), click through it and take PIL.ImageGrab screenshots of the desktop.
+#   tests/run_real_onoff.py, run_installed_onoff.py, run_real_idle.py
+#       integrator scripts against the REAL Strata / the installed app - never in CI.
+#
+# Advisory (run, but a failure does not fail the build - see the "advisory" step):
+#   test_detector  real process-table scan; asserts PDH GPU memory returns a float (a runner has no GPU) and has
+#                  wall-clock limits (warm scan < 1.5 s, capture < 50 ms) that a shared runner may miss.
+#   test_tray      needs Explorer's notification area (Shell_NotifyIcon) and shows one balloon.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash   # Git Bash on the Windows runner: runs with -e, so a failing pip line fails the step
+
+jobs:
+  lint:
+    name: ruff + mypy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/Scripts/python.exe -m pip install --upgrade pip
+          .venv/Scripts/python.exe -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: ruff
+        run: .venv/Scripts/python.exe -m ruff check --output-format=github .
+      - name: mypy
+        run: .venv/Scripts/python.exe -m mypy
+
+  tests:
+    name: tests (Python ${{ matrix.python }})
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 = requires-python floor; 3.14 = what the app is built and shipped with.
+        python: ["3.11", "3.14"]
+    env:
+      AGENTSTART_TEST_OFFLINE: "1"   # test_updater: skip its one real GET to api.github.com (rate limits on shared IPs)
+      AGENTSTART_TEST_NO_INNO: "1"   # test_updater: skip compiling + running a throwaway Inno Setup installer
+      PYTHONIOENCODING: utf-8
+      # STRATA_DIR is deliberately unset: the optional real-Strata checks skip themselves.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      # A stdlib venv at .venv is required, not just tidy: test_reopen / test_game_watch copy .venv\Scripts\python.exe
+      # (the venv redirector) + pyvenv.cfg to make their dummy processes.
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/Scripts/python.exe -m pip install --upgrade pip
+          .venv/Scripts/python.exe -m pip install -r requirements.txt
+      - name: Headless test suites
+        run: .venv/Scripts/python.exe tools/run_tests.py --ci
+      - name: Advisory suites (test_detector, test_tray) - failures do not fail the build
+        continue-on-error: true
+        run: .venv/Scripts/python.exe tools/run_tests.py --advisory

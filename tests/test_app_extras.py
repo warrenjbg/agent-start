@@ -237,7 +237,6 @@ def test_tray() -> None:
         app.on_close_request()
         pump(app, 0.3)
         check(app.state() == "withdrawn" and not app._destroyed, f"X hides the window ({app.state()})")
-        hint = [x for x in TOASTS if "tray" in x[1].lower()]
         check(pump_until(app, lambda: [x for x in TOASTS if "tray" in x[1].lower()], 3), f"first hide: a hint toast ({TOASTS})")
         check(pump_until(app, lambda: config_store.load_state().get("tray_hint_shown") is True, 3), "hint shown once (saved)")
         app.on_close_request()
@@ -746,7 +745,6 @@ def test_settings_switches() -> None:
 
 def test_review_fixes() -> None:
     """Fable v1.8 review: reachable windows without a tray, stale balloons, one-shot stop toast, tray models."""
-    import threading
     import tray as tray_mod
     # 1. --tray with the tray off: iconify after the loop runs; CTk's mainloop must not leave it withdrawn
     app, det, ep = U.new_app()

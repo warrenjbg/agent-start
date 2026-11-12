@@ -1,0 +1,123 @@
+# Project metadata + lint/type-check config. Agent Start is not an installable package: it is run from source
+# (run.bat / python main.py) or frozen with PyInstaller (build.bat). Pinned dependencies live in requirements.txt
+# (runtime + build) and requirements-dev.txt (ruff, mypy); CI is .github/workflows/ci.yml.
+
+[project]
+name = "agent-start"
+description = "Windows tray app that starts and stops a local Strata LLM server and frees RAM/VRAM for it."
+readme = "README.md"
+license = "MIT"
+# Lowest version CI runs the headless suites on (3.11); the app is built and shipped on 3.14.
+requires-python = ">=3.11"
+# version.py is the single source of the version (build.bat / tools/sync_version.py read it too) - never repeat it here.
+dynamic = ["version"]
+
+[tool.setuptools.dynamic]
+version = { attr = "version.__version__" }
+
+# ------------------------------------------------------------------------------------------------------------ ruff
+[tool.ruff]
+line-length = 120          # the repo's convention: code wraps at ~120 (2467 lines > 100, 97 > 120, mostly tests)
+extend-exclude = ["build", "dist", "installer"]
+
+[tool.ruff.lint]
+# pycodestyle errors/warnings, pyflakes, bugbear. Not selected (yet): I (isort, 21 files would be reordered) and UP
+# (pyupgrade, 24 typing/annotation rewrites) - both are pure style rewrites, worth a separate commit of their own.
+select = ["E", "F", "W", "B"]
+ignore = [
+    "B905",   # zip() without strict=: adding strict=True changes behaviour on a length mismatch (3 hits)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test and integrator scripts: compact one-liners (`a = 1; b = 2`, 59 hits), long assert messages (79 hits), `l` as a
+# loop name (4), closures over the loop variable that are called inside the same iteration (pump_until(..., lambda:
+# len(app.metrics) > n) - B023 false positives, 5), one unused loop variable (B007, 1) and `import a, b` lines in the
+# tests/run_*.py integrator scripts (E401, 4).
+"tests/**" = ["E401", "E501", "E701", "E702", "E741", "B007", "B023"]
+# Lines over 120 characters in app modules (13 lines in total; count per file). E501 stays on for every other module.
+"busy_dialog.py" = ["E501"]      # 1
+"main.py" = ["E501"]             # 4
+"metrics_store.py" = ["E501"]    # 2
+"sweep_dialog.py" = ["E501"]     # 2
+"theme.py" = ["E501"]            # 1
+"toasts.py" = ["E501"]           # 1
+"whitelist_modal.py" = ["E501"]  # 2
+# Unused loop variable in a tuple unpack (`for pid, info in ...`, `for item_id, text, enabled, default in ...`).
+# Renaming to _info / _default is harmless, but detector.py is part of the kill path and stays untouched here.
+"detector.py" = ["B007"]         # 1
+"tray.py" = ["B007"]             # 1
+
+# ------------------------------------------------------------------------------------------------------------ mypy
+[tool.mypy]
+# App modules and tools/. tests/ is not type-checked: the suites are scripts built on monkeypatching, fakes and
+# SimpleNamespace stand-ins (184 errors in 18 files with this config, nearly all from that); ruff still lints them.
+files = ["*.py", "tools/*.py"]
+python_version = "3.11"
+explicit_package_bases = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+# Lenient start: bodies of functions WITHOUT annotations are not checked (mypy's default; most functions here are
+# annotated, so most code is checked). Tighten later with check_untyped_defs = true.
+check_untyped_defs = false
+
+# Third-party modules that ship no type information (no py.typed, no stubs installed): treated as Any.
+[[tool.mypy.overrides]]
+module = [
+    "customtkinter", "customtkinter.*",
+    "psutil",
+    "pynvml",
+    "pywintypes", "win32api", "win32con", "win32gui", "win32pdh", "win32process",
+]
+ignore_missing_imports = true
+
+# Known findings on the current code, silenced PER MODULE AND PER ERROR CODE so every other check still runs on these
+# files. They are real typing gaps (mostly `x = None` attributes later set to an object, and Optional values used
+# after a check mypy cannot follow), not crashes seen in the tests; fix them and delete the entry. Counts as of v1.8.1.
+[[tool.mypy.overrides]]
+module = "main"            # 20 errors across 7 codes (assignment 7, attr-defined 5, union-attr 3, index 2, ...)
+ignore_errors = true       # too many to list per code; main.py is the next file to tighten
+
+[[tool.mypy.overrides]]
+module = "detector"
+disable_error_code = ["assignment", "arg-type", "call-overload"]   # 3 + 2 + 1
+
+[[tool.mypy.overrides]]
+module = "server_manager"
+disable_error_code = ["assignment", "misc", "union-attr"]          # 1 + 1 + 1
+
+[[tool.mypy.overrides]]
+module = "updater"
+disable_error_code = ["operator", "arg-type"]                      # 2 + 1
+
+[[tool.mypy.overrides]]
+module = "game_watch"
+disable_error_code = ["operator", "union-attr"]                    # 1 + 1
+
+[[tool.mypy.overrides]]
+module = "settings_dialog"
+disable_error_code = ["type-var"]                                  # 2
+
+[[tool.mypy.overrides]]
+module = "sweep_dialog"
+disable_error_code = ["union-attr"]                                # 2
+
+[[tool.mypy.overrides]]
+module = "graphs"
+disable_error_code = ["override"]                                  # 1: BarGraph.scale() shadows tk.Canvas.scale
+
+[[tool.mypy.overrides]]
+module = "launcher_bat"
+disable_error_code = ["assignment"]                                # 1
+
+[[tool.mypy.overrides]]
+module = "ram_plan"
+disable_error_code = ["arg-type"]                                  # 1
+
+[[tool.mypy.overrides]]
+module = "vram_sampler"
+disable_error_code = ["no-redef"]                                  # 1: `nv` bound twice (import fallback)
+
+[[tool.mypy.overrides]]
+module = "tools.make_icon"
+disable_error_code = ["attr-defined"]                              # 1: Image.LANCZOS is missing from Pillow's stubs
