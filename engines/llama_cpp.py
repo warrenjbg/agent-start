@@ -773,6 +773,16 @@ def judge_fit(stdout: Any, block_count: int | None) -> FitReport:
 
 
 @dataclass(frozen=True)
+class LlamaLaunch(CommandLaunch):
+    """A CommandLaunch that names its model (the app's notes say "Model set to <model>", not the program)."""
+
+    @property
+    def model_name(self) -> str:
+        m = _last_value([str(a) for a in self.args], _MODEL_PATH_FLAGS)
+        return model_label(m.strip('"')) if m else super().model_name
+
+
+@dataclass(frozen=True)
 class FoundLlama:
     """What llama_finder found: every build, every model file, and the suggested pair (choice.build is the best
     build for this PC; choice.model only when there is exactly one model)."""
@@ -879,10 +889,49 @@ class LlamaCppEngine(Engine):
             choice = getattr(found[0], "choice", None) if len(found) == 1 else None
             if choice is None or not choice.clear or choice.build is None or choice.model is None:
                 return None
-            return CommandLaunch(program=choice.build.program,
-                                 args=llama_finder.default_args(choice.model.path, DEFAULT_PORT))
+            return LlamaLaunch(program=choice.build.program,
+                               args=llama_finder.default_args(choice.model.path, DEFAULT_PORT))
         except Exception:  # noqa: BLE001
             return None
+
+    setup_action = "Choose model"
+
+    def found_summary(self, found: Any) -> tuple[str, str]:
+        build = getattr(getattr(found, "choice", None), "build", None)
+        n = len(getattr(found, "models", ()) or ())
+        tag = {"cuda": "CUDA", "vulkan": "Vulkan", "cpu": "CPU"}.get(str(getattr(build, "backend", "")),
+                                                                    str(getattr(build, "backend", "")).upper())
+        line = (f"{n} model{'' if n == 1 else 's'} on this PC" if n
+                else "No model files found · add a .gguf in Settings")
+        return tag, line
+
+    def switch_choices(self, found: Any, cfg: Mapping[str, Any]) -> list[tuple[str, Any, bool]]:
+        """One entry per model file found. Configured: the same program and arguments with only the model
+        replaced. Not configured yet: the best build with `-m <model> --port 9931`."""
+        try:
+            import llama_finder
+            models = list(getattr(found, "models", ()) or ())
+            if not models:
+                return []
+            prog = configured_program(cfg)
+            raw = [str(x) for x in (cfg.get("launch_cmd") or [])]
+            cur = fit_model_path(cfg) if prog else None
+            build = getattr(getattr(found, "choice", None), "build", None)
+            if prog is None and build is None:
+                return []
+            out: list[tuple[str, Any, bool]] = []
+            for label, m in zip(llama_finder.unique_labels(models, llama_finder.model_label), models):
+                if prog is not None:
+                    info = LlamaLaunch(program=raw[0], args=tuple(llama_finder.with_model(raw[1:], m.path)))
+                else:
+                    assert build is not None
+                    info = LlamaLaunch(program=build.program, args=llama_finder.default_args(m.path, DEFAULT_PORT))
+                same = bool(cur) and os.path.normcase(os.path.normpath(cur or "")) == \
+                    os.path.normcase(os.path.normpath(m.path))
+                out.append((label, info, same))
+            return out
+        except Exception:  # noqa: BLE001
+            return []
 
     def launch_title(self, info: Any) -> str:
         m = _last_value([str(a) for a in getattr(info, "args", ())], _MODEL_PATH_FLAGS)

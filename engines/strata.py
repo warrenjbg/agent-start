@@ -266,6 +266,14 @@ class StrataEngine(Engine):
         import strata_finder
         return strata_finder.best_launcher(found) or None
 
+    setup_action = "Choose launcher"
+
+    def found_summary(self, found: Any) -> tuple[str, str]:
+        n = len(list(getattr(found, "launchers", None) or []))
+        folder = os.path.basename(os.path.normpath(self.install_dir_of(found))) if self.install_dir_of(found) else ""
+        line = f"{n} launcher{'' if n == 1 else 's'}" + (f" in {folder}" if folder else "")
+        return "", line if n else folder
+
     def auto_launch(self, found: list[Any], cfg: Mapping[str, Any]) -> Any:
         """One Strata install on this PC with exactly one launcher (one model) that can be read: use it. Several
         launchers are several models: the user picks."""

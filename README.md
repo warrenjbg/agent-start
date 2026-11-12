@@ -167,7 +167,10 @@ To use llama.cpp:
    - models: `.gguf` files of 100 MB or more in those places, llama.cpp's own cache, the Hugging Face cache and LM
      Studio's models folder (vision projectors and later parts of split files are left out).
    With one model found it sets itself up (`-m <model> --port 9931`, the best build) and says so; nothing is
-   started. With several models, or none, Turn on opens Settings.
+   started. With several models the window shows a card with what was found, and the main button reads
+   **Choose model**: it lists the models, and picking one finishes the set-up. After that the ⇄ button next to
+   the gear switches between the found models (only the model in the arguments changes; a running model is
+   turned off first, the same way as a Strata model switch).
 3. Settings shows **Build** and **Model** dropdowns with what was found, above a program box and an arguments box.
    On an NVIDIA card the CUDA build comes first. Picking a model writes it into the arguments and keeps the rest;
    you can also *Browse…* for `llama-server.exe` and type the arguments yourself, e.g.
@@ -189,7 +192,7 @@ To use llama.cpp:
 | Turn off | Ends `llama-server.exe` and its console host (and `llama-connect.exe` from the same folder, if `--connect` started one); nothing else |
 | App sweep | Never offers `llama-server.exe` or anything in its folder for closing |
 | Dashboard link | *Open llama.cpp dashboard* opens llama-server's own web page on `/` (not with `--no-ui`) |
-| Not available | Unloading without ending the process, a load percentage, tool-call awareness, the full-RAM / low-RAM plan, the Switch model button |
+| Not available | Unloading without ending the process, a load percentage, tool-call awareness, the full-RAM / low-RAM plan |
 
 Tested on one PC with llama.cpp build b12314 (the winget build and the CUDA build from llama.cpp's GitHub
 releases). Not tested yet: setups with `--api-key`, other builds.

@@ -104,6 +104,10 @@ DETAIL_WRAP = 360 - DETAIL_INDENT - 16
 GAP_HEAD_BUTTON = 12                     # status line -> button when no detail is shown
 GAP_DETAIL_TOP = 4                       # status row (28 px, title centred) -> detail line
 GAP_AFTER_DETAIL = 10                    # detail line -> button / progress bar
+SETUP_CARD_GAP = 12                      # status line -> the set-up card (nothing configured, an install was found)
+SETUP_CARD_H = 52
+SETUP_HINT_GAP = 8                       # button -> "or open Settings…"
+SETUP_H = SETUP_CARD_GAP + SETUP_CARD_H + (GAP_AFTER_DETAIL - GAP_HEAD_BUTTON) + SETUP_HINT_GAP + 16
 PENDING_GAP = 7                          # button -> the pending-stop line under it
 PENDING_H = PENDING_GAP + 16             # added while that line shows
 CARD_TOP = 14                            # button -> first panel
@@ -779,6 +783,26 @@ class AgentStartApp(ctk.CTk):
                                     font=self._font(16, "bold"), command=self.on_toggle,
                                     text_color_disabled=T.TEXT_3)
         self.toggle.pack()
+        # set-up card (nothing configured yet, the engine found an install): what was found, centred; the main
+        # button below it is the one action ("Choose model"), with a pointer to Settings under it
+        self.setup_card = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=T.R_CARD, height=SETUP_CARD_H)
+        self.setup_card.grid_propagate(False)
+        self.setup_card.grid_columnconfigure(0, weight=1)
+        self.setup_card.grid_rowconfigure((0, 3), weight=1)
+        self._setup_head = ctk.CTkFrame(self.setup_card, fg_color="transparent")
+        self._setup_head.grid(row=1, column=0)
+        self.setup_title = ctk.CTkLabel(self._setup_head, text="", font=self._font(13, "bold"), text_color=T.TEXT,
+                                        height=18)
+        self.setup_title.pack(side="left")
+        self.setup_tag = ctk.CTkLabel(self._setup_head, text="", font=self._font(10), text_color=T.TEXT_2, height=16,
+                                      fg_color=T.RAISED, corner_radius=6)
+        self.setup_line = ctk.CTkLabel(self.setup_card, text="", font=self._detail_font, text_color=T.TEXT_2,
+                                       height=16)
+        self.setup_line.grid(row=2, column=0)
+        self.setup_hint = ctk.CTkLabel(self.btn_box, text="or open Settings to set it up by hand",
+                                       font=self._detail_font, text_color=T.TEXT_2, height=16)
+        self._setup_shown = False
+        self._launch_infos: dict[str, Any] = {}  # menu key -> launcher info (engines without launcher files)
         self.pending_box = ctk.CTkFrame(self.btn_box, fg_color="transparent")
         self.pending_text = ctk.CTkLabel(self.pending_box, text="", font=self._detail_font, text_color=T.TEXT_2,
                                          height=16)
@@ -866,8 +890,9 @@ class AgentStartApp(ctk.CTk):
             title, led = LOW_RAM_STATUS
         self.pill.configure(text=title)
         self.led.configure(fg_color=led)
+        self._sync_setup(st)
         if st in (IDLE, ERROR):
-            self._style_toggle("Turn on", TOGGLE_ON, "normal")
+            self._style_toggle(self.engine.setup_action if self._setup_shown else "Turn on", TOGGLE_ON, "normal")
         elif st == ACTIVE:
             label = "Turn off"
             if self._stop_pending is not None:
@@ -1024,6 +1049,29 @@ class AgentStartApp(ctk.CTk):
         if self.state_name == ACTIVE:
             self._apply_state()
 
+    def _sync_setup(self, st: str | None = None) -> bool:
+        """The set-up card shows while idle with nothing configured and an install the engine found."""
+        st = st or self.state_name
+        found = self._found_strata
+        want = bool(st == IDLE and found is not None and self._pending_launcher is None
+                    and not self.engine.is_configured(self.cfg))
+        if want:
+            try:
+                tag, line = self.engine.found_summary(found)
+            except Exception:  # noqa: BLE001
+                tag, line = "", ""
+            self.setup_title.configure(text=f"{self.engine.name} found")
+            self.setup_line.configure(text=_short(line, 48))
+            if tag:
+                self.setup_tag.configure(text=f" {tag} ")
+                if not self.setup_tag.winfo_manager():
+                    self.setup_tag.pack(side="left", padx=(8, 0))
+            elif self.setup_tag.winfo_manager():
+                self.setup_tag.pack_forget()
+        changed = want != self._setup_shown
+        self._setup_shown = want
+        return changed
+
     def _is_low_ram(self) -> bool:
         return (self.state_name == ACTIVE and self._engine_load is not None
                 and self._engine_load.mode == "low_ram" and self.loaded is not False)
@@ -1089,10 +1137,18 @@ class AgentStartApp(ctk.CTk):
                 pass
         if not clickable:
             self._head_hover(False)
-        key = (show, busy, self._pending_shown)
+        setup = self._setup_shown
+        key = (show, busy, self._pending_shown, setup)
         if key == self._layout_key:
             return
         self._layout_key = key
+        if setup:
+            self.setup_card.grid(row=2, column=0, sticky="ew", padx=16,
+                                 pady=(GAP_AFTER_DETAIL if show else SETUP_CARD_GAP, 0))
+            self.setup_hint.pack(pady=(SETUP_HINT_GAP, 0))
+        else:
+            self.setup_card.grid_remove()
+            self.setup_hint.pack_forget()
         if show:
             self.preview.grid(row=1, column=0, sticky="ew", padx=(DETAIL_INDENT, 16), pady=(GAP_DETAIL_TOP, 0))
         else:
@@ -1102,7 +1158,8 @@ class AgentStartApp(ctk.CTk):
                                pady=(GAP_AFTER_DETAIL if show else GAP_HEAD_BUTTON, 0))
         else:
             self.progress.grid_remove()
-        self.btn_box.grid(row=3, column=0, pady=(GAP_AFTER_DETAIL if (show or busy) else GAP_HEAD_BUTTON, 0))
+        self.btn_box.grid(row=3, column=0,
+                          pady=(GAP_AFTER_DETAIL if (show or busy or setup) else GAP_HEAD_BUTTON, 0))
         if self._pending_shown:
             self.pending_box.pack(pady=(PENDING_GAP, 0))
         else:
@@ -1970,9 +2027,9 @@ class AgentStartApp(ctk.CTk):
         if "_error" in res:
             self._set_preview(f"Scan failed: {res['_error']}")
         elif self._found_strata is not None and not self.engine.is_configured(self.cfg):
-            self._set_status(f"{self.engine.name} found",
-                             f"{_tail(self.engine.install_dir_of(self._found_strata), 30)} · click to set up",
-                             color=T.TEXT_2, link=True)
+            if self._sync_setup():
+                self._apply_state()
+            self._set_status("Not set up yet", "", color=T.TEXT_2)
         elif self._reopen_offer and not self._reopening:
             head = format_preview(res).partition("\n")[0]
             self._set_status(head if self._fits_summary(head) else "", self._offer_text(), color=T.TEXT_2, link=True)
@@ -2016,7 +2073,8 @@ class AgentStartApp(ctk.CTk):
             self._set_note("Installing an update · try again after the restart")
             return
         if not self.engine.is_configured(self.cfg) and self._pending_launcher is None:
-            self.open_settings(found=self._found_strata)     # nothing to start yet: pick the Strata launcher first
+            if self._found_strata is None or not self.open_model_menu(anchor=self.toggle):
+                self.open_settings(found=self._found_strata)     # nothing to start yet and nothing to pick from
             return
         self._sweep_note = ""
         self._reopen_this = False
@@ -2418,12 +2476,24 @@ class AgentStartApp(ctk.CTk):
         """(label, launcher path) for every usable launcher file of the install; the current one's label ends with
         a check mark. Empty for an engine without launcher files."""
         eng = self.engine
+        self._launch_infos = {}
+        found = self._found_strata
         if not eng.can(CAP_LAUNCHER_FILES):
-            return []
-        cur_path = eng.current_launcher(self.cfg)
+            if found is None:
+                return []
+            picks = []
+            for i, (label, info, current) in enumerate(eng.switch_choices(found, self.cfg)):
+                key = f"choice:{i}"
+                self._launch_infos[key] = info
+                picks.append((label + ("  ✓" if current else ""), key))
+            return picks
+        cfg = self.cfg
+        if found is not None and not eng.is_configured(cfg):
+            cfg = dict(cfg, **eng.install_settings(found))       # not set up yet: the launchers of what was found
+        cur_path = eng.current_launcher(cfg)
         cur = os.path.normcase(os.path.abspath(cur_path)) if cur_path else ""
         out = []
-        for path in eng.list_launchers(self.cfg):
+        for path in eng.list_launchers(cfg):
             try:
                 info = eng.read_launcher(path)
                 label = f"{info.model_name}  ·  {info.file_name}"
@@ -2442,22 +2512,26 @@ class AgentStartApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             log.debug("listing launchers failed", exc_info=True)
             self._launchers = []
-        show = len(self._launchers) >= 2
+        show = len(self._launchers) >= 2 and self.engine.is_configured(self.cfg)
         if show and not self.switch_btn.winfo_manager():
             self.switch_btn.grid(row=0, column=5, padx=(0, 2))
         elif not show and self.switch_btn.winfo_manager():
             self.switch_btn.grid_remove()
 
-    def open_model_menu(self) -> None:
+    def open_model_menu(self, anchor: Any = None) -> bool:
+        """The model menu under the switch button (or under `anchor`: the main button in set-up mode).
+        False when there is nothing to offer."""
         if self.state_name in (STARTING, STOPPING) or self._dialog_open():
-            return
+            return False
         self._refresh_launchers()
         if not self._launchers:
-            return
+            return False
+        w = anchor if anchor is not None else self.switch_btn
         self._model_menu.configure(values=[label for label, _ in self._launchers])
-        x = self.switch_btn.winfo_rootx()
-        y = self.switch_btn.winfo_rooty() + self.switch_btn.winfo_height()
+        x = w.winfo_rootx()
+        y = w.winfo_rooty() + w.winfo_height()
         self._model_menu.open(x, y)
+        return True
 
     def _on_model_menu(self, label: str) -> None:
         path = dict(self._launchers).get(label)
@@ -2470,7 +2544,13 @@ class AgentStartApp(ctk.CTk):
         if self.state_name in (STARTING, STOPPING):
             return
         try:
-            info = self.engine.read_launcher(bat_path)
+            info = self._launch_infos.get(bat_path)          # an engine without launcher files: its own choice
+            if info is None:
+                info = self.engine.read_launcher(bat_path)
+            else:                                            # the same check a choice made in Settings gets
+                trial = dict(self.cfg)
+                self.engine.apply_launcher(trial, info)
+                self.engine.plan_launch(trial)
         except Exception as exc:  # noqa: BLE001
             self._set_note(f"Can't switch to {_short(os.path.basename(bat_path), 24)}\n{exc}")
             return
@@ -2945,8 +3025,8 @@ class AgentStartApp(ctk.CTk):
             log.info("launcher saved: %s (%s)", info.path,
                      "applies next start" if self._pending_launcher is not None else "applied")
         done(err)
-        if err is None and self.state_name == ACTIVE:
-            self._apply_state()                           # shows / clears the "applies next start" line
+        if err is None and self.state_name in (ACTIVE, IDLE):
+            self._apply_state()                           # the "applies next start" line / the set-up card
 
     def _apply_pending_launcher(self, note: bool = False) -> bool:
         """Switch the shared config to the saved launcher - only while no Strata is using the old one.

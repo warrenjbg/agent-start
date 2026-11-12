@@ -369,6 +369,7 @@ def expected_h(app) -> int:
     h = main.BASE_H + (main.DETAIL_H if detail_shown(app) else 0)
     h += main.PROGRESS_H if app.progress.winfo_manager() == "grid" else 0
     h += main.PENDING_H if getattr(app, "_pending_shown", False) else 0       # "Turns off after this reply · Cancel"
+    h += main.SETUP_H if getattr(app, "_setup_shown", False) else 0           # the set-up card + the Settings pointer
     groups = ([p for p in main.PANELS if p in app.pinned],
               [p for p in main.PANELS if p not in app.pinned] if app.expanded else [])
     first = True

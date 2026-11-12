@@ -166,6 +166,72 @@ def test_auto_config() -> None:
             app.destroy()
 
 
+def test_card_and_switch() -> None:
+    """Two models: the set-up card, the main button lists the models, and once set up the switch button does."""
+    saved: list[dict] = []
+    real_save, real_load = config_store.save_config, config_store.load_config
+    disk = dict(U.CFG, backend="llama_cpp", launch_cmd=[], model_name="")
+    config_store.save_config = lambda cfg, *a, **k: (saved.append(dict(cfg)), disk.update(cfg))
+    config_store.load_config = lambda *a, **k: dict(disk)
+    app, det, ep = _llama_app([_found([M1, M2])])
+    try:
+        app._maybe_find_strata()
+        U.pump_until(app, lambda: app._setup_shown, 4.0)
+        U.pump(app, 0.3)
+        check(app._setup_shown and app.setup_title.cget("text") == "llama.cpp found"
+              and app.setup_tag.cget("text").strip() == "CUDA" and app.setup_line.cget("text") == "2 models on this PC",
+              f"card: llama.cpp found, CUDA, 2 models ({app.setup_line.cget('text')!r})")
+        check(app.toggle.cget("text") == "Choose model" and "Not set up yet" in U.status(app)
+              and not H.switch_button_visible(app), f"the main button chooses ({app.toggle.cget('text')!r})")
+        check(abs(U.expected_h(app) - H.window_height(app)) <= 2, "height fits the card")
+        U.shot(app, "llama_setup_card")
+        opened: list = []
+        app._model_menu.open = lambda x, y: opened.append((x, y))        # a native popup: it would block the test
+        n = len(ep.start_calls)
+        app.on_toggle()
+        U.pump(app, 0.3)
+        labels = [la for la, _k in app._launchers]
+        check(len(opened) == 1 and len(labels) == 2 and app.dialog is None and len(ep.start_calls) == n,
+              f"the button opens the model list; nothing starts, no Settings ({labels})")
+        pick = next(la for la in labels if "Q3_K_XL" in la)
+        app._on_model_menu(pick)
+        U.pump_until(app, lambda: bool(saved), 4.0)
+        U.pump(app, 0.5)
+        check(bool(saved) and saved[-1]["launch_cmd"] == [CUDA.program, "-m", M1.path, "--port", "9931"],
+              f"picking a model sets it up on the best build ({saved[-1:] and saved[-1]['launch_cmd']})")
+        check(not app._setup_shown and app.toggle.cget("text") == "Turn on" and "Qwen-27B-Q3_K_XL" in U.status(app)
+              and len(ep.start_calls) == n, f"set up: Turn on, says which model, nothing started ({U.status(app)!r})")
+        check(H.switch_button_visible(app), "the switch button is back, now listing models")
+        labels = [la for la, _k in app._launchers]
+        check(sum(la.endswith("✓") for la in labels) == 1 and next(la for la in labels if la.endswith("✓")).startswith(
+            "Qwen-27B-Q3_K_XL"), f"the configured model is ticked ({labels})")
+        # idle switch keeps the user's other arguments
+        app.cfg["launch_cmd"] = list(app.cfg["launch_cmd"]) + ["-c", "65536"]
+        disk["launch_cmd"] = list(app.cfg["launch_cmd"])
+        app._refresh_launchers()
+        other = next(la for la, _k in app._launchers if "IQ4_XS" in la)
+        app._on_model_menu(other)
+        U.pump_until(app, lambda: saved[-1]["launch_cmd"][2] == M2.path, 4.0)
+        check(saved[-1]["launch_cmd"] == [CUDA.program, "-m", M2.path, "--port", "9931", "-c", "65536"],
+              f"switching replaces only the model ({saved[-1]['launch_cmd']})")
+        U.pump(app, 0.4)
+        # serving: a switch goes through the app's own stop first
+        U.to_active(app, ep)
+        U.pump(app, 0.3)
+        stops = len(ep.stop_calls)
+        back = next(la for la, _k in app._launchers if "Q3_K_XL" in la)
+        count = len(saved)
+        app._on_model_menu(back)
+        U.pump(app, 0.5)
+        U.pump_until(app, lambda: len(ep.stop_calls) == stops + 1, 4.0)
+        check(len(ep.stop_calls) == stops + 1 and ep.stop_calls[-1][1] is False and len(saved) == count + 1
+              and saved[-1]["launch_cmd"] == [CUDA.program, "-m", M1.path, "--port", "9931", "-c", "65536"],
+              f"idle model: the switch goes ahead - saved, then the normal (not forced) stop ({len(ep.stop_calls) - stops})")
+    finally:
+        config_store.save_config, config_store.load_config = real_save, real_load
+        app.destroy()
+
+
 def test_strata_unchanged() -> None:
     """A configured Strata never searches; Settings has no dropdown rows."""
     app, det, ep = U.new_app()
@@ -187,7 +253,7 @@ def test_strata_unchanged() -> None:
 
 
 def run() -> int:
-    for t in (test_engine_side, test_auto_config, test_strata_unchanged):
+    for t in (test_engine_side, test_auto_config, test_card_and_switch, test_strata_unchanged):
         print(f"-- {t.__name__}")
         try:
             t()

@@ -442,6 +442,19 @@ class Engine:
         plan_launch like a choice made in Settings. Never raises."""
         return None
 
+    setup_action: str = "Set up"                              # the main button while nothing is configured
+
+    def found_summary(self, found: Any) -> tuple[str, str]:
+        """(short tag, one line) describing one find_installs() result on the set-up card, e.g. ("CUDA",
+        "3 models on this PC"). Either may be empty."""
+        return "", ""
+
+    def switch_choices(self, found: Any, cfg: Mapping[str, Any]) -> list[tuple[str, Any, bool]]:
+        """Engines WITHOUT launcher files: what the model menu offers, from one find_installs() result -
+        (label, launcher info, is the configured one). Each info goes through apply_launcher / plan_launch like a
+        choice made in Settings. Default: nothing (no menu)."""
+        return []
+
     def launch_title(self, info: Any) -> str:
         """What one launcher loads, in a few words (shown after an automatic set-up)."""
         return str(getattr(info, "model_name", "") or getattr(info, "file_name", "") or "")

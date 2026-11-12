@@ -1,0 +1,49 @@
+<style>
+  .wrap{display:flex;flex-direction:column;gap:20px;max-width:760px}
+  .opt{display:grid;grid-template-columns:372px 1fr;gap:18px;align-items:center}
+  .win{background:#141415;border:1px solid #2C2C30;border-radius:10px;padding:14px 16px 16px;width:340px;font-family:"Segoe UI Variable","Segoe UI",sans-serif}
+  .row{display:flex;align-items:center;gap:8px}
+  .led{width:8px;height:8px;border-radius:50%;background:#6E6E73}
+  .pill{color:#EDEDEB;font-weight:700;font-size:15px}
+  .sum{color:#A1A1A6;font-size:12px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ico{color:#A1A1A6;font-size:14px;width:22px;text-align:center}
+  .btn{margin:12px auto 0;width:180px;height:54px;border-radius:14px;background:#EDEDEB;color:#141415;font-weight:700;font-size:16px;display:flex;align-items:center;justify-content:center}
+  .btn.off{background:#26262A;color:#6E6E73}
+  .card{margin-top:12px;background:#1C1C1E;border-radius:10px;padding:12px 12px 12px;text-align:center}
+  .card .t{color:#EDEDEB;font-size:13px;font-weight:600}
+  .card .s{color:#A1A1A6;font-size:11.5px;margin-top:3px}
+  .card .acts{display:flex;gap:8px;margin-top:10px;justify-content:center}
+  .a{height:28px;padding:0 14px;border-radius:8px;font-size:12px;display:inline-flex;align-items:center}
+  .a.pri{background:#EDEDEB;color:#141415;font-weight:600}
+  .a.sec{background:#26262A;color:#EDEDEB}
+  .tag{display:inline-block;font-size:10.5px;color:#A1A1A6;border:1px solid #2C2C30;border-radius:6px;padding:1px 6px;margin-left:6px;font-weight:400;vertical-align:1px}
+  .ghost{margin:8px auto 0;text-align:center;color:#A1A1A6;font-size:11.5px}
+  h4{margin:0 0 4px;font-size:14px;color:var(--foreground)}
+  p{margin:0;font-size:13px;color:var(--muted-foreground);line-height:1.45}
+</style>
+<div class="wrap">
+  <div class="opt">
+    <div class="win">
+      <div class="row"><span class="led"></span><span class="pill">Idle</span><span class="sum">Not set up yet</span><span class="ico">⚙</span></div>
+      <div class="card">
+        <div class="t">llama.cpp found<span class="tag">CUDA</span></div>
+        <div class="s">3 models on this PC · pick one to finish</div>
+        <div class="acts"><span class="a pri">Choose model</span><span class="a sec">Open Settings</span></div>
+      </div>
+      <div class="btn off">Turn on</div>
+    </div>
+    <div><h4>B · Setup card, centered</h4><p>The card's title, line and two buttons are centered. Turn on stays below, greyed out until a model is chosen. The window is about 60 px taller while the card shows.</p></div>
+  </div>
+  <div class="opt">
+    <div class="win">
+      <div class="row"><span class="led"></span><span class="pill">Idle</span><span class="sum">Not set up yet</span><span class="ico">⚙</span></div>
+      <div class="card">
+        <div class="t">llama.cpp found<span class="tag">CUDA</span></div>
+        <div class="s">3 models on this PC</div>
+      </div>
+      <div class="btn">Choose model</div>
+      <div class="ghost">or open Settings (⚙) to set it up by hand</div>
+    </div>
+    <div><h4>A · Card for what was found, the main button chooses</h4><p>The card only says what was found, centered. The big button is the one action: "Choose model" now, Turn on once a model is picked. No greyed-out button, and about 30 px shorter than B.</p></div>
+  </div>
+</div>

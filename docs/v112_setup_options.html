@@ -1,0 +1,63 @@
+<style>
+  .wrap{display:flex;flex-direction:column;gap:18px;max-width:760px}
+  .opt{display:grid;grid-template-columns:372px 1fr;gap:18px;align-items:center}
+  .win{background:#141415;border:1px solid #2C2C30;border-radius:10px;padding:14px 16px 16px;width:340px;font-family:"Segoe UI Variable","Segoe UI",sans-serif}
+  .row{display:flex;align-items:center;gap:8px}
+  .led{width:8px;height:8px;border-radius:50%;background:#6E6E73}
+  .pill{color:#EDEDEB;font-weight:700;font-size:15px}
+  .sum{color:#A1A1A6;font-size:12px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ico{color:#A1A1A6;font-size:14px;width:22px;text-align:center}
+  .detail{color:#A1A1A6;font-size:12px;margin:6px 0 0 16px}
+  .link{text-decoration:underline}
+  .btn{margin:12px auto 0;width:180px;height:54px;border-radius:14px;background:#EDEDEB;color:#141415;font-weight:700;font-size:16px;display:flex;align-items:center;justify-content:center}
+  .btn.off{background:#26262A;color:#6E6E73}
+  .chip{display:inline-flex;align-items:center;height:26px;padding:0 12px;border-radius:8px;background:#26262A;color:#EDEDEB;font-size:12px;margin:8px 0 0 16px}
+  .card{margin-top:10px;background:#1C1C1E;border-radius:10px;padding:10px 12px}
+  .card .t{color:#EDEDEB;font-size:12.5px}
+  .card .s{color:#A1A1A6;font-size:11.5px;margin-top:2px}
+  .card .acts{display:flex;gap:8px;margin-top:10px}
+  .card .a{height:28px;padding:0 12px;border-radius:8px;font-size:12px;display:flex;align-items:center}
+  .a.pri{background:#EDEDEB;color:#141415;font-weight:600}
+  .a.sec{background:#26262A;color:#EDEDEB}
+  h4{margin:0 0 4px;font-size:14px;color:var(--foreground)}
+  p{margin:0;font-size:13px;color:var(--muted-foreground);line-height:1.45}
+  .rec{color:var(--accent);font-weight:600}
+</style>
+<div class="wrap">
+  <div class="opt">
+    <div class="win">
+      <div class="row"><span class="led"></span><span class="pill">Idle</span><span class="sum">llama.cpp found</span><span class="ico">⚙</span></div>
+      <div class="detail link">…wnloads\llama.cpp-cuda-b12314 · click to set up</div>
+      <div class="btn">Turn on</div>
+    </div>
+    <div><h4>Today</h4><p>An underlined path that doesn't look like a control, above a Turn on button that can't turn anything on yet.</p></div>
+  </div>
+  <div class="opt">
+    <div class="win">
+      <div class="row"><span class="led"></span><span class="pill">Idle</span><span class="sum">Pick a model to finish setup</span><span class="ico">⚙</span></div>
+      <div class="detail">llama.cpp · CUDA build found · 3 models</div>
+      <div class="btn">Choose model</div>
+    </div>
+    <div><h4>A · The main button does the setup <span class="rec">(recommended)</span></h4><p>While nothing is configured the big button reads "Choose model" and opens the model list (or Settings). Once set up it becomes Turn on. One obvious next step, no extra row, same window height.</p></div>
+  </div>
+  <div class="opt">
+    <div class="win">
+      <div class="row"><span class="led"></span><span class="pill">Idle</span><span class="sum">Not set up yet</span><span class="ico">⚙</span></div>
+      <div class="card">
+        <div class="t">llama.cpp found · CUDA build</div>
+        <div class="s">3 models on this PC. Pick one to finish.</div>
+        <div class="acts"><span class="a pri">Choose model</span><span class="a sec">Open Settings</span></div>
+      </div>
+      <div class="btn off">Turn on</div>
+    </div>
+    <div><h4>B · A setup card</h4><p>A card with its own buttons; Turn on stays but is greyed out until setup is done. Clearest explanation, but the window grows and there are three buttons for one job.</p></div>
+  </div>
+  <div class="opt">
+    <div class="win">
+      <div class="row"><span class="led"></span><span class="pill">Idle</span><span class="sum">llama.cpp found</span><span class="ico">⚙</span></div>
+      <div class="chip">Set up…</div>
+      <div class="btn">Turn on</div>
+    </div>
+    <div><h4>C · A small button in place of the link</h4><p>Smallest change: the underlined path becomes a proper "Set up…" button. Turn on still opens Settings when pressed, as now.</p></div>
+  </div>
+</div>

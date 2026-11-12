@@ -494,6 +494,7 @@ def test_first_start_auto(tmp: Path) -> None:
 
 
 def test_first_start_search(tmp: Path) -> None:
+    import ui_helpers as H
     pa, pb = U._free_port(), U._free_port()
     sdir = U.make_strata(tmp, "Strata-F", {"a": pa, "b": pb})
     found = strata_finder.Found(strata_dir=str(sdir), launchers=[str(sdir / "run-a.bat"), str(sdir / "run-b.bat")],
@@ -506,26 +507,43 @@ def test_first_start_search(tmp: Path) -> None:
         app._no_finder = False
         app._maybe_find_strata()
         check(pump_until(app, lambda: app._found_strata is not None, 3), "search result arrives")
-        check(pump_until(app, lambda: "Strata found" in status(app) and app._detail_link, 6),
-              f"idle line offers the found Strata ({status(app)!r})")
+        check(pump_until(app, lambda: app._setup_shown, 6), "the set-up card shows")
+        pump(app, 0.3)
+        check(app.setup_title.cget("text") == "Strata found" and "2 launchers in Strata-F" in app.setup_line.cget("text")
+              and app.setup_card.winfo_manager() == "grid" and app.setup_hint.winfo_manager() == "pack",
+              f"card: what was found, and the pointer to Settings ({app.setup_line.cget('text')!r})")
+        check(app.toggle.cget("text") == "Choose launcher" and "Not set up yet" in status(app)
+              and "click to set up" not in status(app), f"the main button is the action ({app.toggle.cget('text')!r})")
+        check(not H.switch_button_visible(app), "no switch button before set-up")
+        check(abs(U.expected_h(app) - H.window_height(app)) <= 2,
+              f"height fits the card ({H.window_height(app)} vs {U.expected_h(app)})")
         U.shot(app, "extras_found_strata")
-        app.preview._label.event_generate("<Button-1>")
-        pump(app, 0.5)
-        d = app.dialog
-        check(isinstance(d, SettingsDialog), "click opens Settings")
-        if isinstance(d, SettingsDialog):
-            vals = list(d._menu.cget("values"))
-            check("run-a.bat" in vals and "run-b.bat" in vals, f"Settings lists the found launchers ({vals})")
-            d.close()
-            pump(app, 0.3)
         n = len(ep.start_calls)
-        app.on_toggle()
-        pump(app, 0.4)
-        check(isinstance(app.dialog, SettingsDialog) and len(ep.start_calls) == n and app.state_name == "IDLE",
-              "Turn on without a launcher opens Settings instead of failing")
-        if isinstance(app.dialog, SettingsDialog):
-            app.dialog.close()
-            pump(app, 0.2)
+        saved: list[dict] = []
+        real_save, real_load = config_store.save_config, config_store.load_config
+        config_store.save_config = lambda c, *a, **k: saved.append(dict(c))
+        config_store.load_config = lambda *a, **k: dict(cfg)
+        try:
+            opened: list = []
+            app._model_menu.open = lambda x, y: opened.append((x, y))     # a native popup: it would block the test
+            app.on_toggle()
+            pump(app, 0.4)
+            vals = [lab for lab, _k in app._launchers]
+            check(len(opened) == 1, "the menu opens under the main button")
+            check(len(app._launchers) == 2 and any("run-a.bat" in v for v in vals) and len(ep.start_calls) == n
+                  and app.dialog is None, f"the button opens the list of found launchers, starts nothing ({vals})")
+            label = next(lab for lab, _k in app._launchers if "run-b.bat" in lab)
+            app._on_model_menu(label)
+            check(pump_until(app, lambda: bool(saved), 4) and saved[-1].get("port") == pb,
+                  f"picking one saves that launcher ({[c.get('port') for c in saved]})")
+            pump(app, 0.5)
+            check(app.engine.is_configured(app.cfg) and not app._setup_shown and app.toggle.cget("text") == "Turn on"
+                  and app.setup_card.winfo_manager() == "" and len(ep.start_calls) == n,
+                  f"set up: the card is gone, the button is Turn on, nothing started ({app.toggle.cget('text')!r})")
+            check(abs(U.expected_h(app) - H.window_height(app)) <= 2,
+                  f"height back to normal ({H.window_height(app)} vs {U.expected_h(app)}, {status(app)!r})")
+        finally:
+            config_store.save_config, config_store.load_config = real_save, real_load
     finally:
         strata_finder.find_strata = real
         close(app)
