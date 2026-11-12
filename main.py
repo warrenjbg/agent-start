@@ -2653,7 +2653,7 @@ class AgentStartApp(ctk.CTk):
         if found is None and not self.engine.can(CAP_LAUNCHER_FILES):
             found = self._found_strata           # the dropdowns show what the start-up search found
         options = None
-        if found is not None and not self.engine.can(CAP_LAUNCHER_FILES):
+        if not self.engine.can(CAP_LAUNCHER_FILES):
             try:
                 options = self.engine.launch_options(found, self.cfg)
             except Exception:  # noqa: BLE001
@@ -2671,7 +2671,31 @@ class AgentStartApp(ctk.CTk):
             on_check_updates=self.updates.check_now, can_check_updates=self.updates.available(),
             engine=self.engine,
             on_history=self.open_history if self.usage is not None else None,
-            engine_choices=engines.choices(), on_engine_change=self.set_backend, launch_options=options)
+            engine_choices=engines.choices(), on_engine_change=self.set_backend, launch_options=options,
+            on_fit_preview=self.fit_preview)
+
+    def fit_preview(self, info: Any, done: Callable[[str | None], None]) -> bool:
+        """Settings: would this launch fit on the GPU? Runs the engine's read-only pre-check on a worker and
+        calls done(text | None) on the Tk thread: the warning to show, "" for "fits", None for "cannot tell".
+        False (nothing runs) while the engine is up - its own video memory would be counted against the model."""
+        if self.state_name != IDLE or self._destroyed:
+            return False
+        try:
+            trial = dict(self.cfg)
+            self.engine.apply_launcher(trial, info)
+            self.engine.plan_launch(trial)
+            chk = self.engine.fit_check(trial)
+        except Exception:  # noqa: BLE001 - not a launch the engine accepts: nothing to preview
+            return False
+        if chk is None:
+            return False
+
+        def answered(_token: int, fits: Any) -> None:
+            if not self._destroyed:
+                done(self.engine.gpu_fit_loading if fits is False else ("" if fits is True else None))
+
+        self._run_worker("hc-fit-preview", _fit_check_worker, self.engine, trial, chk, self.post, answered, 0)
+        return True
 
     # ------------------------------------------------------------------ system tray
     def _start_tray(self) -> None:

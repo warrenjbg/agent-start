@@ -466,7 +466,13 @@ class Engine:
           models        [(label, model path)]           "model_title"
           with_model    fn(args tuple, model path) -> args tuple with that model
           default_args  fn(model path) -> args tuple for a first set-up
-          model_of      fn(args tuple) -> the model path the arguments name, or None"""
+          model_of      fn(args tuple) -> the model path the arguments name, or None
+        Optional friendly controls (each rewrites one option in the arguments and leaves the rest alone):
+          context_choices [(label, tokens | None)]   context_of fn(args) -> tokens | None
+                                                     with_context fn(args, tokens | None) -> args
+          vision_files  fn(model path) -> [(label, projector path)]   vision_of fn(args) -> path | None
+                                                     with_vision fn(args, path | None) -> args
+          port_of       fn(args) -> port | None      with_port fn(args, port) -> args"""
         return None
 
     def preferred_launcher(self, found: Any) -> str | None:

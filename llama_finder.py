@@ -729,6 +729,112 @@ def with_model(args: Sequence[str], model_path: str) -> tuple[str, ...]:
 
 
 # ------------------------------------------------------------------------------------------------ labels
+# ---- friendly controls: one value option in an argument list (pure; never raise) --------------------------------
+_CTX_FLAGS = ("-c", "--ctx-size")
+_VISION_FLAGS = ("--mmproj", "-mm")
+_VISION_OFF_FLAGS = ("--no-mmproj",)
+_VISION_URL_FLAGS = ("--mmproj-url", "-mmu")
+_PORT_FLAGS = ("--port",)
+CONTEXT_CHOICES: tuple[tuple[str, int | None], ...] = (
+    ("Auto (llama.cpp decides)", None), ("8K tokens", 8192), ("16K tokens", 16384), ("32K tokens", 32768),
+    ("64K tokens", 65536), ("128K tokens", 131072))
+
+
+def option_value(args: Sequence[str], flags: Sequence[str]) -> str | None:
+    """The value of the LAST `flag value` / `flag=value` among `flags` (llama.cpp lets the last one win)."""
+    try:
+        out = None
+        toks = [str(a) for a in args]
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            if t in flags and i + 1 < len(toks):
+                out = toks[i + 1]
+                i += 2
+                continue
+            for f in flags:
+                if f.startswith("--") and t.startswith(f + "="):
+                    out = t[len(f) + 1:]
+            i += 1
+        return out
+    except Exception:
+        return None
+
+
+def with_option(args: Sequence[str], flags: Sequence[str], value: str | None) -> tuple[str, ...]:
+    """The same arguments with that option set to `value` (in the place of its first occurrence, else appended),
+    or removed when value is None. Every other argument stays where it is."""
+    try:
+        toks = [str(a) for a in args]
+        out: list[str] = []
+        placed = False
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            hit = t in flags and i + 1 < len(toks)
+            eq = any(f.startswith("--") and t.startswith(f + "=") for f in flags)
+            if hit or eq:
+                if value is not None and not placed:
+                    out += [flags[0], str(value)]
+                    placed = True
+                i += 2 if hit else 1
+                continue
+            out.append(t)
+            i += 1
+        if value is not None and not placed:
+            out += [flags[0], str(value)]
+        return tuple(out)
+    except Exception:
+        try:
+            return tuple(str(a) for a in args)
+        except Exception:
+            return ()
+
+
+def context_of(args: Sequence[str]) -> int | None:
+    v = option_value(args, _CTX_FLAGS)
+    return int(v) if v is not None and v.isdigit() and int(v) > 0 else None
+
+
+def with_context(args: Sequence[str], tokens: int | None) -> tuple[str, ...]:
+    return with_option(args, _CTX_FLAGS, str(int(tokens)) if tokens else None)
+
+
+def port_of(args: Sequence[str]) -> int | None:
+    v = option_value(args, _PORT_FLAGS)
+    return int(v) if v is not None and v.isdigit() else None
+
+
+def with_port(args: Sequence[str], port: int) -> tuple[str, ...]:
+    return with_option(args, _PORT_FLAGS, str(int(port)))
+
+
+def vision_of(args: Sequence[str]) -> str | None:
+    """The vision projector file the arguments name, or None (also None for --no-mmproj / a projector URL)."""
+    toks = [str(a) for a in args]
+    if any(t in _VISION_OFF_FLAGS for t in toks):
+        return None
+    v = option_value(toks, _VISION_FLAGS)
+    return v.strip('"') if v else None
+
+
+def with_vision(args: Sequence[str], projector: str | None) -> tuple[str, ...]:
+    """Vision on with that projector file, or off (None): every projector option is removed first."""
+    toks = [t for t in (str(a) for a in args) if t not in _VISION_OFF_FLAGS]
+    return with_option(with_option(toks, _VISION_URL_FLAGS, None), _VISION_FLAGS, projector)
+
+
+def vision_files(model_path: str, listdir: Callable[[str], list[str]] = os.listdir) -> list[tuple[str, str]]:
+    """(label, path) of the vision projector files (mmproj*.gguf) in the model file's own folder - where
+    downloads put them. One directory listing; nothing is opened. Never raises."""
+    try:
+        folder = os.path.dirname(os.path.abspath(str(model_path)))
+        names = sorted(n for n in listdir(folder) if n.casefold().endswith(".gguf") and "mmproj" in n.casefold())
+        return [(os.path.splitext(n)[0], os.path.join(folder, n)) for n in names]
+    except Exception:
+        return []
+
+
 def _size_text(n: int) -> str:
     try:
         n = int(n)

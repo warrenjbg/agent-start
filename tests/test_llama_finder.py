@@ -639,11 +639,48 @@ def smoke_real_pc() -> None:
           f"{dt_b:.2f}/{dt_m:.2f}/{dt_a:.2f}s")
 
 
+
+def t_friendly_controls() -> None:
+    F = lf
+
+    def chk(cond: object, msg: str) -> None:
+        check(msg, bool(cond))
+
+    a = ("-m", "C:/m/a.gguf", "--port", "9931", "-c", "8192", "--mmproj", "C:/m/mmproj-x.gguf", "-np", "1")
+    chk(F.context_of(a) == 8192 and F.port_of(a) == 9931 and F.vision_of(a) == "C:/m/mmproj-x.gguf",
+          "context / port / vision are read from the arguments")
+    chk(F.with_context(a, 65536) == ("-m", "C:/m/a.gguf", "--port", "9931", "-c", "65536", "--mmproj",
+                                       "C:/m/mmproj-x.gguf", "-np", "1"), "with_context replaces in place")
+    chk(F.with_context(a, None) == ("-m", "C:/m/a.gguf", "--port", "9931", "--mmproj", "C:/m/mmproj-x.gguf",
+                                      "-np", "1"), "with_context(None) removes the option, keeps the rest")
+    chk(F.with_context(("-m", "x", "--ctx-size=4096"), 16384) == ("-m", "x", "-c", "16384")
+          and F.with_context(("-m", "x"), 32768) == ("-m", "x", "-c", "32768")
+          and F.with_context(("-c", "1", "-m", "x", "-c", "2"), 8192) == ("-c", "8192", "-m", "x"),
+          "with_context: --ctx-size=, appended when absent, duplicates collapse")
+    chk(F.with_vision(a, None) == ("-m", "C:/m/a.gguf", "--port", "9931", "-c", "8192", "-np", "1")
+          and F.with_vision(("-m", "x", "--no-mmproj"), "p.gguf") == ("-m", "x", "--mmproj", "p.gguf")
+          and F.with_vision(("-m", "x", "--mmproj-url", "http://h/p"), "p.gguf") == ("-m", "x", "--mmproj", "p.gguf"),
+          "with_vision: off removes it, on replaces --no-mmproj / a projector URL")
+    chk(F.vision_of(("-m", "x", "--mmproj", "p", "--no-mmproj")) is None and F.vision_of(("-m", "x")) is None,
+          "vision_of: --no-mmproj wins, none named")
+    chk(F.with_port(a, 8081)[2:4] == ("--port", "8081") and F.port_of(("--port", "x")) is None, "port")
+    chk(F.context_of(("-c", "abc")) is None and F.context_of(("-c", "0")) is None and F.context_of(()) is None
+          and F.context_of(("-c",)) is None, "context_of: garbage is None")
+    chk(F.with_option(None, ("-c",), "1") == () and F.option_value(None, ("-c",)) is None, "never raises")  # type: ignore[arg-type]
+    got = F.vision_files(os.path.join("C:/x", "m.gguf"),
+                         listdir=lambda d: ["mmproj-BF16.gguf", "a.gguf", "MMPROJ-f16.GGUF", "mmproj.txt"])
+    chk([la for la, _p in got] == ["MMPROJ-f16", "mmproj-BF16"] and all(p.replace(chr(92), "/").startswith("C:/x") for _la, p in got),
+          f"vision_files: projector files next to the model ({got})")
+    chk(F.vision_files(os.path.join("C:/nope-zz", "m.gguf")) == [], "vision_files: a missing folder is empty")
+    chk(F.CONTEXT_CHOICES[0][1] is None and [n for _l, n in F.CONTEXT_CHOICES[1:]] == [8192, 16384, 32768, 65536,
+                                                                                        131072], "context choices")
+
+
 def main() -> int:
     try:
         for fn in (test_backends, test_lookalikes, test_winget_path_dedupe, test_ranking, test_choose, test_models,
                    test_model_places, test_hf_cache, test_junction_not_followed, test_budget_and_stop,
-                   test_with_model_and_args, test_labels, test_never_raises, test_find_all, test_no_personal_data,
+                   test_with_model_and_args, t_friendly_controls, test_labels, test_never_raises, test_find_all, test_no_personal_data,
                    smoke_real_pc):
             try:
                 fn()

@@ -1,0 +1,92 @@
+<style>
+  .wrap{display:flex;flex-direction:column;gap:22px;max-width:780px}
+  .pair{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap}
+  .col{display:flex;flex-direction:column;gap:8px}
+  .cap{font-size:13px;color:var(--muted-foreground);max-width:340px;line-height:1.45}
+  .cap b{color:var(--foreground);font-weight:600}
+  .win{background:#141415;border:1px solid #2C2C30;border-radius:10px;width:340px;font-family:"Segoe UI Variable","Segoe UI",sans-serif;color:#EDEDEB;font-size:12.5px;padding:12px}
+  .title{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px}
+  .title .n{font-size:14px;font-weight:600}
+  .title .v{color:#6E6E73;font-size:11.5px}
+  .tabs{display:flex;gap:4px;background:#1C1C1E;border-radius:8px;padding:3px;margin-bottom:12px}
+  .tab{flex:1;text-align:center;height:26px;line-height:26px;border-radius:6px;color:#A1A1A6}
+  .tab.on{background:#26262A;color:#EDEDEB}
+  .sec{color:#A1A1A6;font-size:11.5px;margin:12px 0 6px}
+  .sec:first-of-type{margin-top:0}
+  .r{display:flex;align-items:center;justify-content:space-between;height:28px;margin-bottom:6px}
+  .r .l{color:#EDEDEB}
+  .dd{background:#26262A;border-radius:8px;height:28px;display:flex;align-items:center;justify-content:space-between;padding:0 10px;width:190px;box-sizing:border-box;white-space:nowrap;overflow:hidden}
+  .dd span:last-child{color:#A1A1A6;font-size:10px;margin-left:6px}
+  .sw{width:30px;height:16px;border-radius:8px;background:#EDEDEB;position:relative}
+  .sw::after{content:"";position:absolute;right:2px;top:2px;width:12px;height:12px;border-radius:50%;background:#141415}
+  .sw.off{background:#26262A}.sw.off::after{left:2px;right:auto;background:#6E6E73}
+  .hint{color:#6E6E73;font-size:11.5px;margin:-2px 0 8px}
+  .amber{color:#E0A33A}
+  .adv{display:flex;align-items:center;gap:6px;color:#A1A1A6;margin-top:10px;height:24px}
+  .box{background:#1C1C1E;border:1px solid #2C2C30;border-radius:8px;height:28px;display:flex;align-items:center;padding:0 10px;font-family:Consolas,monospace;font-size:11.5px;color:#A1A1A6;white-space:nowrap;overflow:hidden;margin-top:6px}
+  .foot{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}
+  .b{height:28px;padding:0 14px;border-radius:8px;display:flex;align-items:center}
+  .b.p{background:#EDEDEB;color:#141415;font-weight:600}.b.s{background:#26262A}
+  .line{height:1px;background:#2C2C30;margin:12px 0}
+  .link{display:flex;justify-content:space-between;height:28px;align-items:center;color:#EDEDEB}
+  .link span:last-child{color:#6E6E73}
+</style>
+<div class="wrap">
+  <div class="pair">
+    <div class="col">
+      <div class="win">
+        <div class="title"><span class="n">Settings</span><span class="v">v1.12.0 · up to date</span></div>
+        <div class="tabs"><div class="tab on">Model</div><div class="tab">Behaviour</div><div class="tab">About</div></div>
+        <div class="r"><span class="l">Engine</span><div class="dd"><span>llama.cpp</span><span>▾</span></div></div>
+        <div class="r"><span class="l">Build</span><div class="dd"><span>CUDA · b12314</span><span>▾</span></div></div>
+        <div class="r"><span class="l">Model</span><div class="dd"><span>Qwen3.8-27B-UD-IQ4_XS</span><span>▾</span></div></div>
+        <div class="r"><span class="l">Context length</span><div class="dd"><span>64K tokens</span><span>▾</span></div></div>
+        <div class="hint amber">Won't fully fit on the GPU at 64K · 50 of 66 layers</div>
+        <div class="r"><span class="l">Vision</span><div class="dd"><span>On · mmproj-BF16</span><span>▾</span></div></div>
+        <div class="r"><span class="l">Port</span><div class="dd" style="width:90px"><span>9931</span><span></span></div></div>
+        <div class="adv">▸ Advanced · program and arguments</div>
+        <div class="foot"><div class="b s">Cancel</div><div class="b p">Save</div></div>
+      </div>
+      <div class="cap"><b>A · Tabs: Model</b><br>Everything about what runs. Context length and Vision are plain dropdowns; the raw arguments move under Advanced. The amber line is the same GPU-fit check, shown as you pick.</div>
+    </div>
+    <div class="col">
+      <div class="win">
+        <div class="title"><span class="n">Settings</span><span class="v">v1.12.0 · up to date</span></div>
+        <div class="tabs"><div class="tab">Model</div><div class="tab on">Behaviour</div><div class="tab">About</div></div>
+        <div class="sec">When other apps need the PC</div>
+        <div class="r"><span class="l">A game starts</span><div class="dd" style="width:150px"><span>Turn llama.cpp off</span><span>▾</span></div></div>
+        <div class="r"><span class="l">Memory runs low</span><div class="dd" style="width:150px"><span>Ask me</span><span>▾</span></div></div>
+        <div class="r"><span class="l">That app closes</span><div class="dd" style="width:150px"><span>Ask me</span><span>▾</span></div></div>
+        <div class="sec">After Turn off</div>
+        <div class="r"><span class="l">Reopen the apps that were closed</span><div class="sw"></div></div>
+        <div class="link"><span>Protected apps</span><span>›</span></div>
+        <div class="sec">Agent Start</div>
+        <div class="r"><span class="l">Keep running in the tray</span><div class="sw"></div></div>
+        <div class="r"><span class="l">Start with Windows</span><div class="sw off"></div></div>
+      </div>
+      <div class="cap"><b>A · Tabs: Behaviour</b><br>The seven switches, grouped under three plain headings. <b>About</b> would hold the version, Check for updates, the daily-check switch, Usage history and the endpoint address.</div>
+    </div>
+  </div>
+  <div class="pair">
+    <div class="col">
+      <div class="win">
+        <div class="title"><span class="n">Settings</span><span class="v">v1.12.0 · up to date</span></div>
+        <div class="sec">Model</div>
+        <div class="r"><span class="l">Engine</span><div class="dd"><span>llama.cpp</span><span>▾</span></div></div>
+        <div class="r"><span class="l">Model</span><div class="dd"><span>Qwen3.8-27B-UD-IQ4_XS</span><span>▾</span></div></div>
+        <div class="r"><span class="l">Context length</span><div class="dd"><span>64K tokens</span><span>▾</span></div></div>
+        <div class="r"><span class="l">Vision</span><div class="dd"><span>On · mmproj-BF16</span><span>▾</span></div></div>
+        <div class="adv">▸ Build, port and arguments</div>
+        <div class="line"></div>
+        <div class="sec">When other apps need the PC</div>
+        <div class="r"><span class="l">A game starts</span><div class="dd" style="width:150px"><span>Turn llama.cpp off</span><span>▾</span></div></div>
+        <div class="r"><span class="l">Memory runs low</span><div class="dd" style="width:150px"><span>Ask me</span><span>▾</span></div></div>
+        <div class="r"><span class="l">That app closes</span><div class="dd" style="width:150px"><span>Ask me</span><span>▾</span></div></div>
+        <div class="line"></div>
+        <div class="link"><span>More: tray, startup, updates, history</span><span>›</span></div>
+        <div class="foot"><div class="b s">Cancel</div><div class="b p">Save</div></div>
+      </div>
+      <div class="cap"><b>B · One page with sections</b><br>No tabs: the things you change most on one page, with headings and dividers. Rarely touched items (tray, Start with Windows, updates, history, protected apps) move to a second "More" page.</div>
+    </div>
+  </div>
+</div>

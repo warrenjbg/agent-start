@@ -55,6 +55,7 @@ class SettingsDialog(ctk.CTkToplevel):
                  can_check_updates: bool = True, engine=None,
                  on_history: Callable[[], Any] | None = None,
                  launch_options: dict | None = None,
+                 on_fit_preview: Callable[[Any, Callable[[str | None], None]], bool] | None = None,
                  engine_choices: list[tuple[str, str]] | None = None,
                  on_engine_change: Callable[[str], str | None] | None = None) -> None:
         """on_check_updates(on_result) adds the "Check for updates" row under the title (none when it is None): it
@@ -89,6 +90,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self._on_check_updates = on_check_updates
         self._on_history = on_history
         self._on_engine_change = on_engine_change
+        self._on_fit_preview = on_fit_preview
         self._engine_choices = [(str(i), str(n)) for i, n in (engine_choices or [])]
         self.has_engine_row = len(self._engine_choices) >= 2 and on_engine_change is not None
         self._can_check = bool(can_check_updates)

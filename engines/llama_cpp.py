@@ -941,8 +941,6 @@ class LlamaCppEngine(Engine):
         try:
             import llama_finder
             builds, models = list(getattr(found, "builds", ())), list(getattr(found, "models", ()))
-            if not builds and not models:
-                return None
 
             def model_of(args: Any) -> str | None:
                 m = _last_value([str(a) for a in args], _MODEL_PATH_FLAGS)
@@ -957,6 +955,11 @@ class LlamaCppEngine(Engine):
                 "with_model": llama_finder.with_model,
                 "default_args": lambda model: llama_finder.default_args(model, DEFAULT_PORT),
                 "model_of": model_of,
+                "context_choices": list(llama_finder.CONTEXT_CHOICES),
+                "context_of": llama_finder.context_of, "with_context": llama_finder.with_context,
+                "vision_files": llama_finder.vision_files,
+                "vision_of": llama_finder.vision_of, "with_vision": llama_finder.with_vision,
+                "port_of": llama_finder.port_of, "with_port": llama_finder.with_port,
             }
         except Exception:  # noqa: BLE001
             return None
