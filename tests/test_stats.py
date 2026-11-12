@@ -503,7 +503,7 @@ def test_version_consistency() -> None:
     import version
     root = HERE.parent
     v = version.__version__
-    check(re.fullmatch(r"\d+\.\d+\.\d+", v) is not None and v == "1.9.0", f"version.py = {v}")
+    check(re.fullmatch(r"\d+\.\d+\.\d+", v) is not None and v == "1.10.0", f"version.py = {v}")
     quad = "(" + ", ".join(v.split(".") + ["0"]) + ")"
     info = (root / "installer" / "version_info.txt").read_text(encoding="utf-8")
     check(info.count(quad) == 2 and info.count(f'"{v}"') == 2, "installer/version_info.txt matches version.py")
