@@ -7,7 +7,8 @@ an `Engine` object from `engines/`, chosen by the `backend` key in `config.json`
 | File | What it is |
 |---|---|
 | `engines/base.py` | The interface: `Engine`, the capability names, and the plain data types that cross it |
-| `engines/strata.py` | Strata, the only engine today |
+| `engines/strata.py` | Strata, the default engine (`strata`) |
+| `engines/llama_cpp.py` | llama.cpp's `llama-server` in single-model mode (`llama_cpp`); see `docs/llama_server_design.md` |
 | `engines/__init__.py` | The registry: `get_engine(cfg)`. It finds every module in the package by itself |
 
 ## Adding an engine
@@ -23,8 +24,8 @@ That is all: the registry imports every module in `engines/` and registers each 
 `AgentStart.spec` collects the whole package, and `--selftest` loads it. Nothing in `server_manager.py`,
 `detector.py`, `main.py` or the dialogs needs to change. The engine is the `backend` key in `config.json`.
 
-Settings shows an **Engine** row once two or more engines are installed (with Strata alone it is hidden). Choosing
-an engine there saves `backend`; the choice takes effect after Agent Start restarts.
+Settings shows an **Engine** row once two or more engines are installed (now: Strata and llama.cpp). Choosing an
+engine there saves `backend`; the choice takes effect after Agent Start restarts.
 
 Not yet proven on a frozen build: the package-wide collection in the spec and the registry's discovery inside the
 packaged app. The first build after this change must run `--selftest`.
@@ -104,18 +105,37 @@ thing the metrics store, the status line and the graphs ever see:
 - `model`, `clock`, `vram_mb`.
 
 The engine converts whatever it has (a JSON document, Prometheus counters, log lines). Strata's converter is
-`metrics_store.strata_sample` and its poller is `metrics_store.StrataPoller`.
+`metrics_store.strata_sample` and its poller is `metrics_store.StrataPoller`; llama.cpp's poller is
+`engines.llama_cpp.LlamaCppPoller` (live state from `/slots`, finished requests from the run's log).
+
+`RequestSample.prompt_tokens` (the prompt tokens the engine actually read; a cached prefix does not count) and
+`generated_tokens` are the request's sizes for the usage history; None means the request is counted without
+tokens.
+
+`metrics_poller(cfg, **seams)` receives an `http` seam from the app: `EndpointManager.engine_http`, a
+`http(method, path, timeout)` callable that only reaches loopback on the configured port and adds the engine's
+`request_headers` only after the port identified itself. An engine that asks its server for live state uses
+it instead of opening connections itself; engines ignore seams they do not know.
 
 ## Texts
 
 The main window, the dialogs and the toasts name the engine with `Engine.name`. An engine can also set
 `launcher_kind`, `launcher_pick_text`, `launcher_filetypes`, `program_filetypes`, `setup_hint`, `has_dashboard`
 (whether `GET /` on the port is a web app worth a link) and the `low_ram_*` wording for `CAP_RAM_MODES`.
-`is_configured(cfg)` says whether the user has set up a launch yet (default: `launch_cmd` is filled in).
+`is_configured(cfg)` says whether the user has set up a launch yet (default: `launch_cmd` is filled in). An
+engine overrides it when another engine's command may still be in `launch_cmd` (Strata: a python interpreter;
+llama.cpp: an absolute path to `llama-server.exe`).
+
+## Other optional parts
+
+- `CommandLaunch(program, args)`: what Settings builds from the program and arguments boxes for an engine
+  without launcher files. The default `apply_launcher` saves it as `launch_cmd` and `launch_cwd` (the program's
+  folder); the default `same_launch` compares it with `launch_cmd`.
+- `fit_check(cfg)` / `parse_fit(stdout, cfg)` with `FitCheck` / `FitReport`: an optional GPU-fit pre-check.
 
 ## Config keys
 
 Engine-specific settings live in `config.json` under the engine's own keys (Strata: `strata_dir`,
-`launcher_bat`, `model_name`). The neutral keys every engine uses are `backend`, `launch_cmd`, `launch_cwd`,
+`launcher_bat`, `model_name`; llama.cpp: `api_key`). The neutral keys every engine uses are `backend`, `launch_cmd`, `launch_cwd`,
 `port`, `endpoint_url`, `ready_timeout_s` and `stop_timeout_s`. Existing keys must keep their meaning: users'
 config files are never migrated by hand.

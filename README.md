@@ -18,7 +18,10 @@ and makes sure it gets the RAM it needs to run at full speed.
   starts while Strata holds the RAM and offers to turn Strata back on when it closes, keeps a local usage history,
   and offers new versions from GitHub with one-click install.
 
-Requires Windows 10/11 x64 and a Strata install. Not affiliated with the Strata project.
+It can also run llama.cpp's `llama-server` instead of Strata (first version, see [Engines](#engines)).
+
+Requires Windows 10/11 x64 and a Strata install (or llama.cpp's `llama-server`). Not affiliated with the Strata
+or llama.cpp projects.
 
 ## Install
 
@@ -115,9 +118,10 @@ script); the Settings dialog and the log show the same number.
 
 ## Settings (⚙)
 
-- **Engine** — shown only when a second engine module is installed (Strata is the only one today, so the row is
-  hidden). Choosing another engine saves `backend` in `config.json` and takes effect after Agent Start restarts.
-- **Strata launcher** — a dropdown of every `run-*.bat` in the Strata folder (other `.bat` files such as
+- **Engine** — *Strata* or *llama.cpp* (see [Engines](#engines)). Choosing another engine saves `backend` in
+  `config.json` and takes effect after Agent Start restarts.
+- **Strata launcher** (with llama.cpp: a program box and an arguments box, see [Engines](#engines)) — a dropdown
+  of every `run-*.bat` in the Strata folder (other `.bat` files such as
   `SETUP.bat` are not listed) plus **Browse…** for a `.bat` anywhere. The line below shows what that launcher
   runs: *model · config file · port*.
   The app only **reads** the `.bat` — it never runs it. It takes the line that starts
@@ -145,6 +149,66 @@ script); the Settings dialog and the log show the same number.
   shows the answer next to the button: up to date, a new version (the version label becomes the install link),
   or that GitHub could not be reached. It only checks; installing still asks first. Greyed out when the app
   runs from source.
+
+## Engines
+
+Agent Start runs one model server, the engine. There are two:
+
+- **Strata** (default): everything described above.
+- **llama.cpp** (new, first version): llama.cpp's `llama-server.exe` serving one model.
+
+To use llama.cpp:
+
+1. Settings (⚙) → **Engine** → *llama.cpp*. This saves `backend` in `config.json`; it takes effect after Agent
+   Start restarts.
+2. Settings then shows a program box and an arguments box instead of the launcher list. Pick `llama-server.exe`
+   (*Browse…*) and type its arguments, e.g. `-m C:\models\model.gguf --port 9931`.
+   - An explicit `--port N` is required (with a space; `--port=N` is refused). llama-server's own default port is
+     9931; Agent Start does not rely on it.
+   - A model is required: `-m <file.gguf>` or `-hf <user>/<model>`. Router mode (no model) is not supported, and
+     neither is `llama.exe serve`.
+   - `--host` must include 127.0.0.1 (or leave it out); `--api-prefix` is refused.
+   - Save takes the port and the API address from `--port`, and the first `--api-key` (as `api_key`).
+
+| With llama.cpp | |
+|---|---|
+| Turn on | Starts `llama-server.exe` with your arguments; the load shows phase labels (*Loading model weights*, *Setting up the context*), no percentage |
+| A server you started yourself | Adopted when it runs on the configured port (recognised by its `Server: llama.cpp` reply header) |
+| Status line | *Reading* / *Generating* / idle, from the server's `/slots` |
+| Speed graphs, usage history | From the server's log, for a server Agent Start started (an adopted one is not recorded) |
+| Safe Turn off | A normal Turn off asks first while a reply runs (`/slots`). Tool calls are not visible, so *Turn off when it's done* waits for 60 s of idle instead |
+| Turn off | Ends `llama-server.exe` and its console host (and `llama-connect.exe` from the same folder, if `--connect` started one); nothing else |
+| App sweep | Never offers `llama-server.exe` or anything in its folder for closing |
+| Dashboard link | *Open llama.cpp dashboard* opens llama-server's own web page on `/` (not with `--no-ui`) |
+| Not available | Unloading without ending the process, a load percentage, tool-call awareness, the full-RAM / low-RAM plan, the Switch model button, the first-start search for an install |
+
+Tested on one PC with llama.cpp build b12314 (the winget build and the CUDA build from llama.cpp's GitHub
+releases). Not tested yet: setups with `--api-key`, other builds.
+
+**Speed:** llama.cpp builds differ. The winget package is a Vulkan build; on an NVIDIA card the CUDA build from
+llama.cpp's GitHub releases was about twice as fast in one test. A model that does not fully fit in video memory
+runs partly on the CPU and is much slower.
+
+**GPU-fit warning:** Agent Start tells you when that happens, with an amber line in the window (no notification):
+
+- *At Turn on* it asks llama.cpp's own `llama-fit-params.exe` (from the same folder as your `llama-server.exe`,
+  with your model and context size) whether everything fits. The tool only reads the model file and the card; it
+  answers in a second or two, and the server is started right after (at most 6 seconds later, answer or not). If two or more layers would stay off the card,
+  the window says *Won't fully fit on the GPU · will run partly on the CPU (slower)*. There is no check when the
+  tool is missing, when you set `-ngl` yourself, with `--fit off`, or for a model that would be downloaded, and
+  its answer is dropped when Turn on finds a server already running.
+- *While a reply is generating* it watches for the symptom: video memory at 90% or more and the server using 25%
+  or more of all CPU cores, for 8 seconds. Then the window says *Running partly on the CPU (slower) · a smaller
+  context or model would fit the GPU*. 20 seconds of generating without the symptom clears the line, including
+  one the first check raised. This check needs a video-memory reading (NVIDIA cards).
+
+The four limits are `fit_watch_*` in `config.json`. They were set from a few runs of one 27B model on one 16 GB
+card, so treat them as a starting point. Strata is not checked: it manages its own memory plan.
+
+**Switching back to Strata:** Strata refuses a launch command that is not a python interpreter. If the start
+fails after switching back, re-select the `run-*.bat` in Settings.
+
+How the engines plug in: `docs/engines.md`; the llama.cpp module: `docs/llama_server_design.md`.
 
 ## Stats section
 
@@ -229,7 +293,9 @@ started*, then *Reopened 3 apps*.
 | `min_ram_mb`, `min_vram_mb`, `min_game_ram_mb` | 250 / 200 / 50 |
 | `game_dirs`, `game_exclude` | Game folders; exe names never treated as games (Wallpaper Engine) |
 | `user_whitelist` | Edited by the ⚙ dialog |
-| `backend` | The inference engine: `strata` (the only one today; a missing or unknown value means `strata`). Settings shows an Engine row for it once a second engine is installed. See `docs/engines.md` |
+| `backend` | The inference engine: `strata` (default; a missing or unknown value means `strata`) or `llama_cpp`. Set by the Engine row in Settings. See [Engines](#engines) and `docs/engines.md` |
+| `fit_watch_vram_pct`, `fit_watch_cpu_pct`, `fit_watch_sustain_s`, `fit_watch_clear_s` | llama.cpp only, the live GPU-fit check: video memory at least this full (90) and the server at least this share of all CPU cores (25) for this many seconds of generating (8) shows the warning; this many seconds without it (20) clears it |
+| `api_key` | llama.cpp only: the first `--api-key` from the arguments, saved by Settings; sent as a Bearer header only after the port identified itself as llama-server |
 | `mem_watch_app_mb`, `mem_watch_sustain_s` | Memory-pressure check: an app's memory that counts as large (4096), and how long both conditions must hold (15) |
 | `mem_watch_evict_pct`, `mem_watch_evict_sustain_s`, `mem_watch_evict_app_mb` | Pushed-out check: Strata's memory in RAM below this share of its peak (50) for this long (6), and the smallest new app that is named as the cause, in MB (512) |
 | `mem_watch_floor_baseline_pct`, `mem_watch_floor_total_pct` | "Running short" = available memory below the smaller of this share of what was available when Strata became ready (50) and this share of installed RAM (6) |
@@ -296,6 +362,10 @@ notification area on a runner). *Local* suites open the real window and take scr
 | `tests\test_resume_watch.py` | CI | When that app closes: is the game/app still running (fake process lists), the confirm window, gaps and expiry, the watcher with a fake clock and on its own thread, one read-only real snapshot (starts no process) |
 | `tests\test_kill_path.py` | CI | What a stop may kill and when it refuses, on fake processes: kill targets, the launcher cmd.exe, identity, foreign listeners, busy, force |
 | `tests\test_engines.py` | CI | The engine interface: registry and `backend`, the Strata engine's answers, and a fake llama-server-shaped engine driving the supervisor (no unload, no launcher; an engine cannot widen a kill; API key never sent with the identity probe) |
+| `tests\test_fit_check.py` | CI | The pre-check runner: only `llama-fit-params.exe` next to the engine program is ever run, windowless, time-limited |
+| `tests\test_fit_watch.py` | CI | The live GPU-fit rule (pure): sustain and clear windows, gaps, missing figures |
+| `tests\test_gpu_fit_ui.py` | Local | The GPU-fit warning in the app window (opens one window), fakes only |
+| `tests\test_llama_cpp.py` | CI | The llama.cpp engine on fakes only (nothing started or contacted): identity, launch checks and Save, `/health` and `/slots`, log parsing, load phases, the GPU-fit pre-check arguments, and stop/adopt through the real supervisor |
 | `tests\test_metrics_sample.py` | CI | Engine-neutral metrics samples: the Strata converter, old-vs-new store equivalence, a non-Strata sample, the Strata poller with fake fetchers |
 | `tests\test_usage_history.py` | CI | Usage history store: per-day / per-model totals, local midnight, each request counted once (also across an app restart), token-weighted speed, time served, atomic writes, corrupt or unreadable `usage.json`, dropping old days, threads; temp files only |
 | `tests\test_server_manager.py` | CI | Fake Strata on a random port: start/ready/timeout/lazy-load/adopt/busy+force/cancel/foreign-listener/launcher topology/launch from a parsed `.bat` (shows one real toast) |
