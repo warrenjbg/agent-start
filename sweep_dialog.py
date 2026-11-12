@@ -10,7 +10,7 @@ import customtkinter as ctk
 import config_store
 import theme as T
 
-log = logging.getLogger("hermes_controller")
+log = logging.getLogger("agent_start")
 
 DECISIONS = ("close_and_start", "start_only", "cancel")
 

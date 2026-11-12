@@ -1,0 +1,48 @@
+{
+  "target_os": "windows",
+  "backend": "strata",
+  "model_name": "swift-1.5-iq3_s",
+  "strata_dir": "",
+  "launcher_bat": "",
+  "launch_cmd": [],
+  "endpoint_url": "http://127.0.0.1:8080/v1",
+  "port": 8080,
+  "ready_timeout_s": 180,
+  "stop_timeout_s": 20,
+  "min_ram_mb": 250,
+  "min_vram_mb": 200,
+  "min_game_ram_mb": 50,
+  "game_dirs": [
+    "steamapps",
+    "Epic Games",
+    "Riot Games",
+    "XboxGames",
+    "GOG Galaxy",
+    "Battle.net"
+  ],
+  "game_exclude": [
+    "wallpaper32.exe",
+    "wallpaper64.exe"
+  ],
+  "user_whitelist": [
+    "code.exe",
+    "WindowsTerminal.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "cmd.exe",
+    "node.exe",
+    "claude.exe",
+    "hermes.exe",
+    "Discord.exe",
+    "brave.exe",
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "Obsidian.exe",
+    "FanControl.exe",
+    "OpenRGB.exe",
+    "NVIDIA App.exe",
+    "NVIDIA Overlay.exe"
+  ],
+  "launch_cwd": ""
+}

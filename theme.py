@@ -1,4 +1,4 @@
-"""Design tokens for Hermes Controller — "PC front panel": quiet graphite chrome, one status-LED accent.
+"""Design tokens for Agent Start — "PC front panel": quiet graphite chrome, one status-LED accent.
 
 Direction: exact, calm, a bit mechanical. The only rich element is the memory gauge; everything else is neutral.
 All spacing is on a 4 px grid. Two weights (400 / 600 for the one status line).
@@ -94,4 +94,4 @@ def dark_caption(win) -> None:
         color = ctypes.c_int(int(BG[5:7] + BG[3:5] + BG[1:3], 16))                  # COLORREF 0x00BBGGRR
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(color), 4)  # DWMWA_CAPTION_COLOR
     except Exception:  # noqa: BLE001
-        logging.getLogger("hermes_controller").debug("caption colour not applied", exc_info=True)
+        logging.getLogger("agent_start").debug("caption colour not applied", exc_info=True)

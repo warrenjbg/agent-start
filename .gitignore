@@ -6,3 +6,8 @@ logs/
 tests/*.png
 *.log
 state.json
+# personal / machine-specific (config.default.json is the shipped default)
+config.json
+tests/.prompts/
+tests/*.txt
+tests/real_handles.json

@@ -9,7 +9,7 @@ from sweep_dialog import SweepDialog
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(threadName)s %(message)s", stream=sys.stdout)
 messagebox.askyesno = lambda *a, **k: (print("ASKYESNO", a), False)[1]   # never force anything
 HERE = pathlib.Path(__file__).resolve().parent
-app = main.HermesControllerApp()
+app = main.AgentStartApp()
 T0 = time.monotonic()
 log = []
 

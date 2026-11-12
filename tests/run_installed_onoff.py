@@ -1,10 +1,10 @@
-"""Integrator check (user-approved): drive the INSTALLED HermesController.exe like a user (mouse clicks):
+"""Integrator check (user-approved): drive the INSTALLED AgentStart.exe like a user (mouse clicks):
 Turn on -> 'Start without closing' -> wait Serving -> Turn off -> Idle -> close. Screenshots tests/inst_*.png."""
 import os, time, socket, subprocess, sys
 import win32api, win32con, win32gui, win32process
 from PIL import ImageGrab
 
-EXE = os.path.join(os.environ["LOCALAPPDATA"], "Programs", "Hermes Controller", "HermesController.exe")
+EXE = os.path.join(os.environ["LOCALAPPDATA"], "Programs", "Agent Start", "AgentStart.exe")
 OUT = os.path.dirname(os.path.abspath(__file__))
 T0 = time.time()
 def mark(m): print(f"[{time.time()-T0:6.1f}s] {m}", flush=True)
@@ -54,7 +54,7 @@ OFFWHITE, RAISED, GREEN = (237, 237, 235), (38, 38, 42), (60, 199, 126)
 p = subprocess.Popen([EXE])
 h = None
 while h is None and time.time() - T0 < 20:
-    h = find("Hermes Controller", p.pid); time.sleep(0.2)
+    h = find("Agent Start", p.pid); time.sleep(0.2)
 mark(f"installed exe window up (pid {p.pid}); port open={port_open()}")
 time.sleep(6)
 im, org = client_shot(h, "idle")
@@ -111,7 +111,7 @@ try:
     p.wait(10); mark(f"exe closed, code {p.returncode}")
 except subprocess.TimeoutExpired:
     mark("exe did NOT close on WM_CLOSE")
-log = os.path.join(os.environ["APPDATA"], "HermesController", "logs", "controller.log")
+log = os.path.join(os.environ["APPDATA"], "AgentStart", "logs", "controller.log")
 lines = open(log, encoding="utf-8").read().splitlines()
 start = max(i for i, l in enumerate(lines) if "starting (frozen=True" in l)
 for l in lines[start:]:

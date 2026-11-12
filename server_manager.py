@@ -28,7 +28,7 @@ import psutil
 import config_store
 from config_store import LOG_DIR, load_config, server_root
 
-log = logging.getLogger("hermes_controller")
+log = logging.getLogger("agent_start")
 
 _STRATA_MARK = os.path.normcase("serve\\server.py")
 _LOG_KEEP = 5
@@ -747,7 +747,7 @@ class EndpointManager:
             return self._adopt(abort)
         cmd = [str(x) for x in (self._cfg.get("launch_cmd") or [])]
         if not cmd:
-            return "error", "launch_cmd is empty in config.json"
+            return "error", "No Strata launcher chosen yet · open Settings (gear) and pick your run-*.bat"
         if not cmd[0].strip().casefold().endswith(".exe"):
             # never hand a .bat/.cmd/script to CreateProcess: that runs it through cmd.exe (hand-edited config.json)
             return "error", (f"Launch command must start with python.exe (the Strata venv interpreter), "
@@ -995,14 +995,14 @@ class EndpointManager:
             result["error"] = "; ".join(errors)
 
     def _toast(self, model: str) -> None:
-        msg = f"Hermes Endpoint Closed: {model} unloaded and memory freed."
+        msg = f"Strata stopped: {model} unloaded and memory freed."
         try:
             from winotify import Notification
             icon = config_store.APP_DIR / "assets" / "app.png"
             # Installed build: the Start-menu shortcut carries this AUMID, so the toast shows the app's
             # name + icon. From source there is no shortcut, so use a plain display name.
-            app_id = "warrenjbg.HermesController" if config_store.FROZEN else "Hermes Controller"
-            Notification(app_id=app_id, title="Hermes Endpoint Closed", msg=msg,
+            app_id = "warrenjbg.AgentStart" if config_store.FROZEN else "Agent Start"
+            Notification(app_id=app_id, title="Strata stopped", msg=msg,
                          icon=str(icon) if icon.exists() else "").show()
             self.last_toast = msg
         except Exception:  # noqa: BLE001 - toast failure is non-fatal

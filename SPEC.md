@@ -1,4 +1,4 @@
-# Hermes Controller — Spec & Interface Contracts (v2 — LOCKED after Fable 5.2 review; v1.1 amendments at the end)
+# Agent Start — Spec & Interface Contracts (v2 — LOCKED after Fable 5.2 review; v1.1 amendments at the end)
 
 Windows 11 desktop widget (Python 3.11+, venv is 3.14; CustomTkinter 6, dark mode, 360x260 logical px) that:
 1. **ON**: optionally force-closes RAM-hungry apps/games (only those the user ticks), then starts the local
@@ -8,7 +8,7 @@ Windows 11 desktop widget (Python 3.11+, venv is 3.14; CustomTkinter 6, dark mod
 Host: Ryzen 9800X3D, 64 GB RAM, RTX 5070 Ti (WDDM). RAM is the binding constraint for Strata (IQ3_S streams ~70 GB
 and wants "little else open"); VRAM only changes speed. Only ONE Strata may run at a time.
 
-Project dir: `C:\Users\<user>\Downloads\Hermes Controller` · interpreter `.venv\Scripts\python.exe`
+Project dir: `C:\Users\<user>\Downloads\Agent Start` · interpreter `.venv\Scripts\python.exe`
 (customtkinter 6.0, psutil 7.2, pywin32 (win32gui/win32process/win32pdh/win32event/win32api/win32con/winerror),
 winotify; Pillow 13 is installed for test screenshots only). **No pynvml for per-process VRAM** (verified: NVML
 reports `usedGpuMemory=None` for all 48 GPU processes on this WDDM box); v1.1 uses pynvml (nvidia-ml-py) only for
@@ -30,7 +30,7 @@ Shipped code has no TODO/FIXME/placeholder text and no stub `pass` bodies.
 Subagents must NOT edit files they don't own. If a contract is insufficient, say so in the final report.
 
 **Shared conventions (all modules)**
-- Logging: `log = logging.getLogger("hermes_controller")`; never `print` in library code (under `pythonw`
+- Logging: `log = logging.getLogger("agent_start")`; never `print` in library code (under `pythonw`
   stdout/stderr are None). `main.py` attaches a rotating file handler at `logs\controller.log`.
 - Name normalisation: `norm(name) = name.casefold()` with ONE trailing `.exe` stripped. All name lists (SYSTEM,
   TREE_PROTECTED, user_whitelist) are compared on normalised `proc.name()` only.
@@ -215,8 +215,8 @@ class EndpointManager:
   4. Terminate root-first then the rest → `wait_procs(5)` → `kill()` survivors → `wait_procs(5)`. Kill only via the
      captured `psutil.Process` objects after `is_running()`. Never `taskkill`/`os.kill`.
   5. Verify port released: poll `is_running()` until False, ≤ `stop_timeout_s`.
-  6. Toast ONLY if the port was released and `notify` is True: winotify `Notification(app_id="Hermes Controller",
-     title="Hermes Endpoint Closed", msg=f"Hermes Endpoint Closed: {model_id or model_name} unloaded and memory
+  6. Toast ONLY if the port was released and `notify` is True: winotify `Notification(app_id="Agent Start",
+     title="Strata stopped", msg=f"Strata stopped: {model_id or model_name} unloaded and memory
      freed.")`. Failure is non-fatal (logged).
   7. `cb(result)`, `result = {"ok": bool, "port_released": bool, "killed_pids": list[int], "ram_freed_mb": float,
      "unload": "ok"|"busy"|"unavailable"|"skipped", "error": str|None, "cancelled_start": bool}`.
@@ -234,19 +234,19 @@ class EndpointManager:
 
 ## Contract 3 — UI (`main.py`, `whitelist_modal.py`, `sweep_dialog.py`)
 
-- `main.py`: `class HermesControllerApp(ctk.CTk)`, `def main() -> None`, `if __name__ == "__main__": main()`.
+- `main.py`: `class AgentStartApp(ctk.CTk)`, `def main() -> None`, `if __name__ == "__main__": main()`.
   Single instance BEFORE creating any Tk root (inside `main()`): `win32event.CreateMutex(None, False,
-  "HermesController.Singleton")`, then immediately `win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS` ⇒
-  `ctypes.windll.user32.MessageBoxW(None, "Hermes Controller is already running.", "Hermes Controller", 0x40)`
+  "AgentStart.Singleton")`, then immediately `win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS` ⇒
+  `ctypes.windll.user32.MessageBoxW(None, "Agent Start is already running.", "Agent Start", 0x40)`
   and exit. Keep the handle referenced at module level for process life.
   Logging: `RotatingFileHandler(LOG_DIR\controller.log, maxBytes=1 MB, backupCount=3)` on logger
-  "hermes_controller", level INFO.
-  `ctk.set_appearance_mode("dark")`, `geometry("360x260")`, `resizable(False, False)`, title "Hermes Controller".
-  Constructor `HermesControllerApp(detector=None, endpoint=None, config=None)` — None ⇒ real ones from one shared
+  "agent_start", level INFO.
+  `ctk.set_appearance_mode("dark")`, `geometry("360x260")`, `resizable(False, False)`, title "Agent Start".
+  Constructor `AgentStartApp(detector=None, endpoint=None, config=None)` — None ⇒ real ones from one shared
   `load_config()` dict: `endpoint = EndpointManager(cfg)`, `detector = ProcessDetector(cfg,
   protected_pids_provider=endpoint.protected_pids)`. Tests inject stubs.
 - Layout (fits 360x260 logical px; CTk applies DPI scaling itself):
-  - **Top bar**: "Hermes Controller" label; status pill (CTkLabel, fg_color, corner_radius) — IDLE `#4B5563`,
+  - **Top bar**: "Agent Start" label; status pill (CTkLabel, fg_color, corner_radius) — IDLE `#4B5563`,
     STARTING / STOPPING `#D97706`, ACTIVE `#10B981`, ERROR `#DC2626` (texts IDLE/STARTING/ACTIVE/STOPPING/ERROR;
     ACTIVE with `loaded` False shows "LOADING" in the amber colour); gear button "⚙" → WhitelistModal (disabled
     while STARTING/STOPPING).
@@ -269,7 +269,7 @@ class EndpointManager:
   `start_endpoint(on_ready, on_error)`; `start_only` ⇒ start; `cancel` ⇒ IDLE.
   on_ready ⇒ ACTIVE (preview "Serving …"); on_error(msg) ⇒ ERROR + msg.
 - **OFF flow**: STOPPING; `stop_endpoint(on_stopped)`. on_stopped(result): `unload=="busy"` and not ok ⇒
-  `messagebox.askyesno("Hermes Controller", "Model is mid-turn — force stop?")` on the main thread ⇒ yes:
+  `messagebox.askyesno("Agent Start", "Model is mid-turn — force stop?")` on the main thread ⇒ yes:
   `stop_endpoint(on_stopped, force=True)`; no: back to ACTIVE. Else if `cancelled_start` ⇒ IDLE. Else
   `port_released` ⇒ IDLE and add `ram_freed_mb`; else ERROR + `error`.
 - **SweepDialog** (`sweep_dialog.py`): `class SweepDialog(ctk.CTkToplevel)`,
@@ -408,7 +408,7 @@ class EndpointManager:
   → accumulated by `id` (fallback key: time) to 30. History is cleared at each server start, kept after OFF.
 - Empty states: "Strata is off" (not serving, no data), "No requests yet" / "No prompt reads yet", "Metrics
   unavailable" (3 failed polls and no data), "VRAM unavailable", "Collecting…".
-- Test seams: `HermesControllerApp(..., metrics_fetcher=None, vram_sampler=None)`.
+- Test seams: `AgentStartApp(..., metrics_fetcher=None, vram_sampler=None)`.
 
 ### Code review (v1.1) — fixed
 - A monitor reading probed before a state change is dropped (`_state_seq`): a stale "active" delivered after OFF no
@@ -416,7 +416,7 @@ class EndpointManager:
 - Result notes ("Stopped · freed …", "Start cancelled", …) are held 4 s (`_set_note`); before, the sweep preview
   requested right after replaced them within a fraction of a second.
 - Second instance: the running window is found by class `TkTopLevel` + title (an Explorer window of the folder
-  "Hermes Controller" has the same title).
+  "Agent Start" has the same title).
 - Dialog icon (see `style_dialog`), dialog `after` scripts cancelled on close, dialogs centred within the virtual
   desktop (multi-monitor) instead of being pulled to the primary screen.
 - `config_store.save_state` read-modify-write under the lock; `os.replace` retried on `PermissionError`;

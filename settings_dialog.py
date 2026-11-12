@@ -17,7 +17,7 @@ from sweep_dialog import apply_modal, center_over, later, release_modal, style_d
 from version import __version__
 from whitelist_modal import WhitelistModal
 
-log = logging.getLogger("hermes_controller")
+log = logging.getLogger("agent_start")
 
 NO_LAUNCHERS = "No run-*.bat found"
 

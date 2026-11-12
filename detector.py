@@ -1,4 +1,4 @@
-"""Process detection and sweeping for Hermes Controller (Contract 1 of SPEC.md).
+"""Process detection and sweeping for Agent Start (Contract 1 of SPEC.md).
 
 ProcessDetector finds RAM/VRAM-hungry user apps ("candidates") that may be force-closed before
 Strata starts, and closes the ones the user selected.
@@ -31,7 +31,7 @@ import win32process
 
 import config_store
 
-log = logging.getLogger("hermes_controller")
+log = logging.getLogger("agent_start")
 
 # --------------------------------------------------------------------------------------------- constants
 

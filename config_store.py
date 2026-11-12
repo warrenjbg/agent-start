@@ -1,4 +1,4 @@
-"""Thread-safe, atomic access to config.json for Hermes Controller."""
+"""Thread-safe, atomic access to config.json for Agent Start."""
 from __future__ import annotations
 
 import copy
@@ -15,11 +15,11 @@ FROZEN = bool(getattr(sys, "frozen", False))
 # Code/bundle dir. Frozen (PyInstaller one-folder): read-only files live in sys._MEIPASS (…\_internal).
 APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 # Writable data dir. Installed under Program Files the bundle is read-only, so config + logs live in
-# %APPDATA%\HermesController. From source they stay next to the code. HERMES_CONTROLLER_HOME overrides both.
-if os.environ.get("HERMES_CONTROLLER_HOME"):
-    DATA_DIR = Path(os.environ["HERMES_CONTROLLER_HOME"])
+# %APPDATA%\AgentStart. From source they stay next to the code. AGENT_START_HOME overrides both.
+if os.environ.get("AGENT_START_HOME"):
+    DATA_DIR = Path(os.environ["AGENT_START_HOME"])
 elif FROZEN:
-    DATA_DIR = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "HermesController"
+    DATA_DIR = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "AgentStart"
 else:
     DATA_DIR = APP_DIR
 CONFIG_PATH = DATA_DIR / "config.json"
@@ -28,8 +28,29 @@ STATE_PATH = DATA_DIR / "state.json"          # small runtime memory (e.g. last 
 BUNDLED_CONFIG = APP_DIR / "config.default.json"
 
 
+# Before v1.5 the app was called "Hermes Controller" and kept its data here; moved over once on first launch.
+LEGACY_DATA_DIR = (Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "HermesController"
+                   if FROZEN and not os.environ.get("AGENT_START_HOME") else None)
+
+
+def migrate_legacy_data(legacy: Path | None = None, target: Path | None = None) -> bool:
+    """Copy the old data folder (settings, pins, apps waiting to be reopened, logs) into a NEW data dir.
+    Never overwrites: only runs when the target has no config.json yet. Best effort; returns True if copied."""
+    legacy = LEGACY_DATA_DIR if legacy is None else legacy
+    target = DATA_DIR if target is None else target
+    try:
+        if legacy is None or not (legacy / "config.json").is_file() or (target / "config.json").exists():
+            return False
+        shutil.copytree(legacy, target, dirs_exist_ok=True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def ensure_data_dir() -> None:
-    """Create DATA_DIR and, on first run of an installed build, seed config.json from the bundled default."""
+    """Create DATA_DIR (moving the pre-v1.5 data over once) and, on first run of an installed build, seed
+    config.json from the bundled default."""
+    migrate_legacy_data()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_PATH.exists() and BUNDLED_CONFIG.exists():

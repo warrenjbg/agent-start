@@ -1,4 +1,4 @@
-"""UI smoke test for Hermes Controller (stub backends only — never touches real processes or port 8080).
+"""UI smoke test for Agent Start (stub backends only — never touches real processes or port 8080).
 
 Run:  .venv\\Scripts\\python.exe tests\\test_ui_smoke.py
 Exit code 0 = all checks passed. Screenshots land in tests\\ui_<state>.png.
@@ -24,9 +24,9 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
 # Settings/state written by the UI under test go to a throwaway folder - never the project's config.json /
-# state.json and never %APPDATA%\HermesController. Must be set before config_store is imported.
+# state.json and never %APPDATA%\AgentStart. Must be set before config_store is imported.
 HOME = Path(tempfile.mkdtemp(prefix="hc-ui-home-"))
-os.environ["HERMES_CONTROLLER_HOME"] = str(HOME)
+os.environ["AGENT_START_HOME"] = str(HOME)
 
 import tkinter.messagebox as tk_messagebox  # noqa: E402
 
@@ -37,7 +37,7 @@ import main  # noqa: E402  (must import without detector.py / server_manager.py)
 import config_store  # noqa: E402
 import settings_dialog  # noqa: E402
 import theme as T  # noqa: E402
-from main import HermesControllerApp, PILL_COLORS, LOADING_COLOR  # noqa: E402
+from main import AgentStartApp, PILL_COLORS, LOADING_COLOR  # noqa: E402
 from settings_dialog import SettingsDialog  # noqa: E402
 from sweep_dialog import SweepDialog  # noqa: E402
 from vram_sampler import VramSnapshot  # noqa: E402
@@ -344,7 +344,7 @@ class FakeMetrics:
 
 def new_app(cfg: dict | None = None):
     det, ep = StubDetector(), StubEndpoint()
-    app = HermesControllerApp(detector=det, endpoint=ep, config=dict(cfg or CFG), metrics_fetcher=FakeMetrics(),
+    app = AgentStartApp(detector=det, endpoint=ep, config=dict(cfg or CFG), metrics_fetcher=FakeMetrics(),
                               vram_sampler=FakeVram())
     app.attributes("-topmost", True)
     pump(app, 0.4)

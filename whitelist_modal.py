@@ -11,7 +11,7 @@ import theme as T
 
 from sweep_dialog import apply_modal, center_over, release_modal, style_dialog
 
-log = logging.getLogger("hermes_controller")
+log = logging.getLogger("agent_start")
 
 _BG = T.BG
 _ROW_BG = T.SURFACE

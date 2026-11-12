@@ -327,7 +327,7 @@ def t_validation_errors():
     cb = CB()
     assert mgr_for(cfg).start_endpoint(cb.ready, cb.error)
     k, msg = cb.wait(5)
-    assert k == "error" and "launch_cmd" in msg, msg
+    assert k == "error" and "No Strata launcher chosen" in msg and "Settings" in msg, msg
     cfg2 = make_cfg(port)
     cfg2["launch_cmd"] = [str(TMP / "nope" / "python.exe"), str(SERVE)]
     cb2 = CB()

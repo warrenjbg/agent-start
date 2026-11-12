@@ -7,7 +7,7 @@ read-only scan, the NVML sampler, the HTTP /metrics poller. What is fake: "Strat
 fake_strata_server.py copied to <temp>\serve\server.py and started from a run-*.bat that the app parses - on free
 random ports (never 8080). Safety: the sweep dialog is always answered "Start without closing" and a real sweep is
 made impossible; the only processes stopped are the fake servers this test's manager launched; settings and logs go
-to a temp HERMES_CONTROLLER_HOME; no toast.
+to a temp AGENT_START_HOME; no toast.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 HOME = Path(tempfile.mkdtemp(prefix="hc-e2e-home-"))
-os.environ["HERMES_CONTROLLER_HOME"] = str(HOME)
+os.environ["AGENT_START_HOME"] = str(HOME)
 
 import psutil  # noqa: E402
 from PIL import ImageGrab  # noqa: E402
@@ -137,7 +137,7 @@ def run() -> None:
     detector.sweep_processes = safe_sweep
 
     config_store.save_state({"stats_expanded": True})
-    app = main.HermesControllerApp(detector=detector, endpoint=endpoint, config=cfg)   # real poller + real NVML
+    app = main.AgentStartApp(detector=detector, endpoint=endpoint, config=cfg)   # real poller + real NVML
     try:
         pump_until(app, lambda: False, 0.5)
         check(app.expanded and app.state_name == "IDLE", "starts expanded + IDLE on the fake config")

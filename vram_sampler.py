@@ -12,7 +12,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-log = logging.getLogger("hermes_controller")
+log = logging.getLogger("agent_start")
 
 INTERVAL_S = 2.0
 WINDOW_S = 300.0

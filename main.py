@@ -1,4 +1,4 @@
-"""Hermes Controller — CustomTkinter widget that frees RAM and starts/stops the local Strata endpoint."""
+"""Agent Start — CustomTkinter widget that frees RAM and starts/stops the local Strata endpoint."""
 from __future__ import annotations
 
 import ctypes
@@ -34,9 +34,9 @@ from version import __version__
 from vram_sampler import VramSampler
 from whitelist_modal import WhitelistModal
 
-log = logging.getLogger("hermes_controller")
+log = logging.getLogger("agent_start")
 
-APP_TITLE = "Hermes Controller"
+APP_TITLE = "Agent Start"
 # Logical layout heights. BASE: status line + button (detail hidden). Panels below: the memory card (MEM_CARD_H) and
 # the graph card (82 px per row + 1 px hairlines), then the expand bar (BAR_BLOCK) or, with everything pinned, a 16 px
 # margin. HEIGHT = the default look: memory pinned, collapsed.
@@ -183,7 +183,7 @@ def _build_real_deps(cfg: dict) -> tuple[Any, Any]:
     return detector, endpoint
 
 
-class HermesControllerApp(ctk.CTk):
+class AgentStartApp(ctk.CTk):
     def __init__(self, detector=None, endpoint=None, config: dict | None = None,
                  metrics_fetcher: Callable[[str], dict | None] | None = None, vram_sampler=None) -> None:
         """metrics_fetcher(root_url) and vram_sampler are test seams (defaults: Strata /metrics over HTTP, NVML)."""
@@ -1891,32 +1891,32 @@ def main() -> None:
     import win32event
     import winerror
 
-    _SINGLETON_MUTEX = win32event.CreateMutex(None, False, "HermesController.Singleton")
+    _SINGLETON_MUTEX = win32event.CreateMutex(None, False, "AgentStart.Singleton")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         user32 = ctypes.windll.user32
-        # class + title: an Explorer window of a folder called "Hermes Controller" has the same title
+        # class + title: an Explorer window of a folder called "Agent Start" has the same title
         hwnd = user32.FindWindowW("TkTopLevel", APP_TITLE)
         if hwnd:                                     # bring the running window forward instead of a dialog
             user32.ShowWindow(hwnd, 9)                # SW_RESTORE
             user32.SetForegroundWindow(hwnd)
         else:
-            user32.MessageBoxW(None, "Hermes Controller is already running.", APP_TITLE, 0x40)
+            user32.MessageBoxW(None, "Agent Start is already running.", APP_TITLE, 0x40)
         sys.exit(0)
     _setup_logging()
     _check_config()
     try:  # own taskbar identity/icon instead of grouping under python(w).exe
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("warrenjbg.HermesController")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("warrenjbg.AgentStart")
     except Exception:  # noqa: BLE001
         pass
-    log.info("Hermes Controller %s starting (frozen=%s, data=%s)", __version__, config_store.FROZEN,
+    log.info("Agent Start %s starting (frozen=%s, data=%s)", __version__, config_store.FROZEN,
              config_store.DATA_DIR)
     try:
-        app = HermesControllerApp()
+        app = AgentStartApp()
     except Exception:
         log.exception("startup failed")
         raise
     app.mainloop()
-    log.info("Hermes Controller exited")
+    log.info("Agent Start exited")
 
 
 if __name__ == "__main__":

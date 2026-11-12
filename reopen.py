@@ -40,7 +40,7 @@ import psutil
 
 import config_store
 
-log = logging.getLogger("hermes_controller")
+log = logging.getLogger("agent_start")
 
 STATE_KEY = "reopen_pending"
 

@@ -2,7 +2,7 @@
 import sys, time, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import main
-app = main.HermesControllerApp()
+app = main.AgentStartApp()
 shot = pathlib.Path(__file__).with_name("ui_real_idle.png")
 def snap():
     from PIL import ImageGrab

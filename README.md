@@ -1,36 +1,47 @@
-# Hermes Controller
+# Agent Start
 
-A small always-handy Windows widget (360×268, dark; v1.1.0) that turns the local **Strata** LLM endpoint on and off:
+A small Windows 11 widget that turns a local [Strata](https://github.com/Niko1221/Strata) LLM endpoint on and off,
+and makes sure it gets the RAM it needs to run at full speed.
 
-- **ON**: optionally closes RAM-hungry apps/games you tick, then starts Strata with the launcher you chose
-  (default `run-swift-iq3_s.bat` → `swift-1.5-iq3_s`) and waits until the model is loaded
-  (`GET /health` → `loaded: true`).
-- **OFF**: asks Strata to unload, stops its whole process tree, checks port 8080 is free, and shows the toast
-  *"Hermes Endpoint Closed: <model> unloaded and memory freed."*
+![Agent Start](docs/screenshot.png)
 
-It also notices a Strata you started yourself (`run-*.bat`) and adopts it.
+- **Turn on**: shows which RAM-hungry apps and games to close (games pre-ticked, nothing is closed without your OK)
+  and whether that frees enough memory for Strata's full-RAM mode, then starts Strata from your `run-*.bat` and
+  shows the load progress until the model is ready.
+- **While serving**: what the model is doing right now (*Reading* a prompt with a progress bar, *Generating* with
+  tokens and tok/s, *Queued*), plus optional VRAM / decode / prompt-reading graphs you can pin.
+- **Turn off**: unloads the model, stops only Strata's own processes, checks the port is free, shows a toast, and
+  reopens the apps it closed (games as a one-click *Reopen*).
+- Notices a Strata you started yourself and adopts it. Warns when Strata fell back to its slower Low-RAM (SSD) mode.
+
+Requires Windows 10/11 x64 and a Strata install. Not affiliated with the Strata project.
 
 ## Install
 
-Run `dist\HermesController-Setup-<version>.exe` (currently 1.1.0). It installs for your user only (no admin prompt) to
-`%LOCALAPPDATA%\Programs\Hermes Controller`, adds a Start-menu shortcut (desktop shortcut optional) and an
-uninstaller. The exe is unsigned, so Windows SmartScreen may ask once: *More info → Run anyway*.
+Download `AgentStart-Setup-<version>.exe` from [Releases](../../releases) and run it. It installs for your user
+only (no admin prompt) to `%LOCALAPPDATA%\Programs\Agent Start`, with a Start-menu shortcut (desktop shortcut
+optional) and an uninstaller. The exe is unsigned, so Windows SmartScreen may ask once: *More info → Run anyway*.
 
-Settings and logs live in `%APPDATA%\HermesController` (`config.json`, `logs\`, `state.json`); the first launch
-copies the bundled default config there. Uninstalling keeps that folder.
+**First start:** open Settings (gear) and pick your Strata `run-*.bat` (the dropdown lists the ones in your Strata
+folder; *Browse…* for any other). The app reads the `.bat` and starts the same command itself; it never runs it.
 
-From source instead: `run.bat` (or `.venv\Scripts\python.exe main.py` with a console). Then config and logs stay
-in this folder. Only one instance can run either way.
+Settings and logs live in `%APPDATA%\AgentStart` (`config.json`, `logs\`, `state.json`); the first launch copies
+the bundled default config there. Uninstalling keeps that folder. Upgrading from the earlier name *Hermes
+Controller* replaces it and moves its settings over.
+
+From source instead: `python -m venv .venv`, `.venv\Scripts\pip install -r requirements.txt`, then `run.bat` (or
+`.venv\Scripts\python.exe main.py` with a console). Config and logs then stay in the project folder. Only one
+instance can run either way.
 
 ## Build
 
 ```bat
 build.bat
 ```
-version files → icon → PyInstaller one-folder `dist\HermesController\` → Inno Setup installer
-`dist\HermesController-Setup-<version>.exe`.
+version files → icon → PyInstaller one-folder `dist\AgentStart\` → Inno Setup installer
+`dist\AgentStart-Setup-<version>.exe`.
 Needs the project `.venv` (`pip install -r requirements.txt`) and Inno Setup 6 (`winget install JRSoftware.InnoSetup`).
-The installer bundles the current `config.json` as the default.
+The installer bundles `config.default.json` (no machine-specific paths) as the default config.
 
 **Version**: `version.py` is the only place to bump. `build.bat` first runs `tools\sync_version.py`, which
 regenerates `installer\version_info.txt` (exe properties) and `installer\version.iss` (included by the Inno
@@ -96,8 +107,8 @@ Candidates are apps that are not protected and match one of:
 Never offered (built in, cannot be unticked): Windows/system processes and anything under `C:\Windows`,
 terminals/shells/IDEs, `python`/`node`/`claude`/`hermes`, Strata itself, FanControl, LibreHardwareMonitor,
 Tailscale, this app and the program that launched it. Your editable whitelist (`config.json` →
-`user_whitelist`, default includes Brave, Discord, FanControl, OpenRGB, mVolt+, NVIDIA App/Overlay, Obsidian,
-VIA, Moonlight, Hermes) protects those apps and everything they started.
+`user_whitelist`, default: common browsers, Discord, terminals, VS Code, Obsidian, FanControl, OpenRGB,
+NVIDIA App/Overlay; edit it under Settings → Protected apps) protects those apps and everything they started.
 
 ### Full-speed RAM check
 
@@ -158,7 +169,7 @@ To serve another Strata model, pick its `run-*.bat` in ⚙ Settings — no hand-
 - **VRAM per app is an estimate.** NVIDIA's NVML reports nothing per process on Windows; the app uses Windows' GPU
   memory counters, capped at the card's real usage. *VRAM freed* after a sweep is measured on the whole card.
 - **Stopping during a reply**: if the model is mid-answer, OFF asks before force-stopping. Stopping Strata ends any
-  Hermes session using the `local` model.
+  chat session that is using it.
 - **First scan** after launch takes ~2 s (later ~0.3 s); it runs in the background.
 - **Launcher is parsed when you save it.** If you later edit that `.bat` (or Strata's updater rewrites it), open
   ⚙ Settings and press Save again to pick up the change.
@@ -188,3 +199,13 @@ Run from this folder with `.venv\Scripts\python.exe`:
 None of the tests touch the real Strata, port 8080, or any app they did not start.
 
 Design and contracts: `SPEC.md` (v1 and the advisor review history in `docs\`).
+
+## Tests
+
+Each `tests\test_*.py` is a standalone script (`.venv\Scripts\python.exe tests\test_ui_smoke.py`). The UI and e2e
+suites open windows and take screenshots; none of the suites contact a real Strata or close real apps. Set
+`STRATA_DIR` to your Strata folder to also check the parser against your real `run-*.bat` files.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

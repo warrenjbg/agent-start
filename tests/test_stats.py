@@ -504,16 +504,16 @@ def test_version_consistency() -> None:
     import version
     root = HERE.parent
     v = version.__version__
-    check(re.fullmatch(r"\d+\.\d+\.\d+", v) is not None and v == "1.4.1", f"version.py = {v}")
+    check(re.fullmatch(r"\d+\.\d+\.\d+", v) is not None and v == "1.5.0", f"version.py = {v}")
     quad = "(" + ", ".join(v.split(".") + ["0"]) + ")"
     info = (root / "installer" / "version_info.txt").read_text(encoding="utf-8")
     check(info.count(quad) == 2 and info.count(f'"{v}"') == 2, "installer/version_info.txt matches version.py")
     inc = (root / "installer" / "version.iss").read_text(encoding="utf-8")
     check(f'#define AppVersion "{v}"' in inc, "installer/version.iss matches version.py")
-    iss = (root / "installer" / "HermesController.iss").read_text(encoding="utf-8")
+    iss = (root / "installer" / "AgentStart.iss").read_text(encoding="utf-8")
     check('#include "version.iss"' in iss and "#define AppVersion" not in iss,
-          "HermesController.iss takes AppVersion from the generated include")
-    stale = [p.name for p in (root / "README.md", root / "build.bat", root / "HermesController.spec")
+          "AgentStart.iss takes AppVersion from the generated include")
+    stale = [p.name for p in (root / "README.md", root / "build.bat", root / "AgentStart.spec")
              if "1.0.0" in p.read_text(encoding="utf-8")]
     check(not stale, f"no hardcoded 1.0.0 left in README / build.bat / spec ({stale})")
 

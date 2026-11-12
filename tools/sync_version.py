@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from version import __version__  # noqa: E402
 
-VERSION_INFO = """# PyInstaller version resource for HermesController.exe
+VERSION_INFO = """# PyInstaller version resource for AgentStart.exe
 # GENERATED from version.py by tools/sync_version.py - do not edit by hand.
 VSVersionInfo(
   ffi=FixedFileInfo(filevers={quad}, prodvers={quad}, mask=0x3f, flags=0x0, OS=0x40004,
@@ -24,11 +24,11 @@ VSVersionInfo(
   kids=[
     StringFileInfo([StringTable("040904B0", [
       StringStruct("CompanyName", "warrenjbg"),
-      StringStruct("FileDescription", "Hermes Controller - start/stop the local Strata endpoint"),
+      StringStruct("FileDescription", "Agent Start - start/stop the local Strata endpoint"),
       StringStruct("FileVersion", "{version}"),
-      StringStruct("InternalName", "HermesController"),
-      StringStruct("OriginalFilename", "HermesController.exe"),
-      StringStruct("ProductName", "Hermes Controller"),
+      StringStruct("InternalName", "AgentStart"),
+      StringStruct("OriginalFilename", "AgentStart.exe"),
+      StringStruct("ProductName", "Agent Start"),
       StringStruct("ProductVersion", "{version}")])]),
     VarFileInfo([VarStruct("Translation", [1033, 1200])])
   ]

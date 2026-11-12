@@ -1,4 +1,4 @@
-# Hermes Controller — Spec & Interface Contracts (v1, locked after advisor review)
+# Agent Start — Spec & Interface Contracts (v1, locked after advisor review)
 
 Windows 11 desktop widget (Python 3.11+, tested on 3.14, CustomTkinter, dark mode, 360x260) that:
 1. **ON**: optionally closes RAM-hungry apps/games (user-confirmed), then starts the local **Strata** inference
@@ -8,7 +8,7 @@ Windows 11 desktop widget (Python 3.11+, tested on 3.14, CustomTkinter, dark mod
 Host facts: Ryzen 9800X3D, 64 GB RAM, RTX 5070 Ti (WDDM). RAM is the binding constraint for Strata (the IQ3_S
 model streams ~70 GB; it wants "little else open"); VRAM only changes speed. Only ONE Strata may run at a time.
 
-Project dir: `C:\Users\<user>\Downloads\Hermes Controller` · venv `.venv` (customtkinter 6.0, psutil 7.2,
+Project dir: `C:\Users\<user>\Downloads\Agent Start` · venv `.venv` (customtkinter 6.0, psutil 7.2,
 pywin32, nvidia-ml-py (`import pynvml`), winotify). No TODOs, no placeholders, no `pass` bodies in shipped code.
 
 ## Files & ownership
@@ -148,7 +148,7 @@ class EndpointManager:
   terminate → `wait_procs(5)` → kill survivors → `wait_procs(5)`; if the server's parent is `cmd.exe` whose
   cmdline contains `run-` and `.bat`, terminate that parent too (else its window sits at `pause`);
   (4) verify the port is released (poll ≤ `stop_timeout_s`); (5) toast via winotify:
-  title "Hermes Endpoint Closed", msg "Hermes Endpoint Closed: <model_name> unloaded and memory freed."
+  title "Strata stopped", msg "Strata stopped: <model_name> unloaded and memory freed."
   (toast failure is non-fatal); (6) `on_stopped_callback(result)` with
   `result = {"ok": bool, "port_released": bool, "killed_pids": list[int], "ram_freed_mb": float,
   "unload": "ok"|"busy"|"unavailable", "error": str|None}`. `ram_freed_mb` = summed RSS of the killed tree
@@ -163,12 +163,12 @@ class EndpointManager:
 
 ## Contract 3 — UI (`main.py`, `whitelist_modal.py`, `sweep_dialog.py`)
 
-- `main.py`: `class HermesControllerApp(ctk.CTk)`, `def main() -> None`, `if __name__ == "__main__": main()`.
-  `ctk.set_appearance_mode("dark")`, geometry `360x260`, not resizable, title "Hermes Controller".
-  Single instance via a named Windows mutex (`win32event.CreateMutex(None, False, "HermesController.Singleton")`
+- `main.py`: `class AgentStartApp(ctk.CTk)`, `def main() -> None`, `if __name__ == "__main__": main()`.
+  `ctk.set_appearance_mode("dark")`, geometry `360x260`, not resizable, title "Agent Start".
+  Single instance via a named Windows mutex (`win32event.CreateMutex(None, False, "AgentStart.Singleton")`
   + `GetLastError()==ERROR_ALREADY_EXISTS` ⇒ message box + exit).
 - Layout (everything must fit in 360x260 without clipping at 100% and 125% DPI scaling):
-  - **Top bar**: title label "Hermes Controller"; status pill (CTkLabel with fg_color + corner_radius) —
+  - **Top bar**: title label "Agent Start"; status pill (CTkLabel with fg_color + corner_radius) —
     IDLE `#4B5563`, STARTING / STOPPING `#D97706`, ACTIVE `#10B981`, ERROR `#DC2626`; gear button "⚙"
     opening the Whitelist modal (disabled while STARTING/STOPPING).
   - **Center**: ON/OFF toggle button exactly 180x56, corner_radius 28. Text "ON" in IDLE/ERROR, "OFF" in

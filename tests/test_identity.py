@@ -9,13 +9,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import server_manager as sm  # noqa: E402
 
-S = r"C:\Users\<user>\Downloads\Strata-main\Strata-0.2.10"
+S = r"C:\Users\me\Strata"
 CASES = [
     # (description, name, cmdline, expected)
     ("real venv launcher", "python.exe",
      [S + r"\.venv\Scripts\python.exe", S + r"\serve\server.py", "--engine", "strata", "--port", "8080"], True),
     ("real base-interpreter child", "python.exe",
-     [r"C:\Users\<user>\AppData\Local\Python\pythoncore-3.14-64\python.exe", S + r"\serve\server.py", "--port", "8080"],
+     [r"C:\Users\me\AppData\Local\Python\pythoncore-3.14-64\python.exe", S + r"\serve\server.py", "--port", "8080"],
      True),
     ("pythonw / python3.14 variants", "python3.14.exe", ["python3.14", S + r"\serve\server.py"], True),
     ("forward slashes", "python.exe", ["python", "C:/x/serve/server.py"], True),

@@ -1,4 +1,4 @@
-r"""Turn a Strata `run-*.bat` into the argv Hermes Controller launches itself.
+r"""Turn a Strata `run-*.bat` into the argv Agent Start launches itself.
 
 The .bat is only READ, never executed. The parser understands what those launchers use in practice:
 `cd /d "<dir>"` / `pushd`, `set VAR=value`, `%VAR%`, `%~dp0`, `^` line continuations, `call` / `start [/D dir]`
@@ -114,7 +114,7 @@ def logical_lines(text: str) -> list[str]:
 def expand_vars(s: str, bat_path: str, variables: dict[str, str], cwd: str) -> str:
     """%~dp0 and friends, %VAR% (bat-local `set` first, then the environment; unknown -> empty), %% -> %.
 
-    Batch arguments (%1..%9, %~1..%~9, %*) are empty: Hermes launches the server without any.
+    Batch arguments (%1..%9, %~1..%~9, %*) are empty: Agent Start launches the server without any.
     """
     drive, tail = os.path.splitdrive(bat_path)
     folder, base = os.path.split(tail)

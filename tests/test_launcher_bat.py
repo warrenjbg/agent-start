@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import launcher_bat as lb  # noqa: E402
 from launcher_bat import LauncherError  # noqa: E402
 
-REAL_DIR = r"C:\Users\<user>\Downloads\Strata-main\Strata-0.2.10"
+REAL_DIR = os.environ.get("STRATA_DIR", "")   # optional: your Strata folder, for the real-.bat checks
 REAL_BATS = ["run-iq3_s.bat", "run-iq3_xxs.bat", "run-swift-iq2_xs.bat", "run-swift-iq3_s.bat",
              "run-swift-iq3_xxs.bat"]
 PASSES, FAILS = 0, []

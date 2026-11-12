@@ -1,4 +1,4 @@
-# PyInstaller spec — Hermes Controller (one-folder, windowed). Build via build.bat.
+# PyInstaller spec — Agent Start (one-folder, windowed). Build via build.bat.
 from PyInstaller.utils.hooks import collect_data_files
 
 datas = collect_data_files("customtkinter") + [
@@ -23,10 +23,10 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz, a.scripts, [],
     exclude_binaries=True,
-    name="HermesController",
+    name="AgentStart",
     icon="assets/app.ico",
     console=False,
     version="installer/version_info.txt",
     upx=False,                      # UPX-packed binaries trip antivirus heuristics
 )
-coll = COLLECT(exe, a.binaries, a.datas, name="HermesController", upx=False)
+coll = COLLECT(exe, a.binaries, a.datas, name="AgentStart", upx=False)

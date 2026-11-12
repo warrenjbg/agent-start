@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import engine_log as E  # noqa: E402
 
 FX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "engine_logs")
-LIVE = r"C:\Users\<user>\Downloads\Strata-main\Strata-0.2.10\strata-swift-iq3_s.log"
+LIVE = os.path.join(os.environ.get("STRATA_DIR", ""), "strata-swift-iq3_s.log")   # optional real log (STRATA_DIR)
 passed = failed = 0
 
 

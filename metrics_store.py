@@ -13,7 +13,7 @@ import math
 import urllib.request
 from collections import OrderedDict
 
-log = logging.getLogger("hermes_controller")
+log = logging.getLogger("agent_start")
 
 MAX_REQUESTS = 30
 MIN_PROMPT_TOKENS = 256       # fewer tokens read = a cache hit / fixed-overhead-dominated read: noisy, low bars
