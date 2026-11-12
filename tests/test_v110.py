@@ -24,7 +24,6 @@ from busy_dialog import BusyDialog  # noqa: E402
 from game_watch import GameStart  # noqa: E402
 from mem_watch import MemReport  # noqa: E402
 from resume_watch import ResumeTarget  # noqa: E402
-from settings_dialog import SettingsDialog  # noqa: E402
 from sweep_dialog import SweepDialog  # noqa: E402
 
 PASSES, FAILS = 0, []
@@ -164,10 +163,10 @@ def test_resume() -> None:
             keys = list(getattr(d, "switches", {}))
             check(keys == ["reopen", "tray", "autostart", "games", "memory", "resume", "updates"],
                   f"the resume row sits right after the memory row ({keys})")
-            row = H.settings_option(d, "When that app closes")
+            row = H.settings_option(d, "That app closes")
             check(row["value"] == "Ask me" and row["choices"] == [labels[a] for a in main.RESUME_ACTIONS]
-                  and row["enabled"], f"Settings row 'When that app closes' ({row})")
-            check(H.choose_settings_option(d, "When that app closes", "Turn Strata back on"), "pick Turn Strata back on")
+                  and row["enabled"], f"Settings row 'That app closes' ({row})")
+            check(H.choose_settings_option(d, "That app closes", "Turn Strata back on"), "pick Turn Strata back on")
             check(app.watch.resume_action == "on", f"choice applied ({app.watch.resume_action})")
             H.close_settings(d)
             pump(app, 0.3)
@@ -753,10 +752,10 @@ def _engine_picker_checks() -> None:
             except LookupError:
                 no_row = True
             check(no_row, "one engine: no 'Engine' dropdown")
-            h1 = d.logical_height
-            want = (SettingsDialog.HEIGHT + SettingsDialog.SWITCH_STEP * (len(d.switches) - 1)
-                    + (SettingsDialog.UPDATE_ROW_H if getattr(d, "_check_btn", None) is not None else 0))
-            check(h1 == want, f"one engine: height as before ({h1} vs {want})")
+            h1 = d.tab_heights["Model"]
+            need = H.settings_tab_req_heights(d)
+            check(all(v <= d.logical_height + 1 for v in need.values()) and d.logical_height - max(need.values()) < 5,
+                  f"one engine: the window fits its tallest tab ({d.logical_height} vs {need})")
             H.close_settings(d)
             pump(app, 0.3)
         engines._FACTORIES["v110fake"] = _FakeEngine
@@ -770,8 +769,11 @@ def _engine_picker_checks() -> None:
         d = H.open_settings(app)
         check(d is not None and d.has_engine_row is True, "two engines: the engine row")
         if d is not None:
-            check(h1 is not None and d.logical_height == h1 + SettingsDialog.ENGINE_ROW_H,
-                  f"height grows by ENGINE_ROW_H ({h1} -> {d.logical_height})")
+            check(h1 is not None and d.tab_heights["Model"] == h1 + 32 + 8
+                  and H.settings_tab_of(d, H._option(d, "Engine")[1]) == "Model",
+                  f"the Engine row is on Model: one row (28 + 4) + 8 above the caption ({h1} -> {d.tab_heights['Model']})")
+            need = H.settings_tab_req_heights(d)
+            check(all(v <= d.logical_height + 1 for v in need.values()), f"two engines: nothing clipped ({need})")
             row = H.settings_option(d, "Engine")
             check(row["value"] == "Strata" and sorted(row["choices"]) == ["Fake Engine", "Strata"] and row["enabled"],
                   f"the menu lists both, Strata selected ({row})")

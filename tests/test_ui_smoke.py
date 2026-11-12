@@ -1556,6 +1556,7 @@ def disk_config() -> dict:
 
 
 def test_settings_dialog(dialogs: Dialogs) -> None:
+    import ui_helpers as H                       # pure widget helpers here (no pump: this module may be __main__)
     tmp = Path(tempfile.mkdtemp(prefix="hc-ui-strata-"))
     pa, pb, pz = _free_port(), _free_port(), _free_port()
     sdir = make_strata(tmp, "Strata-A", {"a": pa, "b": pb})
@@ -1587,10 +1588,12 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
         w, h = dlg.winfo_width(), dlg.winfo_height()
         scale = ctk.ScalingTracker.get_window_scaling(dlg)
         check(abs(w - 340 * scale) <= 2 and abs(h - dlg.logical_height * scale) <= 2, f"SettingsDialog size {w}x{h}")
-        check(dlg.logical_height == SettingsDialog.HEIGHT + SettingsDialog.SWITCH_STEP * (len(dlg.switches) - 1)
-              + (SettingsDialog.UPDATE_ROW_H if dlg._check_btn is not None else 0)
-              + (SettingsDialog.ENGINE_ROW_H if dlg.has_engine_row else 0),
-              f"SettingsDialog height = base + one step per switch + the update and engine rows ({dlg.logical_height})")
+        need = H.settings_tab_req_heights(dlg)
+        check(all(v <= dlg.logical_height + 1 for v in need.values())
+              and dlg.logical_height - max(need.values()) < 4 + 1,
+              f"SettingsDialog height = the tallest tab's content, on the 4 px grid ({dlg.logical_height} vs {need})")
+        check(H.settings_tabs(dlg) == ["Model", "Behaviour", "About"] and H.settings_tab(dlg) == "Model",
+              f"three tabs, Settings opens on Model ({H.settings_tabs(dlg)}, {H.settings_tab(dlg)})")
         check(dlg.grab_status() == "local", f"SettingsDialog grab {dlg.grab_status()}")
         check(dlg._link_host.cget("text") == "not running" and dlg._link_text.cget("text_color") == T.TEXT_3,
               f"dashboard link greyed out while Strata is off ({dlg._link_host.cget('text')!r})")
@@ -1602,7 +1605,7 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
         shot(dlg, "settings_idle")
         bottom = dlg.winfo_rooty() + h
         check(dlg._save_btn.winfo_rooty() + dlg._save_btn.winfo_height() <= bottom - 10 * scale
-              and dlg._detail.winfo_rooty() + dlg._detail.winfo_height() <= dlg._protected_btn.winfo_rooty(),
+              and dlg._detail.winfo_rooty() + dlg._detail.winfo_height() <= dlg._msg.winfo_rooty(),
               "settings layout: nothing clipped or overlapping")
         shot(dlg, "settings")
 
@@ -1665,8 +1668,10 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
         check("does not start Strata" in dlg._detail.cget("text") and str(dlg._save_btn.cget("state")) == "disabled",
               "browsed non-launcher .bat rejected inline")
 
-        # ---- Protected apps… opens the existing whitelist modal on top; closing it returns to Settings
-        dlg._protected_btn.invoke()
+        # ---- Protected apps (Behaviour tab) opens the existing whitelist modal on top; closing it returns to Settings
+        check(H.show_settings_tab(dlg, "Behaviour") and H.settings_tab_of(dlg, dlg._protected_btn) == "Behaviour",
+              "Protected apps sits on the Behaviour tab")
+        check(H.click_settings_button(dlg, "Protected apps"), "Protected apps row clicked")
         child = dlg._child
         check(isinstance(child, WhitelistModal) and app.dialog is dlg, "Protected apps… opens the whitelist modal")
         pump_until(app, lambda: child._loaded)
@@ -1678,7 +1683,7 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
         pump(app, 0.4)
         check(app._dialog_open() and dlg.winfo_exists() and dlg.grab_status() == "local",
               "Settings stays open and takes the grab back")
-        dlg._protected_btn.invoke()
+        H.click_settings_button(dlg, "Protected apps")
         pump(app, 0.3)
         dlg.close()                                             # closing Settings closes a nested modal too
         pump(app, 0.3)
@@ -1694,10 +1699,13 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
         url = config_store.server_root(app.cfg["endpoint_url"]) + "/"
         check(dlg._link_host.cget("text") == url[len("http://"):-1] and dlg._link_text.cget("text_color") == T.TEXT,
               f"live link shows the host ({dlg._link_host.cget('text')!r})")
+        H.show_settings_tab(dlg, "About")                       # the endpoint block lives on About
+        dlg.update_idletasks()
         dlg._link_text._label.event_generate("<Button-1>")
         pump(app, 0.1)
         check(OPENED_URLS == [url], f"click opens the Strata dashboard ({OPENED_URLS})")
         shot(dlg, "settings_active")
+        H.show_settings_tab(dlg, "Model")
         dlg._choice.set("run-a.bat")
         dlg._on_pick("run-a.bat")
         check(dlg._msg.cget("text") == "Applies next start — Strata keeps running", f"hint ({dlg._msg.cget('text')!r})")

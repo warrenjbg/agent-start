@@ -612,9 +612,9 @@ def test_settings_button() -> None:
     try:
         # no new params: as before (no row, same size)
         d = dialog(switches=[{"key": "updates", "label": "Check for updates daily", "value": True}])
-        check("old callers: no button, old height", d._check_btn is None
-              and d.logical_height == SettingsDialog.HEIGHT + SettingsDialog.SWITCH_STEP)
-        h_old = d.winfo_reqheight()
+        check("old callers: no button; every tab fits the window", d._check_btn is None
+              and all(h <= d.logical_height for h in d.tab_heights.values()), f"{d.tab_heights} / {d.logical_height}")
+        about_old = d.tab_heights.get("About", 0)
         d.close()
 
         # from source: disabled, the switch's wording
@@ -625,14 +625,10 @@ def test_settings_button() -> None:
               str(d._check_btn.cget("state")) == "disabled" and d._check_btn.cget("text") == CHECK_LABEL_SOURCE)
         ok, why = fits(d)
         check("from source: row fits the dialog width", ok, why)
-        check("new row: height grows by UPDATE_ROW_H", d.logical_height == SettingsDialog.HEIGHT
-              + SettingsDialog.SWITCH_STEP + SettingsDialog.UPDATE_ROW_H)
-        scale = ctk.ScalingTracker.get_window_scaling(d)
-        grow = (d.winfo_reqheight() - h_old) / scale
-        check("content grew by no more than UPDATE_ROW_H (nothing clipped)",
-              0 < grow <= SettingsDialog.UPDATE_ROW_H + 1, f"grew {grow:.1f}")
-        print(f"       (content height grew {grow:.1f} logical px; reqheight {d.winfo_reqheight() / scale:.1f} of "
-              f"{d.logical_height})")
+        grow = d.tab_heights.get("About", 0) - about_old
+        check("new row: the About tab grows by one control row and still fits (nothing clipped)",
+              20 <= grow <= 44 and all(h <= d.logical_height for h in d.tab_heights.values()),
+              f"grew {grow}; {d.tab_heights} / {d.logical_height}")
         d.check_updates()
         check("from source: a click does nothing", d._check_msg.cget("text") == "")
         d.close()

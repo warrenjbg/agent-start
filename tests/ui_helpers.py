@@ -39,6 +39,10 @@ WIDGETS EACH HELPER RELIES ON (the only coupling to the app's layout - a rename 
                                         settings_message, settings_button, settings_button_note,
                                         click_settings_button,
                                         version_label_text, update_link_text, click_update_link, close_settings
+    SettingsDialog tabs: the tab bar's  settings_tabs, settings_tab, show_settings_tab, settings_tab_texts,
+      CTkButtons by text; dlg.tabs      settings_tab_of, settings_tab_req_heights
+      (name -> frame); LinkRow rows     settings_button / click_settings_button also find LinkRow rows
+                                        ('Protected apps', 'Usage history'; .text / .enabled / .invoke())
     any dialog: CTkButton by text       dialog_buttons, click_dialog_button
 
 CTk internals used (customtkinter, not the app): ``CTkLabel._label`` (a CTkLabel click must be generated on its inner
@@ -459,23 +463,37 @@ def open_settings(app, timeout: float = 2.0):
     return d if isinstance(d, SettingsDialog) else None
 
 
+def _switch_rows(dlg) -> list[tuple[str, Any]]:
+    """(caption, CTkSwitch) for every switch row: the caption is the row's label (left), else the switch's text."""
+    out = []
+    for sw in (w for w in _walk(dlg) if isinstance(w, ctk.CTkSwitch)):
+        cap = _text(sw)
+        if not cap:
+            cap = next((_text(w) for w in sw.master.winfo_children() if isinstance(w, ctk.CTkLabel) and _text(w)), "")
+        out.append((cap, sw))
+    return out
+
+
 def _switch(dlg, label: str):
-    sw = _find(dlg, ctk.CTkSwitch, label)
-    if sw is None:
-        have = [_text(w) for w in _walk(dlg) if isinstance(w, ctk.CTkSwitch)]
-        raise LookupError(f"no switch {label!r} in Settings (have {have})")
-    return sw
+    rows = _switch_rows(dlg)
+    for cap, sw in rows:
+        if cap == label:
+            return sw, cap
+    for cap, sw in rows:
+        if cap.startswith(label):
+            return sw, cap
+    raise LookupError(f"no switch {label!r} in Settings (have {[c for c, _s in rows]})")
 
 
 def settings_switch(dlg, label: str) -> dict:
     """Switch whose caption is (or starts with) `label`: {'value': bool, 'enabled': bool, 'caption': str}."""
-    sw = _switch(dlg, label)
-    return {"value": bool(sw.get()), "enabled": _enabled(sw), "caption": _text(sw)}
+    sw, cap = _switch(dlg, label)
+    return {"value": bool(sw.get()), "enabled": _enabled(sw), "caption": cap}
 
 
 def toggle_settings_switch(dlg, label: str) -> None:
     """Click the switch (no-op while disabled, like a real click)."""
-    _switch(dlg, label).toggle()
+    _switch(dlg, label)[0].toggle()
 
 
 def _option(dlg, label: str):
@@ -515,36 +533,56 @@ def settings_launcher(dlg) -> dict:
     return {"value": str(m.get()), "choices": [str(v) for v in m.cget("values")], "enabled": _enabled(m)}
 
 
-def _row_label(dlg, row: int) -> str:
-    for w in dlg.winfo_children():
+def _gridded_at(master, row: int):
+    """The CTkLabel laid out (grid) in `master` at `row`, or None."""
+    for w in master.winfo_children():
         if isinstance(w, ctk.CTkLabel) and w.winfo_manager() == "grid" and int(w.grid_info().get("row", -1)) == row:
-            return _text(w)
-    return ""
+            return w
+    return None
 
 
 def settings_launcher_detail(dlg) -> str:
     """The read-only line under the launcher row (what the .bat runs, or why it can't be used)."""
     pick = _launcher_menu(dlg).master
-    return _row_label(dlg, int(pick.grid_info()["row"]) + 1)
+    return _text(_gridded_at(pick.master, int(pick.grid_info()["row"]) + 1))
 
 
 def settings_message(dlg) -> str:
-    """The message line above Cancel / Save ('Saving…', 'Applies next start …', errors)."""
+    """The message line above the buttons ('Saving…', 'Applies next start …', errors) on the tab shown."""
     save = _find(dlg, ctk.CTkButton, "Save", prefix=False)
-    return _row_label(dlg, int(save.master.grid_info()["row"]) - 1)
+    return _text(_gridded_at(save.master, int(save.grid_info().get("row", 1)) - 1))
+
+
+def _clickable(dlg, text: str):
+    """A CTkButton, or a LinkRow (settings_dialog.LinkRow: .text, .enabled, .invoke()), by text / prefix."""
+    b = _find(dlg, ctk.CTkButton, text)
+    if b is not None:
+        return b
+    import settings_dialog
+    rows = [w for w in _walk(dlg) if isinstance(w, settings_dialog.LinkRow)]
+    return next((r for r in rows if r.text == text), None) or next((r for r in rows if r.text.startswith(text)), None)
+
+
+def _clickable_info(w) -> tuple[str, bool]:
+    if isinstance(w, ctk.CTkButton):
+        return _text(w), _enabled(w)
+    return str(w.text), bool(w.enabled)
 
 
 def settings_button(dlg, text: str) -> dict | None:
-    """A Settings button by text ('Save', 'Browse…', 'Protected apps…', a future 'Check for updates'):
-    {'text', 'enabled'} or None."""
-    b = _find(dlg, ctk.CTkButton, text)
-    return None if b is None else {"text": _text(b), "enabled": _enabled(b)}
+    """A Settings button or link row by text ('Save', 'Browse…', 'Protected apps', 'Usage history',
+    'Check for updates'): {'text', 'enabled'} or None."""
+    b = _clickable(dlg, text)
+    if b is None:
+        return None
+    t, en = _clickable_info(b)
+    return {"text": t, "enabled": en}
 
 
 def click_settings_button(dlg, text: str) -> bool:
-    """Click a Settings button by text; False if absent or disabled."""
-    b = _find(dlg, ctk.CTkButton, text)
-    if b is None or not _enabled(b):
+    """Click a Settings button / link row by text; False if absent or disabled."""
+    b = _clickable(dlg, text)
+    if b is None or not _clickable_info(b)[1]:
         return False
     b.invoke()
     return True
@@ -584,5 +622,78 @@ def click_update_link(dlg) -> bool:
 
 
 def close_settings(dlg) -> bool:
-    """Click Cancel in Settings."""
-    return click_settings_button(dlg, "Cancel")
+    """Click Cancel in Settings (Close on the Behaviour / About tabs: the button that is shown) and wait until the
+    window is gone (a close in the dialog's first ARM_S seconds is carried out once it is armed)."""
+    cancel = _find(dlg, ctk.CTkButton, "Cancel", prefix=False)
+    if cancel is not None and cancel.winfo_manager() == "grid":
+        ok = click_settings_button(dlg, "Cancel")
+    else:
+        ok = click_settings_button(dlg, "Close")
+    if ok and not is_closed(dlg):
+        pump_until(dlg.master, lambda: is_closed(dlg), 2.0)
+    return ok
+
+
+# ---- Settings tabs
+def _tab_bar_buttons(dlg) -> dict[str, Any]:
+    names = list(getattr(dlg, "tabs", {}))
+    return {_text(w): w for w in _walk(dlg) if isinstance(w, ctk.CTkButton) and _text(w) in names}
+
+
+def settings_tabs(dlg) -> list[str]:
+    """The tab names, left to right ('Model', 'Behaviour', 'About')."""
+    return list(getattr(dlg, "tabs", {}))
+
+
+def settings_tab(dlg) -> str:
+    """The tab shown now (the one whose body is laid out)."""
+    return next((n for n, f in dlg.tabs.items() if f.winfo_manager() == "grid"), "")
+
+
+def show_settings_tab(dlg, name: str) -> bool:
+    """Click the tab `name` in the tab bar; False if there is no such tab."""
+    b = _tab_bar_buttons(dlg).get(name)
+    if b is None:
+        return False
+    b.invoke()
+    return True
+
+
+def settings_tab_of(dlg, widget) -> str:
+    """The tab a widget sits on ('' if it is not inside a tab, e.g. the title row or the footer)."""
+    frames = {str(f): n for n, f in dlg.tabs.items()}
+    w = widget
+    while w is not None:
+        if str(w) in frames:
+            return frames[str(w)]
+        w = getattr(w, "master", None)
+    return ""
+
+
+def settings_tab_texts(dlg, name: str) -> list[str]:
+    """Every caption on a tab, top to bottom in creation order: labels, buttons, link rows, switch captions."""
+    import settings_dialog
+    out: list[str] = []
+    for w in _walk(dlg.tabs[name]):
+        if isinstance(w, settings_dialog.LinkRow):
+            out.append(w.text)
+        elif isinstance(w, (ctk.CTkLabel, ctk.CTkButton)) and _text(w):
+            if isinstance(w, ctk.CTkLabel) and isinstance(getattr(w, "master", None), settings_dialog.LinkRow):
+                continue                                  # a link row's own label: counted once, above
+            out.append(_text(w))
+    return out
+
+
+def settings_tab_req_heights(dlg) -> dict[str, float]:
+    """Show each tab in turn and measure what the whole window needs for it (logical px); ends on the tab that was
+    shown. A tab whose need is above dlg.logical_height would be clipped."""
+    scale = ctk.ScalingTracker.get_window_scaling(dlg)
+    shown = settings_tab(dlg)
+    out: dict[str, float] = {}
+    for name in settings_tabs(dlg):
+        show_settings_tab(dlg, name)
+        dlg.update_idletasks()
+        out[name] = dlg.winfo_reqheight() / scale
+    show_settings_tab(dlg, shown)
+    dlg.update_idletasks()
+    return out

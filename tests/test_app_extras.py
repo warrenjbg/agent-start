@@ -387,6 +387,7 @@ def test_update_offer() -> None:
                   and getattr(d, "_update_link", None) is not None and "Update to 9.9.0" in d._update_link.cget("text"),
                   f"update found: named next to the button and offered as the link ({d._check_msg.cget('text')!r})")
             check(not calls["download"] and not calls["launch"], "checking never downloads or installs")
+            d.show_tab("About")
             U.shot(d, "extras_settings_check")
             d.close()
             pump(app, 0.2)
@@ -398,6 +399,7 @@ def test_update_offer() -> None:
         d = app.dialog
         link = getattr(d, "_update_link", None)
         check(link is not None and "Update to 9.9.0" in link.cget("text"), "Settings: update link")
+        d.show_tab("About")
         U.shot(d, "extras_settings_update")
         main.messagebox.askyesno = lambda *a, **k: asked.append(a) or False
         if link is not None:
@@ -575,6 +577,7 @@ def test_reopen_switch() -> None:
         pump(app, 0.4)
         d = app.dialog
         check(isinstance(d, SettingsDialog) and d._reopen_var.get() is True, "Settings: reopen switch on by default")
+        d.show_tab("Behaviour")
         U.shot(d, "extras_settings_switch")
         rec = {"name": "notes.exe", "exe": sys.executable, "cmdline": [sys.executable, "-c", "pass"], "cwd": "",
                "category": "app", "create_time": 1.0, "elevated": False, "aumid": None}
@@ -784,6 +787,7 @@ def test_settings_switches() -> None:
         d = app.dialog
         keys = list(getattr(d, "switches", {}))
         check(keys == ["reopen", "tray", "autostart", "games", "memory", "resume", "updates"], f"Settings switches ({keys})")
+        d.show_tab("Behaviour")
         U.shot(d, "extras_settings_switches")
         if "tray" in keys:
             check(d.switches["tray"][0].get() is True, "tray switch on")
@@ -1043,11 +1047,12 @@ def test_memory_trigger() -> None:
         check(mw.armed == 1, "armed once Strata serves with the model loaded")
         # default: Ask me - a toast naming the app and its memory; nothing stops by itself
         d = H.open_settings(app)
-        row = H.settings_option(d, "When memory runs low")
+        row = H.settings_option(d, "Memory runs low")
         check(row["value"] == "Ask me" and row["choices"] == ["Turn Strata off", "Ask me", "Do nothing"] and row["enabled"],
-              f"Settings row 'When memory runs low': Ask me by default, the same three choices ({row})")
-        games = H.settings_option(d, "When a game starts")
+              f"Settings row 'Memory runs low': Ask me by default, the same three choices ({row})")
+        games = H.settings_option(d, "A game starts")
         check(games["value"] == "Turn Strata off", "the game setting keeps its own value")
+        H.show_settings_tab(d, "Behaviour")
         U.shot(d, "extras_settings_memory")
         H.close_settings(d)
         pump(app, 0.3)
@@ -1088,7 +1093,7 @@ def test_memory_trigger() -> None:
         check(mw.disarmed >= 1, "stopped: the memory check is disarmed")
         # "Turn Strata off": acts by itself, like a game start
         d = H.open_settings(app)
-        check(H.choose_settings_option(d, "When memory runs low", "Turn Strata off"), "Settings: pick Turn Strata off")
+        check(H.choose_settings_option(d, "Memory runs low", "Turn Strata off"), "Settings: pick Turn Strata off")
         H.close_settings(d)
         check(pump_until(app, lambda: config_store.load_state().get("memory_action") == "off", 3),
               "the choice is saved (state.json memory_action)")
@@ -1201,10 +1206,11 @@ def test_engine_without_launcher_files(tmp: Path) -> None:
         check(app._finder_ran is False and "Looking for" not in status(app), "no finder: no first-start search")
         d = H.open_settings(app)
         check(d is not None and d._program_entry.winfo_manager() == "grid" and d._args_entry.winfo_manager() == "grid"
-              and d._menu.winfo_manager() == "", "Settings shows a program box and an arguments box, no launcher list")
-        texts = [w.cget("text") for w in d.winfo_children() if isinstance(w, main.ctk.CTkLabel)]
-        check("llama.cpp program and arguments" in texts and not any("Strata" in str(t_) for t_ in texts),
-              f"captions name the engine, not Strata ({[t_ for t_ in texts if t_][:3]})")
+              and d.advanced_open and d._menu.winfo_manager() == "",
+              "Settings shows a program box and an arguments box (Advanced, open by itself), no launcher list")
+        texts = [str(w.cget("text")) for w in H._walk(d) if isinstance(w, main.ctk.CTkLabel)]
+        check("Advanced · program and arguments" in texts and not any("Strata" in t_ for t_ in texts),
+              f"captions name the engine's program and arguments, not Strata ({[t_ for t_ in texts if t_][:4]})")
         check(d._link_text.cget("text") == "llama.cpp endpoint", "no dashboard: the row is a plain endpoint line")
         check(str(d._save_btn.cget("state")) == "disabled" and d._msg.cget("text") == "", "nothing typed: Save is off, no complaint")
         d._program.set(str(tmp / "llama" / "other.exe"))

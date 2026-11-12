@@ -91,7 +91,10 @@ def test_engine_side() -> None:
           and opts["program_title"] == "Build", f"options: builds best first, both models ({opts and opts['programs']})")
     check(opts["model_of"](("-c", "8192", "-m", M2.path)) == M2.path and opts["model_of"](("--port", "1")) is None
           and tuple(opts["default_args"](M1.path)) == ("-m", M1.path, "--port", "9931"), "options: helpers")
-    check(eng.launch_options(object(), {}) is None, "nothing found: no dropdowns")
+    none = eng.launch_options(object(), {})
+    check(none is not None and none["programs"] == [] and none["models"] == []
+          and all(callable(none[k]) for k in ("with_context", "with_vision", "with_port", "model_of")),
+          "nothing found: no Build / Model lists, but the context / vision / port controls are offered")
     strata = engines.get_engine({"backend": "strata"})
     check(strata.auto_launch([], {}) is None and strata.auto_launch([object(), object()], {}) is None
           and strata.auto_launch([object()], {}) is None, "Strata: none / several installs / unreadable: no auto set-up")
@@ -150,13 +153,14 @@ def test_auto_config() -> None:
                   "picking the other build fills the program box")
             d._program.set(str(TMP / "elsewhere" / "llama-server.exe"))
             U.pump(app, 0.2)
-            check(d._program_choice.get() == "Another program (below)", "a typed program: the dropdown says so")
+            check(d._program_choice.get() == "Another program (below)" and d.advanced_open,
+                  "a typed program: the dropdown says so, and Advanced (the boxes below) is open")
             d._program_picked(d._opt_programs[0][0])
             U.pump(app, 0.2)
-            exp = (SettingsDialog.HEIGHT + SettingsDialog.SWITCH_STEP * len(d._extra_switches)
-                   + (SettingsDialog.UPDATE_ROW_H if d._check_btn is not None else 0)
-                   + (SettingsDialog.ENGINE_ROW_H if d.has_engine_row else 0) + 2 * SettingsDialog.OPTION_ROW_H)
-            check(d.logical_height == exp, f"the window grows by two rows ({d.logical_height} vs {exp})")
+            need = H.settings_tab_req_heights(d)
+            check(H.settings_option(d, "Build")["caption"] == "Build" and H.settings_option(d, "Model")["caption"]
+                  == "Model" and need["Model"] <= d.logical_height + 1 and d.tab_heights["Model"] <= d.logical_height,
+                  f"the two rows are on the Model tab, which fits the window ({need['Model']} of {d.logical_height})")
             U.shot(d, "settings_llama_found")
             H.close_settings(d)
             U.pump(app, 0.3)
