@@ -15,7 +15,8 @@ and makes sure it gets the RAM it needs to run at full speed.
 - Notices a Strata you started yourself and adopts it. Warns when Strata fell back to its slower Low-RAM (SSD) mode.
 - Lives in the system tray (X hides the window; the tray icon's dot shows the state, right-click for Turn on/off,
   Switch model and Quit), can start with Windows, finds your Strata folder on first start, tells you when a game
-  starts while Strata holds the RAM, and offers new versions from GitHub with one-click install.
+  starts while Strata holds the RAM and offers to turn Strata back on when it closes, keeps a local usage history,
+  and offers new versions from GitHub with one-click install.
 
 Requires Windows 10/11 x64 and a Strata install. Not affiliated with the Strata project.
 
@@ -67,8 +68,11 @@ for a memory-hungry app (the two rules above), it watches for that game or app t
 it has been gone for about 10 seconds, so a game that restarts through its launcher does not count; the watch gives
 up after 6 hours. *Ask me* shows a toast *ELDEN RING closed* with a **Turn on Strata** button (it works for 30 min).
 *Turn Strata back on* starts Strata by itself, without the start dialog: nothing is closed, so Strata may load in
-Low-RAM mode if other apps hold the memory. *Do nothing* switches it off. Turning Strata on yourself ends the watch.
-It only observes: it never closes anything. The timings are `resume_*` keys in `config.json`.
+Low-RAM mode if other apps hold the memory. It asks instead (as *Ask me* does) when the same game or app already
+got an automatic turn-on in the last 30 minutes, so a game that keeps restarting cannot load and unload the model
+in a loop, and when a *Reopen* offer is still waiting, because a start would discard it. *Do nothing* switches it
+off. Turning Strata on yourself ends the watch. A game that cancelled a Strata that was still loading is watched
+the same way. It only observes: it never closes anything. The timings are `resume_*` keys in `config.json`.
 
 **Updates:** once a day the app asks GitHub for the latest release (one small request, no data about you). When a
 newer version exists, the idle line says *Update to x.y.z available · click to install*. Click → confirm → it
@@ -131,8 +135,9 @@ script); the Settings dialog and the log show the same number.
   time served), a bar per day of generated tokens, and a table per day and per model (requests, prompt tokens,
   generated tokens, average speed, time served). It is kept in `usage.json` in the data folder, on this PC only;
   nothing is sent anywhere. History starts with the first request after 1.10 is installed, and days older than 400
-  days are dropped. The average speed is weighted by tokens and leaves out very short answers. Prompt tokens count
-  each request's full prompt, so agent turns that re-send the same context count it every time.
+  days are dropped. The average speed is weighted by tokens and leaves out very short answers. Prompt tokens are
+  the tokens Strata actually read: the part of a prompt it still had cached (an agent re-sends its whole context
+  every turn) is not counted again.
 - **Switches** (apply at once): *Reopen closed apps after Turn off* (same as the start dialog's checkbox; off = the
   closed apps are offered as one click instead), *Keep running in the tray*, *Start with Windows*, *When a game
   starts*, *When memory runs low*, *When that app closes*, *Check for updates daily*.

@@ -141,6 +141,19 @@ def _count(*values: Any) -> int | None:
     return None
 
 
+def _prompt_read(req: dict[str, Any]) -> int | None:
+    """Prompt tokens the engine actually read for one request: `prompt_read`, else the whole prompt minus the
+    reused (cached) prefix - the same figure prompt_rate() uses. An agent re-sends its whole context every turn;
+    counting that in full would make the usage history's prompt total many times the work done."""
+    read = _count(req.get("prompt_read"))
+    if read is not None:
+        return read
+    total = _count(req.get("prompt_total"))
+    if total is None:
+        return None
+    return max(0, total - (_count(req.get("reused")) or 0))
+
+
 def strata_sample(doc: Any) -> MetricsSample | None:
     """One Strata GET /metrics JSON document -> MetricsSample (None for a non-dict). Pure; never raises on junk.
 
@@ -159,7 +172,7 @@ def strata_sample(doc: Any) -> MetricsSample | None:
             if key is None:
                 continue
             requests.append(RequestSample(key=key, time=_num(req.get("time")), decode_tps=decode_rate(req),
-                                          prompt_tps=prompt_rate(req), prompt_tokens=_count(req.get("prompt_total")),
+                                          prompt_tps=prompt_rate(req), prompt_tokens=_prompt_read(req),
                                           generated_tokens=_count(req.get("engine_generated"),
                                                                   req.get("output_tokens"))))
     hw = doc.get("hardware")

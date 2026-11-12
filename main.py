@@ -110,6 +110,7 @@ def action_labels(engine_name: str) -> dict[str, str]:
 RESUME_ACTIONS = ("ask", "on", "none")   # Settings "When that app closes": ask / turn the engine back on / nothing
 RESUME_ALERT_VALID_S = 1800.0            # the "Turn on" button of the "closed" toast works this long
 RESUME_TARGETS_MAX = 8                   # remembered causes (game / app) of this session's alerts
+RESUME_AUTO_GAP_S = 1800.0               # one automatic turn-on per app in this time; a repeat asks instead
 
 
 def resume_labels(engine_name: str) -> dict[str, str]:
@@ -122,6 +123,7 @@ TOOL_WAIT_S = 600.0                      # after a request that ended in a tool 
                                          # result; "when it's done" waits up to this long for that next request
 SWITCH_GLYPH = "\uE8AB"                  # Segoe Fluent Icons "Switch"
 USAGE_FLUSH_S = 60.0                     # usage history: serving time is added and the file saved this often
+USAGE_RETRY_S = 30.0                     # ...and while idle a save that failed is retried this often
 LIVE_POLL_S = 1.0                        # /metrics poll while serving (model state on the status line), as Strata's
                                          # own Monitor; stopped while the window is minimised
 ACT_BAR_X = 22                           # activity bar under the status line: starts at the state text...
@@ -405,6 +407,7 @@ class AgentStartApp(ctk.CTk):
             log.exception("usage history unavailable")
         self._metrics_fails = 0
         self._metrics_epoch = 0                  # bumped per start: a late poll of the old server is dropped
+        self._served_epoch = 0
         self.vram = vram_sampler if vram_sampler is not None else VramSampler()
         self._spans: list[list[float | None]] = []   # [start, end|None] (monotonic) while Strata was running
         self._avail_at_launch: float | None = None
@@ -451,6 +454,9 @@ class AgentStartApp(ctk.CTk):
         self._resume_alert: tuple[float, str] | None = None  # (monotonic, title) of the last "closed" toast
         self._backend_pending: str | None = None  # engine chosen in Settings, used after a restart
         self._cancel_game: str | None = None      # the game a still-loading start was cancelled for
+        self._resume_auto_at: dict[str, float] = {}   # title -> monotonic time of its automatic turn-on
+        self._served_acc = 0.0                    # serving seconds not yet in the usage history (metrics worker)
+        self._served_model: str | None = None
         self._mem_armed = False
         self._mem_queued: tuple[str, float] | None = None   # reported while a dialog / box was open
         self._no_tray = not extras or not self._tray_pref
@@ -1410,8 +1416,8 @@ class AgentStartApp(ctk.CTk):
         last_poll = 0.0
         last_epoch = None
         poller = None
-        served_acc, served_last = 0.0, None      # serving time for the usage history, added once a minute
-        served_model = None
+        served_last = None                       # serving time for the usage history, added once a minute
+        usage_retry = 0.0                        # an unwritable usage file is retried this often, not every poll
         while not self._stop_evt.is_set():
             try:
                 # Every LIVE_POLL_S while serving: the status line shows what the model is doing (reading /
@@ -1440,31 +1446,42 @@ class AgentStartApp(ctk.CTk):
                     last_poll, last_epoch = now, epoch
                     usage = self.usage
                     if usage is not None:
+                        if epoch != self._served_epoch:  # another server run: its model is not the last one's
+                            self._flush_served(usage)
+                            self._served_epoch, self._served_model = epoch, None
                         if sample is not None:
                             usage.record(sample, now=time.time())
+                            if sample.model:             # the same name the requests are counted under
+                                self._served_model = sample.model
                         if self.state_name == ACTIVE and self.loaded is not False:
                             if served_last is not None:      # capped: sleep / hibernation is not serving time
-                                served_acc += min(max(0.0, now - served_last), 5.0)
+                                self._served_acc += min(max(0.0, now - served_last), 5.0)
                             served_last = now
-                            served_model = self.model_id or served_model
                         else:
                             served_last = None
-                        if served_acc >= USAGE_FLUSH_S:
-                            usage.add_served(served_model, served_acc, now=time.time())
-                            served_acc = 0.0
+                        if self._served_acc >= USAGE_FLUSH_S:
+                            self._flush_served(usage)
                             usage.flush()
+                            usage_retry = now
                     self.post(self._apply_metrics, epoch, sample)
                 else:
                     served_last = None
                     usage = self.usage
-                    if usage is not None and (served_acc > 0 or usage.dirty):
-                        if served_acc > 0:
-                            usage.add_served(served_model, served_acc, now=time.time())
-                            served_acc = 0.0
+                    mono = time.monotonic()
+                    if usage is not None and (self._served_acc > 0 or usage.dirty) \
+                            and mono - usage_retry >= USAGE_RETRY_S:
+                        usage_retry = mono
+                        self._flush_served(usage)
                         usage.flush()
             except Exception:  # noqa: BLE001
                 log.debug("metrics poll failed", exc_info=True)
             self._stop_evt.wait(LIVE_POLL_S)
+
+    def _flush_served(self, usage: Any) -> None:
+        """Move the serving seconds collected so far into the usage history (metrics worker; destroy())."""
+        acc, self._served_acc = self._served_acc, 0.0
+        if acc > 0:
+            usage.add_served(self._served_model or self.model_id, acc, now=time.time())
 
     def _apply_metrics(self, epoch: int, sample: MetricsSample | None) -> None:
         if epoch != self._metrics_epoch or self.state_name not in (ACTIVE, STOPPING):
@@ -1935,8 +1952,6 @@ class AgentStartApp(ctk.CTk):
         self._metrics_epoch += 1                 # a new server: its request history starts empty
         self._metrics_fails = 0
         self.metrics.reset()
-        if self.usage is not None:               # a new server run may reuse request ids
-            self.usage.begin_session()
         try:
             self._avail_at_launch = psutil.virtual_memory().available / 1048576.0
         except Exception:  # noqa: BLE001
@@ -2482,8 +2497,11 @@ class AgentStartApp(ctk.CTk):
         The game rides in the pending action, so nothing of it outlives that action."""
         if self.state_name != ACTIVE:
             return
-        if self._game_blocked():
-            self._game_queued = (title, 0.0)     # retried from the tick once the dialog / box / update is gone
+        if self._game_blocked():                 # retried from the tick once the dialog / box / update is gone
+            if reason == "memory":
+                self._mem_queued = (title, 0.0)  # ...under its own setting, not the game one
+            else:
+                self._game_queued = (title, 0.0)
             return
         if self._stop_pending is not None:
             if self._stop_pending == ("off", None):
@@ -2698,11 +2716,26 @@ class AgentStartApp(ctk.CTk):
         title = str(getattr(target, "title", "") or "The app")
         name = self.engine.name
         log.info("%s closed (%.0f s ago); when that app closes: %s", title, closed_for_s, self._resume_action)
-        if self._resume_action == "on" and not self._game_blocked():
-            self._run_worker("hc-toast", _toast_worker, f"{name} is starting",
-                             f"{_short(title, 40)} closed, so {name} is turning back on. No apps were closed for it.")
+        now = time.monotonic()
+        last_auto = self._resume_auto_at.get(title)
+        repeat = last_auto is not None and now - last_auto < RESUME_AUTO_GAP_S
+        # Automatic only when nothing else needs the user: no dialog / box / update, no "Reopen" offer waiting (a
+        # start would discard it unseen), the engine is set up, and this app did not already get one automatic
+        # turn-on a moment ago (a game that keeps restarting must not load and unload the model in a loop).
+        if self._resume_action == "on" and not self._game_blocked() and not self._reopen_offer and not repeat \
+                and (self.engine.is_configured(self.cfg) or self._pending_launcher is not None):
+            self._resume_auto_at.pop(title, None)
+            self._resume_auto_at[title] = now
+            while len(self._resume_auto_at) > RESUME_TARGETS_MAX:
+                self._resume_auto_at.pop(next(iter(self._resume_auto_at)))
             self.turn_on(skip_sweep=True)
-            return
+            if self.state_name == STARTING:
+                self._run_worker("hc-toast", _toast_worker, f"{name} is starting",
+                                 f"{_short(title, 40)} closed, so {name} is turning back on. "
+                                 "No apps were closed for it.")
+                return
+        if repeat:
+            log.info("%s closed again soon after an automatic turn-on: asking instead", title)
         self._resume_alert = (time.monotonic(), title)
         buttons = [(f"Turn on {name}", f"{PROTOCOL}://resume-on")] if config_store.FROZEN and _protocol_registered() \
             else []
@@ -3021,6 +3054,7 @@ class AgentStartApp(ctk.CTk):
                 log.debug("resume watcher stop failed", exc_info=True)
         if self.usage is not None:               # the metrics worker is a daemon: it may not get another turn
             try:
+                self._flush_served(self.usage)
                 self.usage.flush()
             except Exception:  # noqa: BLE001
                 log.debug("usage history flush failed", exc_info=True)

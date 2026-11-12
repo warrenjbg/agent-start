@@ -501,7 +501,8 @@ def test_usage() -> None:
         fm.add(5)
         for i, r in enumerate(fm.requests):
             r["time"] = now - 120 + i
-        want_prompt = sum(int(r["prompt_total"]) for r in fm.requests)
+        import metrics_store
+        want_prompt = sum(metrics_store._prompt_read(r) or 0 for r in fm.requests)   # tokens actually read
         check(pump_until(app, lambda: u.totals().total.requests == base.requests + 5, 4),
               f"5 finished requests recorded ({u.totals().total.requests - base.requests})")
         pump(app, 6 * main.LIVE_POLL_S + 0.5)        # the same requests come back in every poll
@@ -509,14 +510,14 @@ def test_usage() -> None:
         check(tot.requests == base.requests + 5, f"repeated polls count them once ({tot.requests - base.requests})")
         check(tot.prompt_tokens == base.prompt_tokens + want_prompt,
               f"prompt tokens counted ({tot.prompt_tokens - base.prompt_tokens} of {want_prompt})")
-        # the app's own launch begins a new session
+        # the app's own launch keeps what is counted (it may adopt a server whose requests are already in)
         ok = _stop_runs(app, ep, lambda: H.click_main_button(app))
         check(ok and app.state_name == "IDLE", "stopped")
         det.cands = []                               # no close-apps dialog
         n = len(ep.start_calls)
         app.turn_on()
         check(pump_until(app, lambda: len(ep.start_calls) > n, 3), "engine start requested")
-        check(len(begins) == 1, f"a new engine start begins a usage session ({len(begins)})")
+        check(not begins, f"a new engine start does not forget the counted requests ({len(begins)})")
     finally:
         close(app)
     check(usage_file.exists(), "usage.json written on exit")
@@ -621,6 +622,90 @@ def test_resume_after_cancelled_load() -> None:
         close(app)
 
 
+def test_v110_review() -> None:
+    """Independent review of the 1.10 round: when the automatic turn-on must NOT happen, and what is counted."""
+    import resume_watch
+    # a memory report's target holds every process of the app: a launcher root that exits is not "closed"
+    rep = _mem_report("Blender")
+    import dataclasses
+    rep = dataclasses.replace(rep, member_count=3,
+                              members=frozenset({(70100, 1_731_370_500.0), (70101, 1_731_370_501.0),
+                                                 (70102, 1_731_370_502.0)}))
+    t = resume_watch.target_for_app(rep)
+    check(len(t.members) == 3, f"memory target keeps all of the app's processes ({sorted(t.members)})")
+    child_only = [{"pid": 70102, "name": "worker.exe", "exe": r"C:\Apps\Blender\worker.exe", "create_time": 1_731_370_502.0}]
+    check(resume_watch.is_running(t, child_only, []), "root gone, a child still running: the app is still running")
+    check(not resume_watch.is_running(t, [{"pid": 5, "name": "x.exe", "exe": r"C:\x.exe", "create_time": 1.0}], []),
+          "all of them gone: closed")
+
+    app, det, ep = U.new_app()
+    try:
+        _fake_resume(app)
+        name = app.engine.name
+        det.cands = []
+        app.set_resume_action("on")
+        # 1. the first automatic turn-on for an app starts the engine ...
+        TOASTS.clear()
+        n = len(ep.start_calls)
+        app._on_resume_closed(_target("Fortnite"), 12.0)
+        check(pump_until(app, lambda: len(ep.start_calls) > n, 3) and app.state_name == "STARTING",
+              "first close: the engine starts by itself")
+        check(pump_until(app, lambda: any(t_[0] == f"{name} is starting" for t_ in TOASTS), 3), "with its toast")
+        # ... the game comes back and cancels that load; when it closes again the app asks instead (no loop)
+        app._start_token += 1
+        app._start_phase = None
+        app._set_state("IDLE")
+        TOASTS.clear()
+        n = len(ep.start_calls)
+        app._on_resume_closed(_target("Fortnite"), 12.0)
+        pump_until(app, lambda: TOASTS, 3)
+        check(len(ep.start_calls) == n and app.state_name == "IDLE", "closes again soon after: nothing starts")
+        check(bool(TOASTS) and TOASTS[-1][0] == "Fortnite closed" and app._resume_alert is not None,
+              f"...it asks instead ({TOASTS[-1:]})")
+        # another app is not affected by Fortnite's turn; after the gap Fortnite is automatic again
+        app._resume_auto_at["Fortnite"] = time.monotonic() - main.RESUME_AUTO_GAP_S - 1
+        n = len(ep.start_calls)
+        app._on_resume_closed(_target("Fortnite"), 12.0)
+        check(pump_until(app, lambda: len(ep.start_calls) > n, 3), "after the gap it is automatic again")
+        app._start_token += 1
+        app._start_phase = None
+        app._set_state("IDLE")
+        # 2. a waiting "Reopen" offer is never discarded by an automatic start
+        app._reopen_offer = [{"name": "Editor"}]
+        TOASTS.clear()
+        n = len(ep.start_calls)
+        app._on_resume_closed(_target("Hades"), 12.0)
+        pump_until(app, lambda: TOASTS, 3)
+        check(len(ep.start_calls) == n and app.state_name == "IDLE" and app._reopen_offer == [{"name": "Editor"}],
+              "a Reopen offer is waiting: nothing starts, the offer stays")
+        check(bool(TOASTS) and TOASTS[-1][0] == "Hades closed", "...it asks instead")
+        app._reopen_offer = []
+        # 3. a memory stop that had to wait for a dialog keeps its own setting
+        app._game_queued, app._mem_queued = None, None
+        app.state_name = "ACTIVE"
+        real_blocked = app._game_blocked
+        app._game_blocked = lambda: True
+        try:
+            app._stop_for_game("Blender", reason="memory")
+            check(app._mem_queued == ("Blender", 0.0) and app._game_queued is None,
+                  "a blocked memory stop waits under the memory setting")
+            app._mem_queued = None
+            app._stop_for_game("Doom")
+            check(app._game_queued == ("Doom", 0.0) and app._mem_queued is None, "a blocked game stop under the game one")
+        finally:
+            app._game_blocked = real_blocked
+            app._game_queued, app._mem_queued = None, None
+            app.state_name = "IDLE"
+        # 4. serving time collected but not yet saved is added when the app closes
+        u = app.usage
+        before = u.totals().total.served_s
+        app._served_acc, app._served_model = 42.0, "model-x"
+    finally:
+        close(app)
+    check(abs(u.totals().total.served_s - before - 42.0) < 1e-6, "the unsaved serving time is added on exit")
+    check(any(m.model == "model-x" for m in u.totals().models), "...under the model the requests name")
+
+
 def test_engine_picker() -> None:
     engines.available()                              # discovery done before the fake is added
     check(engines.choices() == [("strata", "Strata")], f"only Strata ({engines.choices()})")
@@ -716,7 +801,7 @@ def run() -> int:
     real_toast = main._toast_worker
     main._toast_worker = _fake_toast             # never show real Windows toasts from the tests
     try:
-        for fn in (test_resume, test_resume_after_cancelled_load, test_usage, test_engine_picker):
+        for fn in (test_resume, test_resume_after_cancelled_load, test_usage, test_v110_review, test_engine_picker):
             gc.collect()
             print(f"-- {fn.__name__}", flush=True)
             try:

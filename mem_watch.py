@@ -162,6 +162,7 @@ class MemReport:
     app_threshold_mb: float
     sustained_s: float
     reason: str = "pressure"     # "pressure" | "evicted"
+    members: frozenset[AppKey] = frozenset()   # (pid, create_time) of every process of the app at report time
     strata_mb: float | None = None       # evicted: Strata's RAM now ...
     strata_peak_mb: float | None = None  # ... and its peak since it was ready
 
@@ -277,7 +278,8 @@ def decide(state: MemState, apps: Iterable[AppView], now: float, avail_mb: float
         if held + 1e-6 >= cfg.sustain_s:
             reports.append(MemReport(
                 name=a.name, title=a.title, pid=a.pid, create_time=a.create_time, exe=a.exe,
-                ram_mb=round(a.ram_mb, 1), member_count=len(a.members), avail_mb=round(float(avail_mb), 1),
+                ram_mb=round(a.ram_mb, 1), member_count=len(a.members), members=frozenset(a.members),
+                avail_mb=round(float(avail_mb), 1),
                 avail_eff_mb=round(eff, 1), floor_mb=round(flo, 1), baseline_avail_mb=round(st.baseline_avail_mb, 1),
                 app_threshold_mb=cfg.app_mb, sustained_s=round(held, 1)))
             st.reported.add(a.key)
@@ -324,7 +326,8 @@ def _decide_evicted(st: MemState, apps: list[AppView], now: float, avail_mb: flo
     st.last_seen.pop(a.key, None)
     return [MemReport(
         name=a.name, title=a.title, pid=a.pid, create_time=a.create_time, exe=a.exe, ram_mb=round(a.ram_mb, 1),
-        member_count=len(a.members), avail_mb=round(avail_mb, 1), avail_eff_mb=round(avail_mb, 1), floor_mb=0.0,
+        member_count=len(a.members), members=frozenset(a.members), avail_mb=round(avail_mb, 1),
+        avail_eff_mb=round(avail_mb, 1), floor_mb=0.0,
         baseline_avail_mb=round(base_avail, 1), app_threshold_mb=cfg.evict_app_mb, sustained_s=round(held, 1),
         reason="evicted", strata_mb=round(cur, 1), strata_peak_mb=round(peak, 1))]
 

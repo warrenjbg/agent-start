@@ -639,6 +639,7 @@ class SettingsDialog(ctk.CTkToplevel):
             child = None
         if child is None:
             self._msg.configure(text="Usage history is not available", text_color=T.TEXT_2)
+            later(self, 50, self._regrab)        # the grab was released for a child that never came
             return
         self._child = child
         child.bind("<Destroy>", self._on_child_destroy, add="+")

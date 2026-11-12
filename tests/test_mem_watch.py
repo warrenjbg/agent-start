@@ -217,6 +217,8 @@ def test_decide() -> None:
               (r.name, r.title, r.pid, r.ram_mb, r.avail_mb, round(r.floor_mb), r.baseline_avail_mb, r.sustained_s)
               == ("Blender.exe", "Blender", 100, 6000.0, 3000.0, 3932, 8000.0, 15.0), str(r))
         check("why() names both measured values", "6000 MB" in r.why() and "3000 MB" in r.why(), r.why())
+        check("the report carries every process of the app (so 'closed' can mean all of them are gone)",
+              r.members == av().members and len(r.members) == r.member_count, str(r.members))
     got, _ = dseries(st, [av()], 6000, NOW, NOW + 60)
     check("big app, plenty available (above the floor) -> never", got == [])
     got, _ = dseries(st, [av(mb=4000)], 1000, NOW, NOW + 60)
