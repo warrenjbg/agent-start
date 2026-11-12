@@ -1,0 +1,85 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  .row{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}
+  .col{display:flex;flex-direction:column;gap:8px;width:360px}
+  .cap{font-size:13px;color:var(--foreground);font-weight:600}
+  .sub{font-size:12px;color:var(--muted-foreground);line-height:1.4}
+  .win{width:360px;background:#141415;border-radius:8px;border:1px solid #2C2C30;font-family:"Segoe UI Variable Text","Segoe UI",sans-serif;color:#EDEDEB;box-sizing:border-box;padding:14px 16px 16px}
+  .mono{font-family:"Cascadia Mono",Consolas,monospace}
+  .top{display:flex;align-items:center;height:28px;border-radius:8px;margin:0 -6px;padding:0 6px}
+  .top.hover{background:#1C1C1E}
+  .led{width:8px;height:8px;border-radius:4px;margin-right:8px;flex:none}
+  .title{font-weight:600;font-size:15px}
+  .model{color:#A1A1A6;font-size:12px;margin-left:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .caret{color:#6E6E73;font-size:10px;margin-left:6px}
+  .timer{margin-left:auto;font-size:12px;color:#A1A1A6}
+  .gear{margin-left:auto;width:28px;height:28px;display:flex;align-items:center;justify-content:center;color:#A1A1A6;font-size:15px}
+  .timer + .gear{margin-left:4px}
+  /* Revealed line: 10 px from the status text above, 10 px to whatever follows (button or progress bar). */
+  .detail{font-size:12px;color:#A1A1A6;line-height:16px;padding:6px 0 0 16px}
+  .detail + .btn{margin-top:10px}
+  .detail + .bar{margin-top:10px}
+  .amber{color:#E0A33A}.red{color:#F2A7A9}
+  .bar{height:4px;border-radius:2px;background:#1C1C1E;margin-top:8px;overflow:hidden}
+  .bar i{display:block;height:4px;background:#3CC77E}
+  .btn{height:56px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:16px;width:180px;margin:12px auto 0}
+  .on{background:#EDEDEB;color:#141415}.off{background:#26262A;color:#EDEDEB}
+  .card{background:#1C1C1E;border-radius:12px;padding:10px 12px;margin-top:14px}
+  .gauge{height:8px;border-radius:4px;background:#26262A;display:flex;overflow:hidden;margin:6px 0 8px}
+  .leg{display:flex;gap:14px;font-size:11px;color:#A1A1A6}
+  .sw{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px}
+</style></head><body>
+<div class="row">
+
+<div class="col"><div class="cap">1 · Serving, detail hidden (default)</div>
+<div class="win">
+  <div class="top"><div class="led" style="background:#3CC77E"></div><div class="title">Serving</div><div class="model">swift-1.5-iq3_s</div><div class="caret">▾</div><div class="gear">⚙</div></div>
+  <div class="btn off">Turn off</div>
+  <div class="card"><div class="detail" style="padding:0">Memory · 64 GB</div>
+    <div class="gauge"><div style="width:22%;background:#55555B"></div><div style="width:76%;background:#3CC77E"></div></div>
+    <div class="leg mono"><span><i class="sw" style="background:#55555B"></i>Apps 14.2 GB</span><span><i class="sw" style="background:#3CC77E"></i>Strata ~48.9 GB</span><span>Free 0.6 GB</span></div></div>
+</div>
+<div class="sub">≈216 px tall, 52 px less than now. The caret marks the status line as clickable, and it gets a soft highlight on hover.</div></div>
+
+<div class="col"><div class="cap">2 · After clicking the status line</div>
+<div class="win">
+  <div class="top"><div class="led" style="background:#3CC77E"></div><div class="title">Serving</div><div class="model">swift-1.5-iq3_s</div><div class="caret">▴</div><div class="gear">⚙</div></div>
+  <div class="detail">127.0.0.1:8080/v1 · up 12 min</div>
+  <div class="btn off">Turn off</div>
+  <div class="card"><div class="detail" style="padding:0">Memory · 64 GB</div>
+    <div class="gauge"><div style="width:22%;background:#55555B"></div><div style="width:76%;background:#3CC77E"></div></div>
+    <div class="leg mono"><span><i class="sw" style="background:#55555B"></i>Apps 14.2 GB</span><span><i class="sw" style="background:#3CC77E"></i>Strata ~48.9 GB</span><span>Free 0.6 GB</span></div></div>
+</div>
+<div class="sub">One line slides in (+18 px). Clicking again hides it. The choice is remembered, like the stats chevron.</div></div>
+
+<div class="col"><div class="cap">3 · Idle, detail hidden</div>
+<div class="win">
+  <div class="top"><div class="led" style="background:#6E6E73"></div><div class="title">Idle</div><div class="model">2 apps to close · 6.8 GB</div><div class="caret">▾</div><div class="gear">⚙</div></div>
+  <div class="btn on">Turn on</div>
+</div>
+<div class="sub">Idle puts the short summary on the status line. Clicking reveals which apps (eldenring, chrome).</div></div>
+
+<div class="col"><div class="cap">4 · Starting: shows by itself</div>
+<div class="win">
+  <div class="top"><div class="led" style="background:#E0A33A"></div><div class="title">Starting</div><div class="model">Loading experts</div><div class="timer mono">0:22</div><div class="gear">⚙</div></div>
+  <div class="detail">about 45 GB · usually 0:58</div>
+  <div class="bar"><i style="width:44%"></i></div>
+  <div class="btn off">Cancel</div>
+</div>
+<div class="sub">While loading, the phase and progress bar always show, then tuck away once it's serving.</div></div>
+
+<div class="col"><div class="cap">5 · Warnings and errors: always shown</div>
+<div class="win">
+  <div class="top"><div class="led" style="background:#E0A33A"></div><div class="title">Serving</div><div class="model amber">Low-RAM mode</div><div class="gear">⚙</div></div>
+  <div class="detail amber">Reading from SSD (slower) · ~7.3 GB short</div>
+  <div class="btn off">Turn off</div>
+</div>
+<div class="win" style="margin-top:6px">
+  <div class="top"><div class="led" style="background:#E5484D"></div><div class="title">Error</div><div class="model red">Strata exited (code 1)</div><div class="gear">⚙</div></div>
+  <div class="detail red" style="text-decoration:underline">Open strata-20261112-083608.log</div>
+  <div class="btn on">Turn on</div>
+</div>
+<div class="sub">Anything you must act on can't be hidden: low-RAM, errors, "Could not close…", "applies next start".</div></div>
+
+</div></body></html>

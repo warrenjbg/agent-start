@@ -31,7 +31,8 @@ RESULTS: list[tuple[str, bool, str]] = []
 MB = 1024 * 1024
 CREATE_NO_WINDOW = 0x08000000
 SWEEP_KEYS = {"closed_apps", "ram_freed_mb", "vram_freed_mb", "failed", "dry_run", "candidates",
-              "preselected", "preselected_ram_mb", "preselected_vram_mb", "names", "preselected_names"}
+              "preselected", "preselected_ram_mb", "preselected_vram_mb", "names", "preselected_names",
+              "launch_records"}
 
 
 def check(name: str, cond: bool, detail: str = "") -> bool:
@@ -535,8 +536,158 @@ def test_candidates_and_gpu() -> None:
         d.close()
 
 
+# ----------------------------------------------------------------------------------------- 7. launch records
+
+class AppsSeamDetector(ProcessDetector):
+    """_scan_apps returns exactly the given Apps (built only from processes this test spawned)."""
+
+    def __init__(self, apps: list[App]) -> None:
+        super().__init__(config_store.load_config())
+        self._apps = apps
+
+    def _scan_apps(self) -> list[App]:
+        return list(self._apps)
+
+
+LR_KEYS = {"name", "exe", "cmdline", "cwd", "category", "create_time", "elevated", "aumid"}
+
+
+def _spawn_tree(tmpdir: Path, marker: str) -> tuple[subprocess.Popen, psutil.Process, list[psutil.Process]]:
+    """venv python parent.py (spawns a child python) -> root + all descendants (conhost excluded)."""
+    script = tmpdir / "parent.py"
+    script.write_text("import subprocess, sys, time\n"
+                      f"subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)', {marker!r}])\n"
+                      "time.sleep(120)\n", encoding="utf-8")
+    p = subprocess.Popen([sys.executable, str(script), marker], cwd=str(tmpdir), creationflags=CREATE_NO_WINDOW)
+    root = psutil.Process(p.pid)
+    deadline = time.time() + 6
+    kids: list[psutil.Process] = []
+    while time.time() < deadline:
+        kids = [c for c in root.children(recursive=True) if norm(c.name()) != "conhost"]
+        if sum(1 for c in kids if any(marker in a for a in c.cmdline())) >= 2:   # parent interp + child
+            break
+        time.sleep(0.1)
+    return p, root, [root] + kids
+
+
+def _seam_app(root: psutil.Process, members: list[psutil.Process], category: str = "window") -> App:
+    return App(root=root, create_time=root.create_time(), members=list(members), hwnds=[], pid=root.pid,
+               name=root.name(), exe=root.exe(), ram_mb=1.0, vram_mb=0.0, reason="test tree", category=category,
+               preselect=False, member_count=len(members), member_pids=[m.pid for m in members])
+
+
+def _kill_marked(marker: str) -> None:
+    me = os.getpid()
+    procs = [p for p in psutil.process_iter(["cmdline"], ad_value=None)
+             if p.pid != me and any(marker in str(c) for c in (p.info["cmdline"] or []))]
+    for p in procs:
+        try:
+            p.kill()
+        except psutil.Error:
+            pass
+    psutil.wait_procs(procs, timeout=5)
+
+
+def test_launch_records() -> None:
+    section("7. launch records captured by a real sweep (own dummy tree only)")
+    marker = f"hc-lr-test-{os.getpid()}-{int(time.time())}"
+    tmpdir = Path(tempfile.mkdtemp(prefix=marker + "-"))
+    popens: list[subprocess.Popen] = []
+    try:
+        p1, root, members = _spawn_tree(tmpdir, marker)
+        popens.append(p1)
+        print(f"  dummy tree: {[(m.pid, m.name()) for m in members]}")
+        check("dummy tree has root + >= 2 descendants", len(members) >= 3, str(len(members)))
+        want_exe, want_cmd, want_ct = root.exe(), root.cmdline(), root.create_time()
+        app = _seam_app(root, members)
+
+        t = time.perf_counter()
+        rec = detector.capture_launch_record(app)
+        ms = (time.perf_counter() - t) * 1000
+        print(f"  capture_launch_record: {ms:.1f} ms -> {rec}")
+        check("capture < 50 ms", ms < 50, f"{ms:.1f} ms")
+        check("capture keys", rec is not None and set(rec) == LR_KEYS, str(rec))
+
+        det = AppsSeamDetector([app])
+        try:
+            dr = det.sweep_processes(dry_run=True, targets=[(root.pid, want_ct)])
+            check("dry_run: launch_records == [] and nothing killed",
+                  dr["launch_records"] == [] and dr["names"] == [app.name] and all(m.is_running() for m in members),
+                  str(dr))
+            dr = det.sweep_processes(dry_run=False, targets=[(root.pid, want_ct + 5.0)])
+            check("non-matching target: launch_records == []", dr["launch_records"] == [] and root.is_running())
+            r = det.sweep_processes(dry_run=False, targets=[(root.pid, want_ct)])
+            print(f"  sweep result: closed={r['closed_apps']} failed={r['failed']} records={r['launch_records']}")
+            check("sweep closed the dummy app", r["closed_apps"] == [app.name] and not r["failed"], str(r))
+            check("all dummy members gone", not any(m.is_running() for m in members))
+            lr = r["launch_records"]
+            check("exactly one launch record (the ROOT, not its children)", len(lr) == 1, str(lr))
+            if lr:
+                x = lr[0]
+                check("record keys exact", set(x) == LR_KEYS, str(sorted(x)))
+                check("record exe = root exe (absolute)", os.path.normcase(x["exe"]) == os.path.normcase(want_exe)
+                      and os.path.isabs(x["exe"]), x["exe"])
+                check("record cmdline = root cmdline", x["cmdline"] == want_cmd, str(x["cmdline"]))
+                check("record cwd = spawn cwd", os.path.normcase(x["cwd"].rstrip("\\"))
+                      == os.path.normcase(str(tmpdir)), x["cwd"])
+                check("record elevated False, aumid None", x["elevated"] is False and x["aumid"] is None, str(x))
+                check("record name/category/create_time", x["name"] == app.name and x["category"] == "window"
+                      and abs(x["create_time"] - want_ct) < 0.01)
+        finally:
+            det.close()
+
+        # an app that is NOT closed (empty kill set -> root survives) must get no record
+        p2, root2, members2 = _spawn_tree(tmpdir, marker)
+        popens.append(p2)
+        app2 = _seam_app(root2, [], category="game")
+        det2 = AppsSeamDetector([app2])
+        try:
+            r = det2.sweep_processes(dry_run=False, targets=[(root2.pid, root2.create_time())])
+            check("failed app: listed in failed, no launch record",
+                  r["failed"] and r["launch_records"] == [] and r["closed_apps"] == [] and root2.is_running(), str(r))
+        finally:
+            det2.close()
+        _kill_marked(marker)
+        check("capture on a dead root -> None", detector.capture_launch_record(app2) is None)
+        check("capture on App with no root/members -> None",
+              detector.capture_launch_record(App(root=None, create_time=0.0)) is None)
+        rootless = App(root=None, create_time=0.0, members=[])
+        check("_group_root(no members) -> None", detector._group_root(rootless) is None)
+
+        # read-only probes of real processes (nothing is closed): protected process -> elevated True;
+        # a packaged (WindowsApps) process -> AUMID string, when one happens to be running
+        prot = next((p for p in psutil.process_iter(["name"]) if norm(p.info["name"]) in ("lsass", "services")), None)
+        if prot is not None:
+            pr = detector.capture_launch_record(App(root=prot, create_time=prot.create_time(), name=prot.name()))
+            check("protected system process reads as elevated=True", pr is not None and pr["elevated"] is True,
+                  str(pr))
+        pkg = None
+        my_sid = detector.session_id_of(os.getpid())
+        for p in psutil.process_iter(["exe"], ad_value=None):
+            if (p.info["exe"] and "\\program files\\windowsapps\\" in p.info["exe"].casefold()
+                    and detector.session_id_of(p.pid) == my_sid):     # session-0 packaged services are unreadable
+                pkg = p
+                break
+        if pkg is not None:
+            pr = detector.capture_launch_record(App(root=pkg, create_time=pkg.create_time(), name=pkg.name()))
+            print(f"  packaged probe: {pkg.name()} -> aumid={pr and pr['aumid']!r} elevated={pr and pr['elevated']}")
+            check("packaged process yields an AUMID ('...!...')", pr is not None and isinstance(pr["aumid"], str)
+                  and "!" in pr["aumid"], str(pr))
+        else:
+            print("  NOTE: no WindowsApps process running; real AUMID not exercised")
+    finally:
+        _kill_marked(marker)
+        for p in popens:
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
-    for fn in (test_synthetic, test_real_scan, test_real_kill, test_whitelist, test_candidates_and_gpu):
+    for fn in (test_synthetic, test_real_scan, test_real_kill, test_whitelist, test_candidates_and_gpu,
+               test_launch_records):
         try:
             fn()
         except Exception:

@@ -15,7 +15,7 @@ a = Analysis(
     # The rest are plain imports PyInstaller finds itself - listed so a refactor to lazy imports cannot drop them.
     hiddenimports=["detector", "server_manager", "win32timezone", "pynvml", "version", "launcher_bat",
                    "settings_dialog", "metrics_store", "vram_sampler", "graphs",
-                   "engine_log", "ram_plan"],
+                   "engine_log", "ram_plan", "reopen"],
     excludes=["PIL", "pytest", "unittest", "pydoc", "test", "lib2to3"],
     noarchive=False,
 )

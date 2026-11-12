@@ -23,6 +23,7 @@ import engine_log
 import launcher_bat
 import load_progress
 import ram_plan
+import reopen
 import metrics_store
 import theme as T
 from graphs import BarGraph, LineGraph, StatRow, fmt_rate
@@ -36,7 +37,9 @@ from whitelist_modal import WhitelistModal
 log = logging.getLogger("hermes_controller")
 
 APP_TITLE = "Hermes Controller"
-WIDTH, HEIGHT = 360, 268
+WIDTH, HEIGHT = 360, 213                 # compact: status line, button, memory card (detail line hidden)
+DETAIL_H = 18                            # added while the detail line shows (16 px line + spacing)
+PROGRESS_H = 14                          # added while the load progress bar shows
 STATS_H = 3 * 82 + 2                     # three StatRows + two hairlines (logical px)
 STATS_GAP = 8                            # between the memory card and the stats card when expanded
 HEIGHT_EXPANDED = HEIGHT + STATS_GAP + STATS_H
@@ -52,10 +55,20 @@ STATUS = {
     ERROR: ("Error", T.LED["ERROR"]),
 }
 LOADING_STATUS = ("Loading", T.LED["LOADING"])
-LOW_RAM_STATUS = ("Serving · Low-RAM mode", T.AMBER)   # Strata fell back to reading experts from the SSD
+LOW_RAM_STATUS = ("Serving", T.AMBER)   # Strata fell back to reading experts from the SSD (amber LED + summary)
 LOW_RAM_NOTE = "Not enough free RAM for full speed: will load slower"
 TOGGLE_DEBOUNCE_S = 0.4
+# Compact header (v1.1): status line + optional one-line detail. Spacing is measured from the rendered text so the
+# detail line sits 10 px from the status text above and 10 px from the button / progress bar below.
+DETAIL_INDENT = 32                       # window margin 16 + LED 8 + gap 8: the detail aligns with the state text
+DETAIL_WRAP = 360 - DETAIL_INDENT - 16
+GAP_HEAD_BUTTON = 12                     # status line -> button when no detail is shown
+GAP_DETAIL_TOP = 4                       # status row (28 px, title centred) -> detail line
+GAP_AFTER_DETAIL = 10                    # detail line -> button / progress bar
+CARD_TOP = 14                            # button -> memory card
 STATE_SAVE_DEBOUNCE_MS = 300
+REOPEN_STAGGER_S = 1.0                   # pause between two reopened apps
+DETAIL_POLL_S = 10.0                     # /metrics poll for the serving line's "last reply" when stats are closed
 # Kept for tests/back-compat: the LED colour per state.
 PILL_COLORS = {k: v[1] for k, v in STATUS.items()}
 LOADING_COLOR = LOADING_STATUS[1]
@@ -98,11 +111,12 @@ def format_preview(res: dict) -> str:
     n = int(res.get("candidates") or 0)
     m = int(res.get("preselected") or 0)
     if n == 0:
-        return "Nothing to close — memory is clear"
+        return "Nothing to close"
+    # line 1 sits on the status line (short); line 2 is the hidden detail (which apps)
     if m > 0:
-        line1 = f"{m} of {n} apps pre-selected to close · {_gb(res.get('preselected_ram_mb'))}"
+        line1 = f"{m} app{'s' if m != 1 else ''} to close · {_gb(res.get('preselected_ram_mb'))}"
     else:
-        line1 = f"{n} apps could be closed · {_gb(res.get('ram_freed_mb'))} if all ticked"
+        line1 = f"{n} app{'s' if n != 1 else ''} could close · {_gb(res.get('ram_freed_mb'))}"
     # name the apps the RAM figure refers to: the preselected set if any, else everything
     pool = res.get("preselected_names") if m > 0 and res.get("preselected_names") else res.get("names")
     names = [_short(str(x)) for x in (pool or [])]
@@ -115,6 +129,33 @@ def format_preview(res: dict) -> str:
     if len(names) > len(shown):
         line2 += f" +{len(names) - len(shown)} more"
     return f"{line1}\n{line2}" if line2 else line1
+
+
+def _save_reopen_records(records: list[dict]) -> None:
+    """Worker: add this sweep's apps to the pending list (dedupe by program, newest wins)."""
+    try:
+        merged: dict[str, Any] = {}
+        for r in list(reopen.load_pending()) + [reopen.LaunchRecord.from_dict(d) for d in records]:
+            key = os.path.normcase(r.exe or r.aumid or r.name)
+            merged[key] = r
+        reopen.save_pending(list(merged.values()))
+        log.info("reopen: %d app(s) will be reopened after Turn off", len(merged))
+    except Exception:  # noqa: BLE001
+        log.exception("saving reopen records failed")
+
+
+def _reopen_clicked(recs: list, post: Callable, done: Callable) -> None:
+    """Worker for the one-click offer: launch exactly these (games included - the user asked), then clear."""
+    results = []
+    for r in recs:
+        if results:
+            time.sleep(REOPEN_STAGGER_S)
+        results.append(reopen.reopen_one(r))
+    try:
+        reopen.clear_pending()
+    except Exception:  # noqa: BLE001
+        log.debug("clear_pending failed", exc_info=True)
+    post(done, results, [])
 
 
 def _build_real_deps(cfg: dict) -> tuple[Any, Any]:
@@ -191,7 +232,21 @@ class HermesControllerApp(ctk.CTk):
         # Written by worker threads as one atomic attribute swap, read on the Tk thread.
         self._engine_load: engine_log.EngineLoad | None = None
         self._toggle_at = 0.0                    # monotonic time of the last accepted ON/OFF click
-        self._state_save_id = None               # pending debounced state.json save (stats_expanded)
+        self._state_save_id = None               # pending debounced state.json save
+        self._state_pending: dict = {}           # keys waiting for that save
+        self.detail_open = bool(saved.get("detail_open"))   # user revealed the optional detail line
+        # Reopen swept apps after Turn off. Preference from the start dialog's checkbox (default on).
+        self._reopen_pref = bool(saved.get("reopen_after", True))
+        self._reopen_this = False                # this start's choice (read from the sweep dialog)
+        self._reopen_offer: list = []            # records offered as a one-click "Reopen …" line while idle
+        self._reopening = False
+        self._summary_text = ""
+        self._detail_text = ""
+        self._detail_color = T.TEXT_2
+        self._detail_link = False                # detail line is a clickable action (open log, reopen apps)
+        self._ready_mono: float | None = None    # when Strata became ready (uptime on the detail line)
+        self._layout_key: tuple | None = None
+        self._fit_h = 0
         self._engine_checked = False
         self._strata_est: float | None = None    # latched at ready: RAM Strata took (free-RAM drop)
         self._prog_best: tuple[str, float, str | None] = ("Launching", 0.0, None)
@@ -217,6 +272,7 @@ class HermesControllerApp(ctk.CTk):
         self.resizable(False, False)
         self.protocol("WM_DELETE_WINDOW", self.on_close_request)
         self._build_ui()
+        self._set_status("Checking what is running…")
         self._apply_state()
         self._update_telemetry()
         self._apply_expanded()
@@ -241,41 +297,56 @@ class HermesControllerApp(ctk.CTk):
         self.configure(fg_color=T.BG)
         self.grid_columnconfigure(0, weight=1)
 
-        top = ctk.CTkFrame(self, fg_color="transparent", height=28)
-        top.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 0))
-        top.grid_columnconfigure(1, weight=1)
+        # Status line: LED · state · short summary · caret … timer · gear. The status part (not the gear) is one
+        # click target that reveals the optional detail line; it is drawn on a frame that tints on hover.
+        top = ctk.CTkFrame(self, fg_color="transparent", height=28, corner_radius=8)
+        top.grid(row=0, column=0, sticky="ew", padx=(10, 12), pady=(14, 0))
+        top.grid_columnconfigure(2, weight=1)
+        self.head = top
         self.led = ctk.CTkFrame(top, width=8, height=8, corner_radius=4, fg_color=T.LED["IDLE"])
-        self.led.grid(row=0, column=0, padx=(0, 8))
+        self.led.grid(row=0, column=0, padx=(6, 8))
         self.pill = ctk.CTkLabel(top, text="Idle", font=self._font(15, "bold"), text_color=T.TEXT,
                                  anchor="w", height=20)
         self.pill.grid(row=0, column=1, sticky="w")
+        self._summary_font = self._font(12)
+        self.summary = ctk.CTkLabel(top, text="", font=self._summary_font, text_color=T.TEXT_2, anchor="w",
+                                    height=20)
+        self.summary.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self.caret = ctk.CTkLabel(top, text="", font=ctk.CTkFont(family=T.icon_family(), size=8),
+                                  text_color=T.TEXT_3, width=12, height=20)
+        self.caret.grid(row=0, column=3, padx=(4, 0))
         self.elapsed = ctk.CTkLabel(top, text="", font=self._mono(12), text_color=T.TEXT_2, height=20)
-        self.elapsed.grid(row=0, column=2, padx=(0, 4))
+        self.elapsed.grid(row=0, column=4, padx=(6, 4))
         self.gear = ctk.CTkButton(top, text=T.GEAR_GLYPH, width=28, height=28, corner_radius=8,
                                   font=ctk.CTkFont(family=T.icon_family(), size=14),
                                   fg_color="transparent", hover_color=T.RAISED, text_color=T.TEXT_2,
                                   text_color_disabled=T.HAIRLINE, command=self.open_settings)
-        self.gear.grid(row=0, column=3)
+        self.gear.grid(row=0, column=5)
+        for w in (top, self.led, self.pill, self.summary, self.caret, self.elapsed):
+            w.bind("<Button-1>", self._on_head_click)
+            w.bind("<Enter>", lambda _e: self._head_hover(True))
+            w.bind("<Leave>", lambda _e: self._head_hover(False))
 
-        self.preview = ctk.CTkLabel(self, text="Checking what is running…", font=self._font(12),
-                                    text_color=T.TEXT_2, anchor="nw", justify="left", wraplength=320,
-                                    height=36)
-        self.preview.grid(row=1, column=0, sticky="ew", padx=16, pady=(4, 0))
+        # The detail line: hidden unless the user opened it or the state needs it (loading, warnings, errors,
+        # notes). Indented to the state text (LED 8 + gap 8). Wraps to a second line only for long errors.
+        self._detail_font = self._font(12)
+        self._detail_link_font = ctk.CTkFont(family=T.ui_family(), size=12, underline=True)
+        self.preview = ctk.CTkLabel(self, text="", font=self._detail_font, text_color=T.TEXT_2, anchor="w",
+                                    justify="left", wraplength=DETAIL_WRAP, height=16)
         self.preview.bind("<Button-1>", self._on_preview_click)
 
-        # Progress is always gridded (no layout jump); idle it is drawn in the track colour = invisible.
-        self.progress = ctk.CTkProgressBar(self, height=4, corner_radius=2, fg_color=T.BG,
-                                           progress_color=T.BG, border_width=0)
+        # Progress: gridded only while Strata loads.
+        self.progress = ctk.CTkProgressBar(self, height=4, corner_radius=2, fg_color=T.SURFACE,
+                                           progress_color=T.ACCENT, border_width=0)
         self.progress.set(0)
-        self.progress.grid(row=2, column=0, sticky="ew", padx=16, pady=(6, 0))
 
         self.toggle = ctk.CTkButton(self, text="Turn on", width=180, height=56, corner_radius=T.R_CARD,
                                     font=self._font(16, "bold"), command=self.on_toggle,
                                     text_color_disabled=T.TEXT_3)
-        self.toggle.grid(row=3, column=0, pady=(14, 0))
+        self.toggle.grid(row=3, column=0, pady=(GAP_HEAD_BUTTON, 0))
 
         card = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=T.R_CARD)
-        card.grid(row=4, column=0, sticky="ew", padx=16, pady=(16, 16))
+        card.grid(row=4, column=0, sticky="ew", padx=16, pady=(CARD_TOP, 16))
         card.grid_columnconfigure(0, weight=1)
         self.mem_card = card
         head = ctk.CTkFrame(card, fg_color="transparent")
@@ -351,32 +422,225 @@ class HermesControllerApp(ctk.CTk):
             self._style_toggle("Stopping…", TOGGLE_WAIT, "disabled")
         self.gear.configure(state="disabled" if st in (STARTING, STOPPING) else "normal")
         busy = st == STARTING and self._start_phase == "server"
-        self.progress.configure(progress_color=T.ACCENT if busy else T.BG, fg_color=T.SURFACE if busy else T.BG)
         if not busy:
             self.progress.set(0)
             self.elapsed.configure(text="")
         self._track_span()
         if st == ACTIVE:
-            model = self.model_id or self.cfg.get("model_name") or "model"
-            url = str(self.cfg.get("endpoint_url", "")).replace("http://", "")
-            extra = " · still loading" if self.loaded is False else ""
-            color = T.TEXT_2
-            if self._pending_launcher is not None:       # a launcher saved while running waits for the next start
-                url = f"{_short(self._pending_launcher.bat_name, 28)} applies next start"
-            elif low:
-                url, color = self._low_ram_line(), T.AMBER
-            self._set_preview(f"{model}{extra}\n{url}", color=color)
+            if self._ready_mono is None:
+                self._ready_mono = time.monotonic()      # adopted servers: uptime counts from when we saw it
+            self._show_serving()
             if not self._engine_checked:
                 self._engine_checked = True
                 self._run_worker("hc-engine-log", self._check_engine_log, self._start_token)
         elif st == ERROR and self.error_text:
-            self._set_preview(self.error_text, color=T.RED_TEXT)
-        self.preview.configure(cursor="hand2" if st == ERROR and self._error_log else "")
+            head, sep, rest = self.error_text.partition(" · ")
+            if not sep or not self._fits_summary(head):
+                head, rest = "", self.error_text
+            self._set_status(head, rest, color=T.RED_TEXT, link=bool(self._error_log))
+        self._layout()
+
+    def _show_serving(self) -> None:
+        """ACTIVE: model on the status line; the detail line carries uptime + last reply speed (optional), or a
+        warning that must stay visible (Low-RAM mode, a launcher waiting for the next start, still loading)."""
+        model = self.model_id or self.cfg.get("model_name") or "model"
+        if self.loaded is False:
+            self._set_status(model, "Still loading the model", color=T.TEXT_2)
+        elif self._pending_launcher is not None:      # a launcher saved while running waits for the next start
+            self._set_status(model, f"{_short(self._pending_launcher.bat_name, 28)} applies next start")
+        elif self._is_low_ram():
+            self._set_status("Low-RAM mode", self._low_ram_line(), color=T.AMBER)
+        else:
+            self._set_status(model, self._serving_line())
+
+    def _serving_line(self) -> str:
+        parts = []
+        if self._ready_mono is not None:
+            mins = int((time.monotonic() - self._ready_mono) // 60)
+            parts.append("Up <1 min" if mins < 1 else f"Up {mins} min" if mins < 60
+                         else f"Up {mins // 60} h {mins % 60:02d} min")
+        series = self.metrics.decode_series() if hasattr(self, "metrics") else []
+        if series:
+            parts.append(f"last reply {series[-1]:.0f} tok/s")
+        return " · ".join(parts)
+
+    def _is_low_ram(self) -> bool:
+        return (self.state_name == ACTIVE and self._engine_load is not None
+                and self._engine_load.mode == "low_ram" and self.loaded is not False)
+
+    # ------------------------------------------------------------------ status line + detail line
+    def _fits_summary(self, text: str) -> bool:
+        return self._summary_font.measure(text) <= self._summary_budget()
+
+    def _summary_budget(self) -> int:
+        """Logical px left for the summary on the status line. CTkFont.measure is unscaled, like the layout."""
+        used = self.pill.cget("font").measure(self.pill.cget("text"))
+        fixed = WIDTH - 22 - 6 - 8 - 8 - 16 - 28                          # margins, LED, gaps, caret, gear
+        timer = (self.elapsed.cget("font").measure(self.elapsed.cget("text")) + 10) if self.elapsed.cget("text") else 0
+        return int(fixed - used - timer)
+
+    def _ellipsize(self, text: str) -> str:
+        budget = self._summary_budget()
+        if self._summary_font.measure(text) <= budget:
+            return text
+        while text and self._summary_font.measure(text + "…") > budget:
+            text = text[:-1]
+        return text.rstrip(" ·,") + "…"
+
+    def _set_status(self, summary: str, detail: str = "", color: str = T.TEXT_2, link: bool = False) -> None:
+        """Status-line summary (short) + the detail line (shown when opened or when the state needs it)."""
+        self._summary_text = summary or ""
+        self.summary.configure(text=self._ellipsize(self._summary_text) if summary else "", text_color=color)
+        self._detail_text = detail or ""
+        self._detail_color = color
+        self._detail_link = bool(link and detail)
+        self.preview.configure(text=self._detail_text, text_color=color,
+                               font=self._detail_link_font if self._detail_link else self._detail_font,
+                               cursor="hand2" if self._detail_link else "")
+        self._layout()
+
+    def _detail_forced(self) -> bool:
+        """States whose detail the user must see: loading, stopping, errors, a fresh note, warnings."""
+        st = self.state_name
+        if st in (STARTING, STOPPING, ERROR) or self._detail_link:
+            return True
+        if time.monotonic() < self._note_until:
+            return True
+        return st == ACTIVE and (self.loaded is False or self._pending_launcher is not None or self._is_low_ram())
+
+    def _layout(self) -> None:
+        """Grid/hide the detail line, progress bar and caret for the current texts, then fit the window height."""
+        if getattr(self, "_destroyed", False):
+            return
+        has = bool(self._detail_text)
+        forced = self._detail_forced()
+        show = has and (forced or self.detail_open)
+        busy = self.state_name == STARTING and self._start_phase == "server"
+        clickable = has and not forced
+        self.caret.configure(text=(T.CHEVRON_UP if show else T.CHEVRON_DOWN) if clickable else "")
+        for w in (self.head, self.led, self.pill, self.summary, self.caret, self.elapsed):
+            try:
+                w.configure(cursor="hand2" if clickable else "")
+            except Exception:  # noqa: BLE001 - CTkFrame without cursor support
+                pass
+        if not clickable:
+            self._head_hover(False)
+        key = (show, busy)
+        if key == self._layout_key:
+            return
+        self._layout_key = key
+        if show:
+            self.preview.grid(row=1, column=0, sticky="ew", padx=(DETAIL_INDENT, 16), pady=(GAP_DETAIL_TOP, 0))
+        else:
+            self.preview.grid_remove()
+        if busy:
+            self.progress.grid(row=2, column=0, sticky="ew", padx=16,
+                               pady=(GAP_AFTER_DETAIL if show else GAP_HEAD_BUTTON, 0))
+        else:
+            self.progress.grid_remove()
+        self.toggle.grid(row=3, column=0, pady=(GAP_AFTER_DETAIL if (show or busy) else GAP_HEAD_BUTTON, 0))
+        self._fit_height()
+
+    def _fit_height(self, force: bool = False) -> None:
+        """Size the window to its content (the header grows/shrinks by the detail line; stats add their card)."""
+        try:
+            self.update_idletasks()
+            scale = ctk.ScalingTracker.get_window_scaling(self)
+            h = int(round(self.winfo_reqheight() / scale))
+        except Exception:  # noqa: BLE001
+            return
+        if h != self._fit_h or force:
+            self._fit_h = h
+            self.geometry(f"{WIDTH}x{h}")
+
+    def _on_head_click(self, _event=None) -> None:
+        if not self._detail_text or self._detail_forced():
+            return
+        self.detail_open = not self.detail_open
+        self._save_state_later("detail_open", self.detail_open)
+        self._layout()
+
+    def _head_hover(self, on: bool) -> None:
+        clickable = bool(self._detail_text) and not self._detail_forced()
+        self.head.configure(fg_color=T.SURFACE if (on and clickable) else "transparent")
 
     def _dark_caption(self) -> None:
         T.dark_caption(self)
 
+    # ------------------------------------------------------------------ reopen swept apps
+    def _reopen_worker(self) -> None:
+        """Worker, after Turn off: relaunch the auto apps one by one; games stay pending as a one-click offer."""
+        try:
+            records = reopen.load_pending()
+            if not records:
+                self.post(self._reopen_done, [], [])
+                return
+            auto, manual, skipped = reopen.classify(records)
+            for r in skipped:
+                log.info("reopen: skipping %s (%s)", r.name, r.reason_skip)
+            results = reopen.reopen(records, stagger_s=REOPEN_STAGGER_S, stop_evt=self._stop_evt,
+                                    on_progress=lambda d, t, n: self.post(self._reopen_progress, d, t, n))
+            if manual:
+                reopen.save_pending(manual)
+            else:
+                reopen.clear_pending()
+            self.post(self._reopen_done, results, [r.to_dict() for r in manual])
+        except Exception:  # noqa: BLE001
+            log.exception("reopen failed")
+            self.post(self._reopen_done, [], [])
+
+    def _reopen_progress(self, done: int, total: int, name: str) -> None:
+        if self.state_name == IDLE and done < total:
+            self._set_note(f"Reopening apps {done}/{total}\n{_short(name)} started")
+
+    def _reopen_done(self, results: list, manual: list) -> None:
+        self._reopening = False
+        started = [r["name"] for r in results if r.get("ok")]
+        failed = [r for r in results if not r.get("ok") and r.get("status") != "cancelled"]
+        for r in failed:
+            log.warning("reopen: %s not started: %s", r.get("name"), r.get("reason"))
+        self._reopen_offer = [reopen.LaunchRecord.from_dict(d) for d in manual]
+        if self.state_name != IDLE or not (results or manual):
+            return                               # nothing was pending: leave the "Stopped · freed" note alone
+        if started or failed:
+            names = ", ".join(_short(n, 16) for n in started[:2]) + (f" +{len(started) - 2}" if len(started) > 2 else "")
+            line = f"Reopened {len(started)} app{'s' if len(started) != 1 else ''}" + (f"\n{names}" if names else "")
+            if failed:
+                line = f"Reopened {len(started)} · {len(failed)} failed\n" + ", ".join(
+                    f"{_short(str(r.get('name')), 14)}: {r.get('reason')}" for r in failed[:2])
+            self._set_note(line)
+        self._request_preview()
+
+    def _load_reopen_offer(self) -> None:
+        """Worker, at startup: apps closed in an earlier session (Strata stopped another way, or games)."""
+        try:
+            recs = reopen.load_pending()
+        except Exception:  # noqa: BLE001
+            log.debug("load_pending failed", exc_info=True)
+            return
+        if recs:
+            self.post(self._set_reopen_offer, [r.to_dict() for r in recs])
+
+    def _set_reopen_offer(self, dicts: list) -> None:
+        if self.state_name == IDLE and not self._reopening:
+            self._reopen_offer = [reopen.LaunchRecord.from_dict(d) for d in dicts]
+            self._request_preview()
+
+    def _offer_text(self) -> str:
+        offer = self._reopen_offer
+        if len(offer) == 1:
+            return f"Reopen {_short(offer[0].name.removesuffix('.exe'), 26)}"
+        return f"Reopen {len(offer)} closed apps"
+
+    def _click_reopen_offer(self) -> None:
+        recs, self._reopen_offer = list(self._reopen_offer), []
+        self._set_note(f"Reopening {len(recs)} app{'s' if len(recs) != 1 else ''}…")
+        self._run_worker("hc-reopen-click", _reopen_clicked, recs, self.post, self._reopen_done)
+
     def _on_preview_click(self, _event=None) -> None:
+        if self.state_name == IDLE and self._reopen_offer and self._detail_link:
+            self._click_reopen_offer()
+            return
         if self.state_name == ERROR and self._error_log and os.path.exists(self._error_log):
             try:
                 os.startfile(self._error_log)          # opens in the default .log/.txt viewer
@@ -384,7 +648,12 @@ class HermesControllerApp(ctk.CTk):
                 log.exception("could not open %s", self._error_log)
 
     def _set_preview(self, text: str, color: str = T.TEXT_2) -> None:
-        self.preview.configure(text=text, text_color=color)
+        """A message for the status area: its first line goes on the status line when it fits, the rest (or the
+        whole message, when it is too long for the status line) becomes the detail line."""
+        head, _, rest = (text or "").partition("\n")
+        if head and not self._fits_summary(head):
+            head, rest = "", head + (f" · {rest}" if rest else "")
+        self._set_status(head, rest.replace("\n", " · "), color=color)
 
     def _strata_config_path(self) -> str | None:
         """The Strata config JSON from launch_cmd's --config (its "log" field names the engine log)."""
@@ -397,7 +666,7 @@ class HermesControllerApp(ctk.CTk):
     def _low_ram_line(self) -> str:
         ld = self._engine_load
         short = f" · ~{ld.short_gib:.1f} GB short" if ld and ld.short_gib else ""
-        return f"Low-RAM mode: reading from SSD (slower){short}"
+        return f"Reading from SSD (slower){short}"
 
     def _check_engine_log(self, token: int) -> None:
         """Worker: one engine-log verdict once serving. Our own start: the run since launch; adopted: the latest run."""
@@ -428,8 +697,8 @@ class HermesControllerApp(ctk.CTk):
     def _set_note(self, text: str) -> None:
         """A one-off result line ("Stopped · freed 13.5 GB", "Start cancelled") that stays readable for a few
         seconds. Without the hold the idle sweep preview, requested right after, replaced it within ~0.3 s."""
+        self._note_until = time.monotonic() + NOTE_HOLD_S      # first: the layout shows a held note's detail
         self._set_preview(text)
-        self._note_until = time.monotonic() + NOTE_HOLD_S
         if self._note_id is not None:
             try:
                 self.after_cancel(self._note_id)
@@ -440,6 +709,7 @@ class HermesControllerApp(ctk.CTk):
     def _note_expired(self) -> None:
         self._note_id = None
         self._note_until = 0.0
+        self._layout()
         self._request_preview()
 
     def _set_state(self, st: str) -> None:
@@ -453,6 +723,7 @@ class HermesControllerApp(ctk.CTk):
         if st != ERROR:
             self._error_hold_until = 0.0
         if st in (IDLE, ERROR):                  # no Strata of ours any more: drop memory baselines
+            self._ready_mono = None
             self._avail_at_launch = None
             self._strata_est = None
             self._engine_load = None
@@ -499,32 +770,38 @@ class HermesControllerApp(ctk.CTk):
     def toggle_stats(self) -> None:
         self.expanded = not self.expanded
         self._apply_expanded()
-        # Debounced on the Tk thread, then saved off it with the VALUE only. Never hand a worker a closure over
-        # self: if that thread drops the last reference to a destroyed app, tkinter Font.__del__ runs there, and a
-        # Tk call off the main thread can block forever - here while holding config_store's lock (found in tests).
+        self._save_state_later("stats_expanded", self.expanded)
+
+    def _save_state_later(self, key: str, value) -> None:
+        """Debounced on the Tk thread, then saved off it with VALUES only. Never hand a worker a closure over
+        self: if that thread drops the last reference to a destroyed app, tkinter Font.__del__ runs there, and a
+        Tk call off the main thread can block forever - here while holding config_store's lock (found in tests)."""
+        self._state_pending[key] = value
         if self._state_save_id is not None:
             self.after_cancel(self._state_save_id)
-        self._state_save_id = self.after(STATE_SAVE_DEBOUNCE_MS, self._save_expanded)
+        self._state_save_id = self.after(STATE_SAVE_DEBOUNCE_MS, self._flush_state)
 
-    def _save_expanded(self) -> None:
+    def _flush_state(self) -> None:
         self._state_save_id = None
-        self._run_worker("hc-state", config_store.save_state, {"stats_expanded": bool(self.expanded)})
+        pending, self._state_pending = dict(self._state_pending), {}
+        if pending:
+            self._run_worker("hc-state", config_store.save_state, pending)
 
     def _apply_expanded(self) -> None:
         """Grow the window downward to show the stats card, or shrink back to the exact v1.0 size."""
         self.chevron.configure(text=T.CHEVRON_UP if self.expanded else T.CHEVRON_DOWN)
         if self.expanded:
-            self.mem_card.grid(pady=(16, STATS_GAP))      # .grid(), not grid_configure(): only .grid() is DPI-scaled
+            self.mem_card.grid(pady=(CARD_TOP, STATS_GAP))   # .grid(), not grid_configure(): only .grid() is DPI-scaled
             self.stats.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 16))
-            self.geometry(f"{WIDTH}x{HEIGHT_EXPANDED}")
+            self._fit_height(force=True)
             self._keep_on_screen()
             self._refresh_stats()
             if self._stats_id is None and not self._destroyed:
                 self._stats_id = self.after(STATS_MS, self._stats_tick)
         else:
             self.stats.grid_remove()
-            self.mem_card.grid(pady=(16, 16))
-            self.geometry(f"{WIDTH}x{HEIGHT}")
+            self.mem_card.grid(pady=(CARD_TOP, 16))
+            self._fit_height(force=True)
             if self._stats_id is not None:
                 try:
                     self.after_cancel(self._stats_id)
@@ -544,7 +821,7 @@ class HermesControllerApp(ctk.CTk):
                 return
             _left, top, _right, bottom = mon
             x, y = self.winfo_x(), self.winfo_y()
-            frame_h = (self.winfo_rooty() - y) + round(HEIGHT_EXPANDED * scale) + 8
+            frame_h = (self.winfo_rooty() - y) + round((self._fit_h or HEIGHT_EXPANDED) * scale) + 8
             if y + frame_h > bottom:
                 tkinter.Wm.wm_geometry(self, f"+{x}+{max(top, bottom - frame_h)}")   # position only, unscaled
         except Exception:  # noqa: BLE001 - cosmetic
@@ -619,7 +896,10 @@ class HermesControllerApp(ctk.CTk):
         last_epoch = None
         while not self._stop_evt.is_set():
             try:
-                if self.expanded and not self._iconic and self.state_name in (ACTIVE, STOPPING):
+                # Stats open: every STATS_MS. Only the serving detail line open: every ~10 s, for "last reply".
+                slow_ok = (self.detail_open and self.state_name == ACTIVE
+                           and time.monotonic() - last_poll >= DETAIL_POLL_S)
+                if (self.expanded or slow_ok) and not self._iconic and self.state_name in (ACTIVE, STOPPING):
                     epoch = self._metrics_epoch
                     root = config_store.server_root(str(self.cfg.get("endpoint_url") or ""))
                     # /metrics returns only the newest 12 requests: after a gap (section collapsed, window minimised,
@@ -672,11 +952,9 @@ class HermesControllerApp(ctk.CTk):
         self.elapsed.configure(text=load_progress.fmt_elapsed(elapsed))
         note = self._start_note
         if note == LOW_RAM_NOTE and ld is not None and ld.mode in ("low_ram", "waiting_for_ram"):
-            note = ""                            # the first line already says it, with the engine's numbers
-        line2 = note or (
-            f"usually about {load_progress.fmt_elapsed(self._expected_s)}" if self._expected_s else "")
-        self._set_preview(f"{label}{' · ' + detail if detail else ''}" + (f"\n{line2}" if line2 else ""),
-                          color=T.AMBER if warn else T.TEXT_2)
+            note = ""                            # the phase line already says it, with the engine's numbers
+        usual = f"usually {load_progress.fmt_elapsed(self._expected_s)}" if self._expected_s else ""
+        self._set_status(label, " · ".join(x for x in (detail, note or usual) if x), color=T.AMBER if warn else T.TEXT_2)
         self._progress_id = self.after(PROGRESS_MS, self._progress_tick)
 
     def _log_reader(self, token: int) -> None:
@@ -855,6 +1133,7 @@ class HermesControllerApp(ctk.CTk):
     def _first_refresh(self) -> None:
         self._first_id = None
         self._request_preview()
+        self._run_worker("hc-reopen-load", self._load_reopen_offer)
 
     def _tick(self) -> None:
         try:
@@ -864,6 +1143,8 @@ class HermesControllerApp(ctk.CTk):
                 self._iconic = False
             self._update_telemetry()
             self._request_preview()
+            if self.state_name == ACTIVE and not self._detail_forced():
+                self._show_serving()             # uptime / last reply speed
             # Collect garbage HERE, on the Tk thread: closed dialogs leave Tk objects (CTkFont, images) in reference
             # cycles, and if the collector happens to run on a worker instead, their __del__ makes a Tk call off the
             # main thread (blocks until the main loop services it; forever once it has stopped). Cheap: ~1 ms.
@@ -900,6 +1181,9 @@ class HermesControllerApp(ctk.CTk):
             return
         if "_error" in res:
             self._set_preview(f"Scan failed: {res['_error']}")
+        elif self._reopen_offer and not self._reopening:
+            head = format_preview(res).partition("\n")[0]
+            self._set_status(head if self._fits_summary(head) else "", self._offer_text(), color=T.TEXT_2, link=True)
         else:
             self._set_preview(format_preview(res))
 
@@ -928,6 +1212,10 @@ class HermesControllerApp(ctk.CTk):
 
     def turn_on(self) -> None:
         self._sweep_note = ""
+        self._reopen_this = False
+        if self._reopen_offer:                   # starting again: the old "Reopen …" offer is stale
+            self._reopen_offer = []
+            self._run_worker("hc-reopen-clear", reopen.clear_pending)
         self._apply_pending_launcher()
         self._start_token += 1
         token = self._start_token
@@ -978,10 +1266,19 @@ class HermesControllerApp(ctk.CTk):
             return
         self._start_phase = "dialog"
         self._set_preview(f"{len(cands)} app(s) could be closed — choose in the dialog")
-        self.dialog = SweepDialog(self, cands, lambda d, t: self._on_sweep_decision(token, d, t), ram=plan)
+        ref: dict = {}
+        self.dialog = SweepDialog(self, cands, lambda d, t: self._on_sweep_decision(token, d, t, ref.get("dlg")),
+                                  ram=plan, reopen_default=self._reopen_pref)
+        ref["dlg"] = self.dialog
 
-    def _on_sweep_decision(self, token: int, decision: str, targets: list[tuple[int, float]]) -> None:
+    def _on_sweep_decision(self, token: int, decision: str, targets: list[tuple[int, float]], dlg=None) -> None:
         self.dialog = None
+        if dlg is not None and decision != "cancel":
+            choice = bool(getattr(dlg, "reopen_choice", self._reopen_pref))
+            self._reopen_this = choice and decision == "close_and_start" and bool(targets)
+            if choice != self._reopen_pref:
+                self._reopen_pref = choice
+                self._save_state_later("reopen_after", choice)
         if not self._token_live(token):
             return
         if decision == "cancel":
@@ -1009,6 +1306,9 @@ class HermesControllerApp(ctk.CTk):
 
     def _after_sweep(self, token: int, res: dict) -> None:
         self.add_freed(res.get("ram_freed_mb"))
+        records = list(res.get("launch_records") or [])
+        if records and self._reopen_this:
+            self._run_worker("hc-reopen-save", _save_reopen_records, records)
         failed = res.get("failed") or []
         if failed:
             log.warning("sweep could not close: %s", failed)
@@ -1064,6 +1364,7 @@ class HermesControllerApp(ctk.CTk):
         self._start_phase = None
         self.loaded = True
         self.model_id = None
+        self._ready_mono = time.monotonic()
         if elapsed > 15:                         # a real cold load (adopting a running server is ~instant)
             old = self._expected_s
             self._expected_s = elapsed if not old else max(elapsed, 0.5 * old + 0.5 * elapsed)
@@ -1096,7 +1397,7 @@ class HermesControllerApp(ctk.CTk):
         m = re.search(r"\s*—\s*see\s+(.+\.log)\s*$", msg or "")
         self._error_log = m.group(1) if m else None
         if m:
-            msg = msg[: m.start()] + f" · open {os.path.basename(m.group(1))}"
+            msg = msg[: m.start()] + f" · Open {os.path.basename(m.group(1))}"
         self.error_text = msg
         self._error_hold_until = time.monotonic() + ERROR_HOLD_S
         self._set_state(ERROR)
@@ -1160,6 +1461,9 @@ class HermesControllerApp(ctk.CTk):
             self._set_state(IDLE)
             self._set_note(f"Stopped · freed {_gb(result.get('ram_freed_mb'))}")
             self._request_preview()
+            if not self._exit_pending:
+                self._reopening = True
+                self._run_worker("hc-reopen", self._reopen_worker)
         else:
             self.show_error(result.get("error") or "Stop failed — port still in use")
             return
@@ -1308,9 +1612,9 @@ class HermesControllerApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             log.debug("vram sampler stop failed", exc_info=True)
         gc.collect()                             # finalize dialog leftovers here, before workers wind down
-        if self._state_save_id is not None:      # a chevron click just before exit: save it now (main thread)
+        if self._state_save_id is not None and self._state_pending:   # a click just before exit: save it now
             try:
-                config_store.save_state({"stats_expanded": bool(self.expanded)})
+                config_store.save_state(dict(self._state_pending))
             except Exception:  # noqa: BLE001
                 log.debug("final state save failed", exc_info=True)
         for aid in (self._pump_id, self._tick_id, self._first_id, self._progress_id, self._stats_id, self._note_id,

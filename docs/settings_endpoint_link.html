@@ -1,0 +1,82 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  .row{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}
+  .col{display:flex;flex-direction:column;gap:8px;width:360px}
+  .cap{font-size:13px;color:var(--foreground);font-weight:600}
+  .sub{font-size:12px;color:var(--muted-foreground);line-height:1.4}
+  .ui{font-family:"Segoe UI Variable Text","Segoe UI",sans-serif;color:#EDEDEB}
+  .mono{font-family:"Cascadia Mono",Consolas,monospace}
+  .win{width:360px;background:#141415;border-radius:8px;border:1px solid #2C2C30;box-sizing:border-box;padding:14px 16px 16px}
+  .top{display:flex;align-items:center;height:28px}
+  .led{width:8px;height:8px;border-radius:4px;margin-right:8px;flex:none}
+  .title{font-weight:600;font-size:15px}
+  .model{color:#A1A1A6;font-size:12px;margin-left:8px;white-space:nowrap}
+  .caret{color:#6E6E73;font-size:10px;margin-left:6px}
+  .gear{margin-left:auto;width:28px;height:28px;display:flex;align-items:center;justify-content:center;color:#A1A1A6;font-size:15px}
+  .detail{font-size:12px;color:#A1A1A6;line-height:16px;padding:6px 0 0 16px}
+  .detail + .btn{margin-top:10px}
+  .btn{height:56px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:16px;width:180px;margin:12px auto 0}
+  .off{background:#26262A;color:#EDEDEB}
+  /* settings dialog (matches the current one: 340 px, 12 px padding) */
+  .dlg{width:340px;background:#141415;border-radius:8px;border:1px solid #2C2C30;box-sizing:border-box;padding:12px}
+  .dh{display:flex;align-items:baseline;justify-content:space-between}
+  .dh b{font-size:16px}
+  .lbl{font-size:12px;color:#A1A1A6;margin:12px 0 6px}
+  .sel{display:flex;gap:8px}
+  .field{flex:1;height:32px;border-radius:8px;background:#26262A;display:flex;align-items:center;padding:0 10px;font-size:13px;justify-content:space-between}
+  .b2{height:32px;border-radius:8px;background:#26262A;display:flex;align-items:center;padding:0 12px;font-size:13px}
+  .meta{font-size:11px;color:#A1A1A6;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .rule{height:1px;background:#2C2C30;margin:14px 0}
+  .link{display:flex;align-items:center;justify-content:space-between;height:32px;border-radius:8px;padding:0 10px;background:#1C1C1E}
+  .link span{font-size:13px}
+  .link .url{color:#A1A1A6;font-size:11px}
+  .link.hover{background:#26262A}
+  .link.hover span:first-child{text-decoration:underline;text-underline-offset:3px}
+  .ext{color:#A1A1A6;font-size:12px;margin-left:8px}
+  .foot{display:flex;gap:8px;margin-top:16px}
+  .foot div{flex:1;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:13px}
+  .cancel{border:1px solid #303035}.save{background:#EDEDEB;color:#141415}
+  .muted{color:#6E6E73}
+</style></head><body>
+<div class="row">
+
+<div class="col"><div class="cap">Main window, status line clicked</div>
+<div class="win ui">
+  <div class="top"><div class="led" style="background:#3CC77E"></div><div class="title">Serving</div><div class="model">swift-1.5-iq3_s</div><div class="caret">▴</div><div class="gear">⚙</div></div>
+  <div class="detail">Up 12 min · last reply 85 tok/s</div>
+  <div class="btn off">Turn off</div>
+</div>
+<div class="sub">With the address gone, the hidden line shows uptime and the last reply's speed instead.</div></div>
+
+<div class="col"><div class="cap">Settings, while Strata is serving</div>
+<div class="dlg ui">
+  <div class="dh"><b>Settings</b><span class="mono muted" style="font-size:11px">v1.1.0</span></div>
+  <div class="lbl">Strata launcher</div>
+  <div class="sel"><div class="field">run-swift-iq3_s.bat <span class="muted">⌄</span></div><div class="b2">Browse…</div></div>
+  <div class="meta mono">swift-1.5-iq3_s · port 8080</div>
+  <div class="lbl">Endpoint</div>
+  <div class="link hover"><span>Open Strata dashboard<span class="ext">↗</span></span><span class="url mono">127.0.0.1:8080</span></div>
+  <div class="meta mono" style="margin-top:6px">API http://127.0.0.1:8080/v1 <span class="muted">· Copy</span></div>
+  <div class="rule"></div>
+  <div class="b2" style="width:100%;box-sizing:border-box">Protected apps…</div>
+  <div class="foot"><div class="cancel">Cancel</div><div class="save">Save</div></div>
+</div>
+<div class="sub">Shown hovered. Clicking opens Strata's own web app (chat, Monitor card, its settings) in your default browser. The API address underneath has a Copy action for pasting into Hermes or other clients.</div></div>
+
+<div class="col"><div class="cap">Settings, while Strata is off</div>
+<div class="dlg ui">
+  <div class="dh"><b>Settings</b><span class="mono muted" style="font-size:11px">v1.1.0</span></div>
+  <div class="lbl">Strata launcher</div>
+  <div class="sel"><div class="field">run-swift-iq3_s.bat <span class="muted">⌄</span></div><div class="b2">Browse…</div></div>
+  <div class="meta mono">swift-1.5-iq3_s · port 8080</div>
+  <div class="lbl">Endpoint</div>
+  <div class="link"><span class="muted">Open Strata dashboard<span class="ext">↗</span></span><span class="url mono muted">not running</span></div>
+  <div class="meta mono" style="margin-top:6px">API http://127.0.0.1:8080/v1 <span class="muted">· Copy</span></div>
+  <div class="rule"></div>
+  <div class="b2" style="width:100%;box-sizing:border-box">Protected apps…</div>
+  <div class="foot"><div class="cancel">Cancel</div><div class="save">Save</div></div>
+</div>
+<div class="sub">Greyed out with "not running" so it never opens a dead page. The address follows the chosen launcher's port.</div></div>
+
+</div></body></html>

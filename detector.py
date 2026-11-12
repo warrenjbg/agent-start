@@ -687,7 +687,7 @@ class ProcessDetector:
         result: dict = {"closed_apps": [], "ram_freed_mb": 0.0, "vram_freed_mb": None, "failed": [],
                         "dry_run": bool(dry_run), "candidates": 0, "preselected": 0,
                         "preselected_ram_mb": 0.0, "preselected_vram_mb": None, "names": [],
-                        "preselected_names": []}
+                        "preselected_names": [], "launch_records": []}
         try:
             apps = sorted(self._locked_scan(), key=lambda a: (-a.ram_mb, a.name.casefold(), a.pid))
             pre = [a for a in apps if a.preselect]
@@ -730,8 +730,17 @@ class ProcessDetector:
         return result
 
     def _kill_apps(self, selected: list[App], result: dict) -> None:
-        """Real sweep (no lock held): WM_CLOSE -> terminate -> kill, only captured Process objects."""
+        """Real sweep (no lock held): WM_CLOSE -> terminate -> kill, only captured Process objects.
+
+        Launch records (for reopen.py) are captured BEFORE anything is closed, because the processes are
+        gone afterwards; result['launch_records'] then keeps only the apps that really closed.
+        """
         failed: dict[int, dict] = {}
+        records: dict[int, dict] = {}
+        for app in selected:
+            rec = capture_launch_record(app)       # never raises
+            if rec is not None:
+                records[id(app)] = rec
         before = self.gpu_dedicated_used_mb()
         for app in selected:
             for h in app.hwnds:
@@ -769,15 +778,18 @@ class ProcessDetector:
             if still:
                 act(still, "kill")
                 _wait(still, 2.0)
-        closed, freed = [], 0.0
+        closed, freed, closed_records = [], 0.0, []
         for app in selected:
             gone = app.root is None or not _running(app.root)
             if gone:
                 closed.append(app.name)
                 freed += app.ram_mb
+                if id(app) in records:
+                    closed_records.append(records[id(app)])
             elif app.pid not in failed:
                 failed[app.pid] = {"name": app.name, "pid": app.pid, "error": "still running after kill"}
         result["closed_apps"] = closed
+        result["launch_records"] = closed_records
         result["ram_freed_mb"] = round(float(freed), 1)
         result["failed"] = list(failed.values())
         time.sleep(1.0)
@@ -880,3 +892,139 @@ def _wait(procs: list[psutil.Process], timeout: float) -> None:
         psutil.wait_procs(live, timeout=timeout)
     except psutil.Error as exc:
         log.debug("wait_procs: %s", exc)
+
+
+# --------------------------------------------------------------------------------------------- launch records
+# Captured by _kill_apps BEFORE closing an app so reopen.py can start it again when Strata turns off.
+# Everything here is best effort: any failure yields a partial record (or None), never an exception.
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_TOKEN_QUERY = 0x0008
+_TOKEN_ELEVATION_CLASS = 20                        # TOKEN_INFORMATION_CLASS.TokenElevation
+_AUMID_MAX = 130                                   # APPLICATION_USER_MODEL_ID_MAX_LENGTH
+_ERROR_INSUFFICIENT_BUFFER = 122
+
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+try:
+    _GetAumid = _kernel32.GetApplicationUserModelId          # Windows 8+
+    _GetAumid.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_uint32), wintypes.LPWSTR]
+    _GetAumid.restype = ctypes.c_long
+except AttributeError:
+    _GetAumid = None
+try:
+    _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    _advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    _advapi32.OpenProcessToken.restype = wintypes.BOOL
+    _advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                              ctypes.POINTER(wintypes.DWORD)]
+    _advapi32.GetTokenInformation.restype = wintypes.BOOL
+except (OSError, AttributeError):
+    _advapi32 = None
+
+
+def _token_elevated(hproc: int | None) -> bool:
+    """True if the process token is elevated. Anything we cannot read counts as elevated (safe side:
+    an elevated app cannot be relaunched from a non-elevated controller anyway)."""
+    if not hproc or _advapi32 is None:
+        return True
+    htok = wintypes.HANDLE()
+    try:
+        if not _advapi32.OpenProcessToken(hproc, _TOKEN_QUERY, ctypes.byref(htok)):
+            return True                            # typically ERROR_ACCESS_DENIED -> elevated / protected
+        try:
+            val = wintypes.DWORD(0)
+            ret = wintypes.DWORD(0)
+            if not _advapi32.GetTokenInformation(htok, _TOKEN_ELEVATION_CLASS, ctypes.byref(val),
+                                                 ctypes.sizeof(val), ctypes.byref(ret)):
+                return True
+            return bool(val.value)
+        finally:
+            _kernel32.CloseHandle(htok)
+    except (OSError, ctypes.ArgumentError):
+        return True
+
+
+def _process_aumid(hproc: int | None) -> str | None:
+    """AppUserModelID of a packaged (Store/MSIX) process; None when not packaged or on any error."""
+    if not hproc or _GetAumid is None:
+        return None
+    try:
+        size = ctypes.c_uint32(_AUMID_MAX + 1)
+        buf = ctypes.create_unicode_buffer(size.value)
+        rc = _GetAumid(hproc, ctypes.byref(size), buf)
+        if rc == _ERROR_INSUFFICIENT_BUFFER and 0 < size.value <= 4096:
+            buf = ctypes.create_unicode_buffer(size.value)
+            rc = _GetAumid(hproc, ctypes.byref(size), buf)
+        if rc != 0:                                # 15703 APPMODEL_ERROR_NO_APPLICATION_MODEL_ID = unpackaged
+            return None
+        return buf.value or None
+    except (OSError, ctypes.ArgumentError, ValueError):
+        return None
+
+
+def _group_root(app: App) -> psutil.Process | None:
+    """The app's root process: App.root, else the member whose parent is not itself a member."""
+    if app.root is not None:
+        return app.root
+    pids = {m.pid for m in app.members}
+    for m in app.members:
+        try:
+            if m.ppid() not in pids:
+                return m
+        except psutil.Error:
+            continue
+    return app.members[0] if app.members else None
+
+
+def _safe_call(fn: Callable[[], object], default: object) -> object:
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001 - psutil.Error, OSError, anything: record capture must never raise
+        return default
+
+
+def capture_launch_record(app: App) -> dict | None:
+    """Describe how to start `app` again (its group ROOT process) while it is still running.
+
+    Returns {name, exe, cmdline, cwd, category, create_time, elevated, aumid} or None when the root is
+    already gone / unknown. Never raises; costs a few ms (psutil exe/cmdline/cwd + one OpenProcess).
+    """
+    t0 = time.perf_counter()
+    try:
+        root = _group_root(app)
+        if root is None or not _running(root):
+            return None
+        hproc = None
+        try:
+            hproc = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(root.pid))
+        except (OSError, ctypes.ArgumentError):
+            hproc = None
+        try:
+            # holding the handle pins the pid; is_running() (pid + create_time) proves it is still our process
+            if not _running(root):
+                return None
+            exe = _safe_call(root.exe, None) or app.exe or ""
+            cmdline = _safe_call(root.cmdline, None)
+            cwd = _safe_call(root.cwd, None)
+            ctime = _safe_call(root.create_time, None)
+            rec = {
+                "name": str(app.name or _safe_call(root.name, "") or ""),
+                "exe": os.path.abspath(exe) if exe else "",
+                "cmdline": [str(c) for c in cmdline] if isinstance(cmdline, list) else [],
+                "cwd": str(cwd) if cwd else "",
+                "category": str(app.category),
+                "create_time": float(ctime if ctime is not None else app.create_time),
+                "elevated": _token_elevated(hproc),
+                "aumid": _process_aumid(hproc),
+            }
+        finally:
+            if hproc:
+                _kernel32.CloseHandle(hproc)
+        log.debug("launch record for %s captured in %.1f ms", rec["name"], (time.perf_counter() - t0) * 1000)
+        return rec
+    except Exception:  # noqa: BLE001
+        log.exception("capture_launch_record failed for %s", getattr(app, "name", "?"))
+        return None

@@ -1,0 +1,93 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  .row{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}
+  .col{display:flex;flex-direction:column;gap:8px}
+  .cap{font-size:13px;color:var(--foreground);font-weight:600}
+  .sub{font-size:12px;color:var(--muted-foreground);max-width:360px;line-height:1.4}
+  .win{width:360px;background:#141415;border-radius:8px;border:1px solid #2C2C30;font-family:"Segoe UI Variable Text","Segoe UI",sans-serif;color:#EDEDEB;box-sizing:border-box;padding:14px 16px 16px;position:relative}
+  .mono{font-family:"Cascadia Mono",Consolas,monospace}
+  .top{display:flex;align-items:center;height:28px}
+  .led{width:8px;height:8px;border-radius:4px;margin-right:8px;flex:none}
+  .title{font-weight:600;font-size:15px}
+  .muted{color:#A1A1A6}.faint{color:#6E6E73}
+  .gear{margin-left:auto;width:28px;height:28px;display:flex;align-items:center;justify-content:center;color:#A1A1A6;font-size:15px}
+  .detail{font-size:12px;color:#A1A1A6;line-height:16px}
+  .btn{height:56px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:16px}
+  .on{background:#EDEDEB;color:#141415}.off{background:#26262A;color:#EDEDEB}
+  .card{background:#1C1C1E;border-radius:12px;padding:10px 12px}
+  .gauge{height:8px;border-radius:4px;background:#26262A;display:flex;overflow:hidden;margin:6px 0 8px}
+  .leg{display:flex;gap:14px;font-size:11px;color:#A1A1A6}
+  .sw{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px}
+  .chip{font-size:11px;color:#A1A1A6;background:#1C1C1E;border-radius:6px;padding:2px 7px;margin-left:8px}
+  .h{position:absolute;right:-48px;top:0;font-size:11px;color:var(--muted-foreground)}
+</style></head><body>
+<div class="row">
+
+<!-- CURRENT -->
+<div class="col"><div class="cap">Now (268 px tall)</div>
+<div class="win">
+  <div class="top"><div class="led" style="background:#3CC77E"></div><div class="title">Serving</div><div class="gear">⚙</div></div>
+  <div class="detail" style="margin-top:4px;height:36px">swift-1.5-iq3_s<br>127.0.0.1:8080/v1</div>
+  <div style="height:10px"></div>
+  <div class="btn off" style="width:180px;margin:14px auto 0">Turn off</div>
+  <div class="card" style="margin-top:16px">
+    <div class="detail">Memory · 64 GB</div>
+    <div class="gauge"><div style="width:22%;background:#55555B"></div><div style="width:76%;background:#3CC77E"></div></div>
+    <div class="leg mono"><span><i class="sw" style="background:#55555B"></i>Apps 14.2 GB</span><span><i class="sw" style="background:#3CC77E"></i>Strata ~48.9 GB</span><span>Free 0.6 GB</span></div>
+  </div>
+</div>
+<div class="sub">92 px above the button: status, then two lines of detail, then a gap.</div></div>
+
+<!-- A -->
+<div class="col"><div class="cap">A · One-line header (≈236 px)</div>
+<div class="win">
+  <div class="top"><div class="led" style="background:#3CC77E"></div><div class="title">Serving</div>
+    <span class="muted" style="font-size:12px;margin-left:8px">swift-1.5-iq3_s</span>
+    <span class="chip mono">:8080</span><div class="gear">⚙</div></div>
+  <div class="detail" style="margin-top:2px;height:16px;color:#6E6E73">Ready on 127.0.0.1:8080/v1</div>
+  <div class="btn off" style="width:180px;margin:12px auto 0">Turn off</div>
+  <div class="card" style="margin-top:14px">
+    <div class="detail">Memory · 64 GB</div>
+    <div class="gauge"><div style="width:22%;background:#55555B"></div><div style="width:76%;background:#3CC77E"></div></div>
+    <div class="leg mono"><span><i class="sw" style="background:#55555B"></i>Apps 14.2 GB</span><span><i class="sw" style="background:#3CC77E"></i>Strata ~48.9 GB</span><span>Free 0.6 GB</span></div>
+  </div>
+</div>
+<div class="win" style="margin-top:6px">
+  <div class="top"><div class="led" style="background:#6E6E73"></div><div class="title">Idle</div><span class="chip mono">:8080</span><div class="gear">⚙</div></div>
+  <div class="detail" style="margin-top:2px;height:16px">2 apps pre-ticked · 6.8 GB · eldenring, chrome</div>
+  <div class="btn on" style="width:180px;margin:12px auto 0">Turn on</div>
+</div>
+<div class="sub">Model sits on the status line, the port is a small tag. Detail drops to one line in every state (idle preview, load phase, errors), and "usually 0:58" moves next to the timer.</div></div>
+
+<!-- B -->
+<div class="col"><div class="cap">B · Button beside the status (≈206 px)</div>
+<div class="win">
+  <div style="display:flex;gap:14px;align-items:center">
+    <div class="btn off" style="width:118px;flex:none">Turn off</div>
+    <div style="min-width:0;flex:1">
+      <div style="display:flex;align-items:center"><div class="led" style="background:#3CC77E"></div><div class="title">Serving</div><div class="gear" style="margin-right:-6px">⚙</div></div>
+      <div class="detail">swift-1.5-iq3_s</div>
+      <div class="detail mono faint" style="font-size:11px">127.0.0.1:8080/v1</div>
+    </div>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <div class="detail">Memory · 64 GB</div>
+    <div class="gauge"><div style="width:22%;background:#55555B"></div><div style="width:76%;background:#3CC77E"></div></div>
+    <div class="leg mono"><span><i class="sw" style="background:#55555B"></i>Apps 14.2 GB</span><span><i class="sw" style="background:#3CC77E"></i>Strata ~48.9 GB</span><span>Free 0.6 GB</span></div>
+  </div>
+</div>
+<div class="win" style="margin-top:6px">
+  <div style="display:flex;gap:14px;align-items:center">
+    <div class="btn on" style="width:118px;flex:none">Turn on</div>
+    <div style="min-width:0;flex:1">
+      <div style="display:flex;align-items:center"><div class="led" style="background:#6E6E73"></div><div class="title">Idle</div><div class="gear" style="margin-right:-6px">⚙</div></div>
+      <div class="detail">2 apps pre-ticked · 6.8 GB</div>
+      <div class="detail faint" style="font-size:11px">eldenring, chrome</div>
+    </div>
+  </div>
+</div>
+<div class="sub">The power button and the status share one row, like a device front panel. Most compact. Long messages (errors, low-RAM warnings) get ~190 px of width, so they wrap more.</div></div>
+
+</div>
+</body></html>

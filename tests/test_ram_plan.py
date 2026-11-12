@@ -33,7 +33,7 @@ p = R.plan(REAL, 40.0 * GB, 46.84)            # need 49.84, short 9.84, these ap
 check(not p.enough_now and p.reachable, f"real numbers reachable {p}")
 check(p.preticked_pids == (11, 12, 13, 14, 15) or set(p.preticked_pids) >= {12, 13}, f"real picks {p.preticked_pids}")
 check(p.available_mb + p.freed_mb >= p.need_mb, "real plan reaches the target")
-check(p.summary == "Full speed needs ~50 GB free · you have 40 GB", f"summary {p.summary!r}")
+check(p.summary == "Full speed needs ~49 GB free · you have 40 GB", f"summary {p.summary!r}")
 check(p.detail.startswith("Pre-ticked ") and "frees ~" in p.detail, f"detail {p.detail!r}")
 check(len(p.summary) <= 60 and len(p.detail) <= 60, "lines fit the dialog")
 
@@ -43,9 +43,16 @@ check(p.preticked_pids == (2,), f"one big app suffices {p.preticked_pids}")
 p = R.plan(big, 38 * GB, 46.84)              # short 11.84 -> 9 + 2 + 1 = 12
 check(p.preticked_pids == (1, 2, 3), f"needs several {p.preticked_pids}")
 p = R.plan(big, 30 * GB, 46.84)              # short 19.84 > 12 total
-check(not p.reachable and p.preticked_pids == () and "still leaves ~7.8 GB short" in p.detail, f"unreachable {p}")
-p = R.plan(REAL, 39.3 * GB, 46.84)            # the real failing launch: 10.5 GB short, apps total 10.2
-check(not p.reachable and p.preticked_pids == (13,) and "~0.3 GB short" in p.detail, f"near miss wording {p.detail!r}")
+check(not p.reachable and p.preticked_pids == () and "still leaves ~7.3 GB short" in p.detail, f"unreachable {p}")
+p = R.plan(REAL, 39.0 * GB, 46.84)            # need 49.34, apps total 10.2: 0.14 GB short even closing all
+check(not p.reachable and p.preticked_pids == (13,) and "~0.1 GB short" in p.detail, f"near miss wording {p.detail!r}")
+# the real 2026-11-12 08:35 launch: 46149 MB available, the sweep freed 4684 MB, and Strata DID load full-RAM.
+# The old 3 GiB headroom called this 0.2 GB short; the calibrated default must call it reachable.
+today = [app(21, "brave.exe", 1.53), app(22, "Spotify.exe", 1.40, "window"), app(23, "steam.exe", 1.18, "gpu"),
+         app(24, "PhoneExperienceHost.exe", 0.46, "gpu")]
+p = R.plan(today, 46149.0, 46.84)
+check(p.reachable and set(p.preticked_pids) == {21, 22, 23, 24}, f"real 08:35 launch reachable, all ticked ({p})")
+check(not R.plan(today, 46149.0, 46.84, headroom_gib=3.0).reachable, "the old 3 GiB target refused it")
 
 prot = [app(1, "Obsidian.exe", 20.0), app(2, "b.exe", 3.0)]
 p = R.plan(prot, 45 * GB, 46.84, protected_names={"obsidian.exe"})

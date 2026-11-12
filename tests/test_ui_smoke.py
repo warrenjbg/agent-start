@@ -42,6 +42,14 @@ from settings_dialog import SettingsDialog  # noqa: E402
 from sweep_dialog import SweepDialog  # noqa: E402
 from vram_sampler import VramSnapshot  # noqa: E402
 from whitelist_modal import WhitelistModal  # noqa: E402
+import reopen  # noqa: E402
+import webbrowser  # noqa: E402
+
+LAUNCHED: list[str] = []                         # reopen.launch is faked for the whole run: nothing real is started
+OPENED_URLS: list[str] = []
+reopen.launch = lambda rec: (LAUNCHED.append(reopen._coerce(rec).name) or True, "started (test)")
+reopen.already_running = lambda rec: False
+webbrowser.open = lambda url, *a, **k: OPENED_URLS.append(url) or True
 
 assert config_store.DATA_DIR == HOME, "tests must not write to the real data dir"
 
@@ -340,6 +348,23 @@ def new_app(cfg: dict | None = None):
     return app, det, ep
 
 
+def status(app) -> str:
+    """Everything the status area says: the status-line summary, then the detail line (shown or not)."""
+    head, detail = app.summary.cget("text"), app.preview.cget("text")
+    return head + ("\n" + detail if detail else "") if head else detail
+
+
+def detail_shown(app) -> bool:
+    return app.preview.winfo_manager() == "grid"
+
+
+def expected_h(app) -> int:
+    """Logical window height for what is currently laid out (the window sizes itself to its content)."""
+    h = main.HEIGHT + (main.DETAIL_H if detail_shown(app) else 0)
+    h += main.PROGRESS_H if app.progress.winfo_manager() == "grid" else 0
+    return h + (main.STATS_GAP + main.STATS_H if app.expanded else 0)
+
+
 def pill(app):
     """(status title, LED colour) — the front-panel status line that replaced the pill."""
     return app.pill.cget("text"), app.led.cget("fg_color")
@@ -357,17 +382,18 @@ def test_layout_idle_preview(app, det, ep) -> None:
     wscale = ctk.ScalingTracker.get_widget_scaling(app)
     print(f"CTk window scaling {scale}, widget scaling {wscale}")
     w, h = app.winfo_width(), app.winfo_height()
-    check(abs(w - 360 * scale) <= 2 and abs(h - 268 * scale) <= 2, f"window size {w}x{h} != 360x268*{scale}")
+    check(not detail_shown(app) and abs(w - 360 * scale) <= 2 and abs(h - main.HEIGHT * scale) <= 2,
+          f"compact window {w}x{h} != 360x{main.HEIGHT}*{scale}")
     check(app.resizable() == (False, False), "window must be non-resizable")
     tw, th = app.toggle.winfo_width(), app.toggle.winfo_height()
     check(abs(tw - 180 * wscale) <= 2 and abs(th - 56 * wscale) <= 2, f"toggle {tw}x{th} != 180x56*{wscale}")
     check(pill(app) == ("Idle", PILL_COLORS["IDLE"]), f"idle status {pill(app)}")
     check(app.toggle.cget("text") == "Turn on", "IDLE toggle text 'Turn on'")
 
-    ok = pump_until(app, lambda: "pre-selected" in app.preview.cget("text"))
-    txt = app.preview.cget("text")
+    ok = pump_until(app, lambda: "to close" in status(app))
+    txt = status(app)
     print("IDLE preview:", txt.replace("\n", " | "))
-    check(ok and "2 of 4 apps pre-selected to close · 6.8 GB" in txt, f"preselected preview: {txt!r}")
+    check(ok and app.summary.cget("text") == "2 apps to close · 6.8 GB", f"preselected summary: {txt!r}")
     check("if all ticked" not in txt, "preselected preview must not say 'if all ticked'")
     check("eldenring, chrome, wallpaper64 +1 more" in txt, f"names line: {txt!r}")
     check(all(c[0] is True and c[1] is None for c in det.sweep_calls), "preview only uses dry_run=True, targets=None")
@@ -381,8 +407,25 @@ def test_layout_idle_preview(app, det, ep) -> None:
             [(l, "legend") for l in legend]:
         check(wdg.winfo_rooty() + wdg.winfo_height() <= bottom and wdg.winfo_rootx() + wdg.winfo_width() <= right,
               f"{nm} clipped")
-    check(app.preview.winfo_rooty() + app.preview.winfo_height() <= app.progress.winfo_rooty(),
-          "preview overlaps progress")
+    check(not detail_shown(app) and app.caret.cget("text") == T.CHEVRON_DOWN,
+          f"idle detail hidden behind a caret ({app.caret.cget('text')!r})")
+    check(app.summary.winfo_rootx() + app.summary.winfo_width() <= app.gear.winfo_rootx(), "summary runs into the gear")
+    # click the status line: the detail line opens, 10 px from the button, and the window grows by DETAIL_H
+    app._on_head_click()
+    pump(app, 0.2)
+    wscale = ctk.ScalingTracker.get_widget_scaling(app)
+    gap = app.toggle.winfo_rooty() - (app.preview.winfo_rooty() + app.preview.winfo_height())
+    check(detail_shown(app) and abs(app.winfo_height() - (main.HEIGHT + main.DETAIL_H) * scale) <= 2,
+          f"opened detail: window {app.winfo_height()}")
+    check(abs(gap - main.GAP_AFTER_DETAIL * wscale) <= 2, f"detail -> button gap {gap}")
+    check(abs(app.preview.winfo_rootx() - app.pill.winfo_rootx()) <= 2,
+          f"detail aligned with the state text ({app.preview.winfo_rootx()} vs {app.pill.winfo_rootx()})")
+    shot(app, "idle_detail_open")
+    app._flush_state() if app._state_save_id else None
+    check(pump_until(app, lambda: load_state_file().get("detail_open") is True, 3), "detail_open saved")
+    app._on_head_click()
+    pump(app, 0.2)
+    check(not detail_shown(app) and abs(app.winfo_height() - main.HEIGHT * scale) <= 2, "click again hides it")
     check(app.toggle.winfo_rooty() + app.toggle.winfo_height() <= app.gauge.winfo_rooty() - 16,
           "button overlaps memory card")
     check(app.telemetry.cget("text") == "", f"telemetry empty until something is freed ({app.telemetry.cget('text')!r})")
@@ -392,12 +435,10 @@ def test_layout_idle_preview(app, det, ep) -> None:
 
     det.preselected_mode = False
     app._request_preview()
-    ok = pump_until(app, lambda: "if all ticked" in app.preview.cget("text"))
-    txt = app.preview.cget("text")
+    ok = pump_until(app, lambda: "could close" in status(app))
+    txt = status(app)
     print("IDLE preview (none preselected):", txt.replace("\n", " | "))
-    check(ok and "4 apps could be closed · 10.4 GB if all ticked" in txt, f"all-ticked: {txt!r}")
-    check(app.preview.winfo_rooty() + app.preview.winfo_height() <= app.progress.winfo_rooty(),
-          "long preview overlaps progress")
+    check(ok and app.summary.cget("text") == "4 apps could close · 10.4 GB", f"all-ticked: {txt!r}")
     shot(app, "idle_all_ticked")
     det.preselected_mode = True
 
@@ -414,7 +455,7 @@ def test_on_flow(app, det, ep) -> None:
     check(ticks == {41001: True, 41002: True, 41003: False, 41004: False}, f"preselected ticks {ticks}")
     dsw, dsh = dlg.winfo_width(), dlg.winfo_height()
     scale = ctk.ScalingTracker.get_window_scaling(dlg)
-    check(abs(dsw - 372 * scale) <= 2 and abs(dsh - 320 * scale) <= 2, f"SweepDialog size {dsw}x{dsh}")
+    check(abs(dsw - 372 * scale) <= 2 and abs(dsh - (320 + SweepDialog.REOPEN_H) * scale) <= 2, f"SweepDialog size {dsw}x{dsh}")
     check(dlg.grab_status() == "local", f"SweepDialog grab {dlg.grab_status()}")
     shot(dlg, "sweepdialog")
     n_sweeps = len(det.sweep_calls)
@@ -432,8 +473,8 @@ def test_on_flow(app, det, ep) -> None:
 
     ep.status_value = active_status(True, "swift-test-1")
     fire(ep.start_calls[-1][0])
-    ok = pump_until(app, lambda: app.state_name == "ACTIVE" and app.preview.cget("text").startswith("swift-test-1\n"))
-    check(ok, f"on_ready -> ACTIVE 'swift-test-1' (got {app.state_name}, {app.preview.cget('text')!r})")
+    ok = pump_until(app, lambda: app.state_name == "ACTIVE" and status(app).startswith("swift-test-1\n"))
+    check(ok, f"on_ready -> ACTIVE 'swift-test-1' (got {app.state_name}, {status(app)!r})")
     check(pill(app) == ("Serving", PILL_COLORS["ACTIVE"]), f"active status {pill(app)}")
     check(app.toggle.cget("text") == "Turn off", "ACTIVE toggle 'Turn off'")
     check(str(app.gear.cget("state")) == "normal", "gear enabled while ACTIVE")
@@ -493,7 +534,7 @@ def test_off_flow(app, det, ep, dialogs: Dialogs) -> None:
     app.on_toggle()
     fire(ep.stop_calls[-1][0], stop_result(ok=False, port_released=False, error="port still in use"))
     check(pump_until(app, lambda: app.state_name == "ERROR"), "stop failure -> ERROR")
-    check("port still in use" in app.preview.cget("text"), "stop failure text")
+    check("port still in use" in status(app), "stop failure text")
     dialogs.yesno = True
 
 
@@ -509,15 +550,15 @@ def test_error_and_cancel(app, det, ep) -> None:
     fire(ep.start_calls[-1][1], msg)
     check(pump_until(app, lambda: app.state_name == "ERROR"), "on_error -> ERROR")
     check(pill(app) == ("Error", PILL_COLORS["ERROR"]), f"error status {pill(app)}")
-    short = "Strata exited (code 1) · open strata-20261112-050000.log"
-    check(app.preview.cget("text") == short and app.toggle.cget("text") == "Turn on",
-          f"ERROR text shortened to the log file name + Turn on ({app.preview.cget('text')!r})")
+    short = "Strata exited (code 1)\nOpen strata-20261112-050000.log"
+    check(status(app) == short and app.toggle.cget("text") == "Turn on",
+          f"ERROR text shortened to the log file name + Turn on ({status(app)!r})")
     check(app._error_log == "C:\\logs\\strata-20261112-050000.log" and str(app.preview.cget("cursor")) == "hand2",
           "error line links to the full log path")
     app._error_hold_until = 0.0              # even after the hold expires...
     app._request_preview()
     pump(app, 0.3)
-    check(app.preview.cget("text") == short, "ERROR keeps its message until the user acts (no preview overwrite)")
+    check(status(app) == short, "ERROR keeps its message until the user acts (no preview overwrite)")
     shot(app, "error")
 
     # cancel during STARTING (server phase)
@@ -672,7 +713,7 @@ def test_delete_window(dialogs: Dialogs) -> None:
     to_active(app, ep)
     app.turn_off()
     app.on_close_request()
-    check(not app._destroyed and "please wait" in app.preview.cget("text"), "STOPPING close ignored + note")
+    check(not app._destroyed and "please wait" in status(app), "STOPPING close ignored + note")
     ep.status_value = dict(IDLE_STATUS)
     fire(ep.stop_calls[-1][0], stop_result())
     pump_until(app, lambda: app.state_name == "IDLE")
@@ -755,8 +796,8 @@ def test_load_progress_view(app, det, ep) -> None:
     ep.status = lambda: {**real_status(), "log_path": str(logf)}
     try:
         app.on_toggle()
-        ok = pump_until(app, lambda: "Loading experts into RAM" in app.preview.cget("text"), 5)
-        txt = app.preview.cget("text")
+        ok = pump_until(app, lambda: "Loading experts into RAM" in status(app), 5)
+        txt = status(app)
         check(ok and "about 45 GB" in txt, f"phase from log shown ({txt!r})")
         check(app.elapsed.cget("text").count(":") == 1, f"elapsed timer shown ({app.elapsed.cget('text')!r})")
         check(0.25 <= app.progress.get() <= 0.78, f"progress within the experts phase ({app.progress.get():.2f})")
@@ -764,7 +805,7 @@ def test_load_progress_view(app, det, ep) -> None:
         shot(app, "loading_progress")
         with open(logf, "a", encoding="utf-8") as f:
             f.write("[strata] filling the GPU's expert cache (1095 experts, 2.11 GiB of VRAM) ...\n")
-        ok = pump_until(app, lambda: "Filling GPU cache" in app.preview.cget("text"), 5)
+        ok = pump_until(app, lambda: "Filling GPU cache" in status(app), 5)
         check(ok and app.progress.get() >= 0.78, f"next phase advances the bar ({app.progress.get():.2f})")
         fire(ep.start_calls[-1][0])                  # on_ready
         check(pump_until(app, lambda: app.state_name == "ACTIVE"), "ready -> ACTIVE")
@@ -794,11 +835,11 @@ def test_low_ram(app, det, ep) -> None:
     try:
         check(app._strata_config_path() == str(cfg_json), "config path from launch_cmd --config")
         plan = app._ram_plan([dict(c) for c in CANDS])
-        check(plan is not None and abs(plan.need_mb - (46.84 + 3.0) * 1024) < 1, f"plan uses the learned arena ({plan})")
+        check(plan is not None and abs(plan.need_mb - (46.84 + ram_plan.DEFAULT_HEADROOM_GIB) * 1024) < 1, f"plan uses the learned arena ({plan})")
 
         cands = [dict(c) for c in CANDS]
         total = sum(c["ram_mb"] for c in cands)
-        need = (46.84 + 3.0) * 1024
+        need = (46.84 + ram_plan.DEFAULT_HEADROOM_GIB) * 1024
         # 1) short but reachable: the plan's pre-ticks replace the detector's, the line confirms full speed
         pl = ram_plan.plan(cands, need - total + 100, 46.84)
         rec = []
@@ -850,26 +891,27 @@ def test_low_ram(app, det, ep) -> None:
         ep.status = lambda: {**real_status(), "log_path": str(logf)}
         try:
             app.on_toggle()
-            ok = pump_until(app, lambda: "Waiting for RAM" in app.preview.cget("text"), 6)
-            txt = app.preview.cget("text")
+            ok = pump_until(app, lambda: "Waiting for RAM" in status(app), 6)
+            txt = status(app)
             check(ok and "needs 47 GB, 40 GB free" in txt, f"waiting phase from the engine log ({txt!r})")
             check(app.preview.cget("text_color") == TH.AMBER, "waiting shown in amber")
             with open(eng, "a", encoding="utf-8") as fh:
                 fh.write("strata generate: not enough RAM for the expert arena (it needs 46.84 GiB and 39.52 GiB is "
                          "available (7.32 GiB short, after waiting)): this run reads the experts from the file\n"
                          "strata generate: experts via mmap (not enough RAM for the expert arena)\n")
-            ok = pump_until(app, lambda: app.preview.cget("text").startswith(
-                "Low-RAM mode · reading experts from SSD · slower"), 6)
-            check(LOW_RAM_NOTE_TXT not in app.preview.cget("text"), "no duplicate RAM note under the fallback line")
-            check(ok, f"fallback shown while loading ({app.preview.cget('text')!r})")
+            ok = pump_until(app, lambda: status(app).startswith(
+                "Low-RAM mode\nreading experts from SSD · slower"), 6)
+            check(LOW_RAM_NOTE_TXT not in status(app), "no duplicate RAM note under the fallback line")
+            check(ok, f"fallback shown while loading ({status(app)!r})")
             shot(app, "loading_low_ram")
             ep.status_value = active_status()
             fire(ep.start_calls[-1][0])                  # on_ready
             check(pump_until(app, lambda: app.state_name == "ACTIVE"), "ready -> ACTIVE")
-            ok = pump_until(app, lambda: pill(app)[0] == "Serving · Low-RAM mode", 4)
-            check(ok and pill(app)[1] == TH.AMBER, f"serving shows Low-RAM in amber ({pill(app)})")
-            txt = app.preview.cget("text")
-            check("Low-RAM mode: reading from SSD (slower) · ~7.3 GB short" in txt, f"serving detail ({txt!r})")
+            ok = pump_until(app, lambda: app.summary.cget("text") == "Low-RAM mode", 4)
+            check(ok and pill(app) == ("Serving", TH.AMBER) and detail_shown(app),
+                  f"serving shows Low-RAM in amber, detail forced open ({pill(app)}, {status(app)!r})")
+            txt = status(app)
+            check("Reading from SSD (slower) · ~7.3 GB short" in txt, f"serving detail ({txt!r})")
             shot(app, "serving_low_ram")
         finally:
             ep.status = real_status
@@ -890,8 +932,8 @@ def test_low_ram(app, det, ep) -> None:
             fire(ep.start_calls[-1][0])
             check(pump_until(app, lambda: app.state_name == "ACTIVE"), "full run -> ACTIVE")
             pump(app, 1.5)
-            check(pill(app)[0] == "Serving" and "Low-RAM" not in app.preview.cget("text"),
-                  f"full-RAM run: plain Serving ({pill(app)}, {app.preview.cget('text')!r})")
+            check(pill(app)[0] == "Serving" and "Low-RAM" not in status(app),
+                  f"full-RAM run: plain Serving ({pill(app)}, {status(app)!r})")
         finally:
             ep.status = real_status
             ep.status_value = dict(IDLE_STATUS)
@@ -918,8 +960,8 @@ def test_review_fixes(app, det, ep) -> None:
         app.on_toggle()
         app.on_toggle()                              # 2nd click of a double-click, same instant
         pump(app, 0.2)
-        check(app.state_name == "STARTING" and "cancelled" not in app.preview.cget("text").lower(),
-              f"double-click keeps the start ({app.state_name}, {app.preview.cget('text')!r})")
+        check(app.state_name == "STARTING" and "cancelled" not in status(app).lower(),
+              f"double-click keeps the start ({app.state_name}, {status(app)!r})")
         if pump_until(app, lambda: isinstance(app.dialog, SweepDialog), 3):
             app.dialog._decide("cancel")
         pump_until(app, lambda: app.state_name == "IDLE", 3)
@@ -944,7 +986,7 @@ def test_review_fixes(app, det, ep) -> None:
         app._pending_launcher = info
         check(not app._apply_pending_launcher(note=True) and app._pending_launcher is info,
               "Strata on the old port: the launcher waits")
-        check("applies when Strata on port" in app.preview.cget("text"), f"and says so ({app.preview.cget('text')!r})")
+        check("applies when Strata on port" in status(app), f"and says so ({status(app)!r})")
     finally:
         main.launcher_bat.apply_to_config = real_apply
         ep.protected_pids = real_prot
@@ -992,6 +1034,63 @@ def test_strata_estimate(app, det, ep) -> None:
         app._set_state("IDLE")
 
 # ---------------------------------------------------------------- v1.1: stats section
+def test_reopen_flow(app, det, ep) -> None:
+    """After Turn off: auto apps relaunch (faked launch), games stay as a one-click offer that relaunches them."""
+    py = os.path.join(sys.base_prefix, "python.exe")
+    pyw = os.path.join(sys.base_prefix, "pythonw.exe")
+    recs = [{"name": "notes.exe", "exe": py, "cmdline": [py], "cwd": sys.base_prefix, "category": "app",
+             "create_time": 1.0, "elevated": False, "aumid": None},
+            {"name": "eldenring.exe", "exe": pyw, "cmdline": [pyw], "cwd": sys.base_prefix, "category": "game",
+             "create_time": 2.0, "elevated": False, "aumid": None},
+            {"name": "admin.exe", "exe": sys.executable, "cmdline": [sys.executable], "cwd": "", "category": "app",
+             "create_time": 3.0,
+             "elevated": True, "aumid": None}]
+    old_hold, old_stagger = main.NOTE_HOLD_S, main.REOPEN_STAGGER_S
+    main.NOTE_HOLD_S, main.REOPEN_STAGGER_S = 0.6, 0.05
+    try:
+        # the sweep dialog offers the choice; unticking is remembered
+        dlg_ref = {}
+        d = SweepDialog(app, det.cands, lambda dec, t: dlg_ref.setdefault("dec", dec), reopen_default=True)
+        pump(app, 0.3)
+        check(d._reopen_var is not None and d._reopen_var.get() is True, "start dialog: reopen ticked by default")
+        shot(d, "sweep_reopen")
+        d._reopen_var.set(False)
+        app._on_sweep_decision(app._start_token, "cancel", [], d)      # cancel: the preference is not changed
+        check(app._reopen_pref is True, "cancel keeps the reopen preference")
+        d._decide("cancel")
+        pump(app, 0.3)
+
+        app._set_state("IDLE")
+        LAUNCHED.clear()
+        main._save_reopen_records(recs[:1])
+        main._save_reopen_records(recs[1:])                            # a 2nd sweep merges, does not replace
+        check(len(reopen.load_pending()) == 3, f"pending merged ({len(reopen.load_pending())})")
+        app._reopening = True
+        app._run_worker("hc-reopen", app._reopen_worker)
+        check(pump_until(app, lambda: not app._reopening, 5), "reopen worker finished")
+        check(LAUNCHED == ["notes.exe"], f"only the plain app was relaunched ({LAUNCHED})")
+        check("Reopened 1 app" in status(app), f"note says so ({status(app)!r})")
+        left = [r.name for r in reopen.load_pending()]
+        check(left == ["eldenring.exe"], f"the game stays pending, the admin app is dropped ({left})")
+        ok = pump_until(app, lambda: "Reopen eldenring" in status(app), 4)
+        check(ok and detail_shown(app) and app._detail_link and str(app.preview.cget("cursor")) == "hand2",
+              f"idle shows a clickable 'Reopen eldenring' ({status(app)!r})")
+        shot(app, "reopen_offer")
+        app.preview._label.event_generate("<Button-1>")
+        check(pump_until(app, lambda: "eldenring.exe" in LAUNCHED, 4), f"click relaunches the game ({LAUNCHED})")
+        check(pump_until(app, lambda: not reopen.load_pending() and not app._reopen_offer, 3), "offer cleared")
+        # an offer left over from an earlier session is shown at startup; turning on clears it
+        main._save_reopen_records(recs[1:2])
+        app._run_worker("hc-reopen-load", app._load_reopen_offer)
+        check(pump_until(app, lambda: bool(app._reopen_offer), 3), "pending apps from earlier are offered")
+        reopen.clear_pending()
+        app._reopen_offer = []
+        app._request_preview()
+        pump(app, 0.4)
+    finally:
+        main.NOTE_HOLD_S, main.REOPEN_STAGGER_S = old_hold, old_stagger
+
+
 def load_state_file() -> dict:
     try:
         return json.loads((HOME / "state.json").read_text(encoding="utf-8"))
@@ -1020,8 +1119,8 @@ def check_stats_fit(app, label: str) -> None:
     scale = ctk.ScalingTracker.get_window_scaling(app)
     wscale = ctk.ScalingTracker.get_widget_scaling(app)
     w, h = app.winfo_width(), app.winfo_height()
-    check(abs(w - 360 * scale) <= 2 and abs(h - main.HEIGHT_EXPANDED * scale) <= 2,
-          f"{label}: expanded window {w}x{h} != 360x{main.HEIGHT_EXPANDED}*{scale}")
+    check(abs(w - 360 * scale) <= 2 and abs(h - expected_h(app) * scale) <= 2,
+          f"{label}: expanded window {w}x{h} != 360x{expected_h(app)}*{scale}")
     bottom = app.winfo_rooty() + h
     card_bottom = app.stats.winfo_rooty() + app.stats.winfo_height()
     # same bottom margin as the collapsed v1.0 layout (16 px; its fixed-height rows round up to 3 px slack at 150 %)
@@ -1054,7 +1153,8 @@ def test_stats_section(app, det, ep) -> None:
     app._set_state("IDLE")
     check(not app.expanded and not app.stats.winfo_ismapped(), "starts collapsed (no state.json)")
     check(app.chevron.cget("text") == T.CHEVRON_DOWN, "collapsed chevron points down")
-    check(abs(app.winfo_height() - 268 * scale) <= 2, "collapsed height is v1.0's 268")
+    check(abs(app.winfo_height() - expected_h(app) * scale) <= 2,
+          f"collapsed height fits the content ({app.winfo_height()} vs {expected_h(app)})")
     check(vram.started == 1, "VRAM sampler started with the app")
     cx = app.chevron.winfo_rootx() + app.chevron.winfo_width()
     check(cx <= app.mem_card.winfo_rootx() + app.mem_card.winfo_width() - 8 * scale
@@ -1142,8 +1242,9 @@ def test_stats_section(app, det, ep) -> None:
     # ---- collapse: exact v1.0 size again, polling stops, state persisted
     app.chevron.invoke()
     pump(app, 0.3)
-    check(not app.expanded and not app.stats.winfo_ismapped() and abs(app.winfo_height() - 268 * scale) <= 2
-          and abs(app.winfo_width() - 360 * scale) <= 2, f"collapse -> 360x268 ({app.winfo_width()}x{app.winfo_height()})")
+    check(not app.expanded and not app.stats.winfo_ismapped() and abs(app.winfo_height() - expected_h(app) * scale) <= 2
+          and abs(app.winfo_width() - 360 * scale) <= 2,
+          f"collapse -> 360x{expected_h(app)} ({app.winfo_width()}x{app.winfo_height()})")
     check(pump_until(app, lambda: load_state_file().get("stats_expanded") is False, 3), "collapsed state persisted")
     card_bottom = app.mem_card.winfo_rooty() + app.mem_card.winfo_height()
     check(abs((app.winfo_rooty() + app.winfo_height() - card_bottom) - 16 * scale) <= 2, "memory card margin restored")
@@ -1188,18 +1289,18 @@ def test_notes_and_stale_status(app, det, ep) -> None:
     check(pump_until(app, lambda: app.state_name == "IDLE"), "OFF -> IDLE (note test)")
     n = len(det.sweep_calls)
     pump(app, 1.5)
-    check(app.preview.cget("text") == "Stopped · freed 2.0 GB" and len(det.sweep_calls) == n,
-          f"'Stopped · freed' note is held, not replaced by the sweep preview at once ({app.preview.cget('text')!r})")
+    check(status(app) == "Stopped · freed 2.0 GB" and len(det.sweep_calls) == n,
+          f"'Stopped · freed' note is held, not replaced by the sweep preview at once ({status(app)!r})")
     app._on_monitor_status(seq_before_stop, active_status())      # probed while Strata was still up
     check(app.state_name == "IDLE", "stale 'active' monitor reading after OFF is ignored")
-    check(pump_until(app, lambda: "pre-selected" in app.preview.cget("text"), 6),
-          f"sweep preview returns when the note expires ({app.preview.cget('text')!r})")
+    check(pump_until(app, lambda: "to close" in status(app), 6),
+          f"sweep preview returns when the note expires ({status(app)!r})")
     app._on_monitor_status(app._state_seq, active_status())       # a current reading still reconciles
     check(app.state_name == "ACTIVE", "fresh monitor reading IDLE -> ACTIVE")
     ep.status_value = dict(IDLE_STATUS)
     app.on_status(ep.status()); app.on_status(ep.status())
     pump(app, 0.1)
-    check(app.state_name == "IDLE" and app.preview.cget("text") == "Endpoint is no longer running",
+    check(app.state_name == "IDLE" and status(app) == "Endpoint is no longer running",
           "ACTIVE -> IDLE note")
     app._set_state("IDLE")
 
@@ -1308,8 +1409,16 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
         check(str(dlg._save_btn.cget("state")) == "normal", "Save enabled for a valid launcher")
         w, h = dlg.winfo_width(), dlg.winfo_height()
         scale = ctk.ScalingTracker.get_window_scaling(dlg)
-        check(abs(w - 340 * scale) <= 2 and abs(h - 252 * scale) <= 2, f"SettingsDialog size {w}x{h}")
+        check(abs(w - 340 * scale) <= 2 and abs(h - SettingsDialog.HEIGHT * scale) <= 2, f"SettingsDialog size {w}x{h}")
         check(dlg.grab_status() == "local", f"SettingsDialog grab {dlg.grab_status()}")
+        check(dlg._link_host.cget("text") == "not running" and dlg._link_text.cget("text_color") == T.TEXT_3,
+              f"dashboard link greyed out while Strata is off ({dlg._link_host.cget('text')!r})")
+        dlg.open_dashboard()
+        check(OPENED_URLS == [], "dashboard link does nothing while Strata is off")
+        dlg.copy_api()
+        check(dlg.clipboard_get() == f"http://127.0.0.1:{pa}/v1" and dlg._copy_btn.cget("text") == "Copied",
+              "Copy puts the API address on the clipboard")
+        shot(dlg, "settings_idle")
         bottom = dlg.winfo_rooty() + h
         check(dlg._save_btn.winfo_rooty() + dlg._save_btn.winfo_height() <= bottom - 10 * scale
               and dlg._detail.winfo_rooty() + dlg._detail.winfo_height() <= dlg._protected_btn.winfo_rooty(),
@@ -1353,7 +1462,7 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
         check(disk["user_whitelist"] == ["keep.exe"], "saving the launcher keeps the rest of config.json")
         check(app.cfg["launcher_bat"] == bat_b and app.cfg["port"] == pb and app.cfg["model_name"] == "model-b"
               and app._pending_launcher is None, "IDLE: the shared config switches immediately")
-        check("run-b.bat" in app.preview.cget("text"), f"idle note names the new launcher ({app.preview.cget('text')!r})")
+        check("run-b.bat" in status(app), f"idle note names the new launcher ({status(app)!r})")
 
         # ---- Browse… to a .bat in another Strata folder
         app.gear.invoke()
@@ -1401,6 +1510,13 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
         dlg = app.dialog
         check(isinstance(dlg, SettingsDialog), "Settings opens while ACTIVE")
         pump(app, 0.3)
+        url = config_store.server_root(app.cfg["endpoint_url"]) + "/"
+        check(dlg._link_host.cget("text") == url[len("http://"):-1] and dlg._link_text.cget("text_color") == T.TEXT,
+              f"live link shows the host ({dlg._link_host.cget('text')!r})")
+        dlg._link_text._label.event_generate("<Button-1>")
+        pump(app, 0.1)
+        check(OPENED_URLS == [url], f"click opens the Strata dashboard ({OPENED_URLS})")
+        shot(dlg, "settings_active")
         dlg._choice.set("run-a.bat")
         dlg._on_pick("run-a.bat")
         check(dlg._msg.cget("text") == "Applies next start — Strata keeps running", f"hint ({dlg._msg.cget('text')!r})")
@@ -1414,8 +1530,8 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
               "the running endpoint keeps its port/config (OFF must still find it)")
         check(len(ep.stop_calls) == n_stop and len(ep.start_calls) == n_start and app.state_name == "ACTIVE",
               "no restart")
-        check("run-a.bat applies next start" in app.preview.cget("text"), f"main window says so "
-              f"({app.preview.cget('text')!r})")
+        check("run-a.bat applies next start" in status(app), f"main window says so "
+              f"({status(app)!r})")
         shot(app, "active_pending_launcher")
         app.gear.invoke()
         dlg = app.dialog
@@ -1442,7 +1558,7 @@ def test_settings_dialog(dialogs: Dialogs) -> None:
         check(dlg._msg.cget("text") == "", "unchanged selection: no hint")
         dlg._save_btn.invoke()
         check(pump_until(app, lambda: not app._dialog_open()) and app._pending_launcher is None
-              and "applies next start" not in app.preview.cget("text"), "re-saving the active launcher is not 'pending'")
+              and "applies next start" not in status(app), "re-saving the active launcher is not 'pending'")
 
         # ---- gear is inert while STARTING / STOPPING
         app.state_name = "STARTING"
@@ -1488,7 +1604,8 @@ def run() -> int:
                              (test_sweep_dialog_close_x, (app, det, ep)), (test_whitelist_modal, (app, det, ep)),
                              (test_load_progress_view, (app, det, ep)), (test_strata_estimate, (app, det, ep)),
                              (test_stats_section, (app, det, ep)), (test_notes_and_stale_status, (app, det, ep)),
-                             (test_low_ram, (app, det, ep)), (test_review_fixes, (app, det, ep))):
+                             (test_low_ram, (app, det, ep)), (test_review_fixes, (app, det, ep)),
+                             (test_reopen_flow, (app, det, ep))):
                 print(f"-- {fn.__name__}")
                 try:
                     fn(*args)

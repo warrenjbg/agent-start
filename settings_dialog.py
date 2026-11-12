@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import logging
 import os
+import webbrowser
 from tkinter import filedialog
 from typing import Callable
 
 import customtkinter as ctk
 
+import config_store
 import launcher_bat
 import theme as T
 from launcher_bat import LauncherError, LauncherInfo
@@ -22,7 +24,8 @@ NO_LAUNCHERS = "No run-*.bat found"
 
 class SettingsDialog(ctk.CTkToplevel):
     WIDTH = 340
-    HEIGHT = 252
+    HEIGHT = 326
+    EXT_GLYPH = "\uE8A7"   # Segoe Fluent Icons "Open in new window"
 
     def __init__(self, master, cfg: dict, detector,
                  on_save: Callable[[LauncherInfo, Callable[[str | None], None]], None],
@@ -93,19 +96,59 @@ class SettingsDialog(ctk.CTkToplevel):
                                     wraplength=self.WIDTH - 24, height=30)
         self._detail.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 0))
 
+        # ---- Endpoint: the running server's own web app (chat, Monitor, its settings) + the API address
+        root = config_store.server_root(str(cfg.get("endpoint_url") or ""))
+        self._dashboard_url = root + "/" if root else ""
+        self._api_url = str(cfg.get("endpoint_url") or "")
+        ctk.CTkLabel(self, text="Endpoint", anchor="w", text_color=T.TEXT_2, font=small, height=16).grid(
+            row=4, column=0, sticky="ew", padx=12, pady=(2, 4))
+        live = self._running and bool(self._dashboard_url)
+        self._link = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=8, height=30)
+        self._link.grid(row=5, column=0, sticky="ew", padx=12)
+        self._link.grid_columnconfigure(2, weight=1)
+        self._link_font = ctk.CTkFont(family=T.ui_family(), size=12)
+        self._link_font_hover = ctk.CTkFont(family=T.ui_family(), size=12, underline=True)
+        self._link_text = ctk.CTkLabel(self._link, text="Open Strata dashboard", font=self._link_font, height=28,
+                                       text_color=T.TEXT if live else T.TEXT_3, anchor="w")
+        self._link_text.grid(row=0, column=0, padx=(10, 0), sticky="w")
+        self._link_ext = ctk.CTkLabel(self._link, text=self.EXT_GLYPH, height=28, width=14,
+                                      font=ctk.CTkFont(family=T.icon_family(), size=10),
+                                      text_color=T.TEXT_2 if live else T.TEXT_3)
+        self._link_ext.grid(row=0, column=1, padx=(6, 0))
+        host = self._dashboard_url.replace("http://", "").rstrip("/")
+        self._link_host = ctk.CTkLabel(self._link, text=host if live else "not running", font=mono, height=28,
+                                       text_color=T.TEXT_2 if live else T.TEXT_3, anchor="e")
+        self._link_host.grid(row=0, column=2, padx=(8, 10), sticky="e")
+        if live:
+            for w in (self._link, self._link_text, self._link_ext, self._link_host):
+                w.configure(cursor="hand2")
+                w.bind("<Button-1>", lambda _e: self.open_dashboard())
+                w.bind("<Enter>", lambda _e: self._link_hover(True))
+                w.bind("<Leave>", lambda _e: self._link_hover(False))
+
+        api = ctk.CTkFrame(self, fg_color="transparent")
+        api.grid(row=6, column=0, sticky="ew", padx=12, pady=(4, 0))
+        api.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(api, text=f"API {self._api_url}", font=mono, text_color=T.TEXT_2, anchor="w", height=18).grid(
+            row=0, column=0, sticky="w")
+        self._copy_btn = ctk.CTkButton(api, text="Copy", width=44, height=18, corner_radius=6, font=small,
+                                       fg_color="transparent", hover_color=T.RAISED, text_color=T.TEXT_2,
+                                       command=self.copy_api)
+        self._copy_btn.grid(row=0, column=1, sticky="e")
+
         ctk.CTkFrame(self, height=1, fg_color=T.HAIRLINE, bg_color=T.HAIRLINE, corner_radius=0).grid(
-            row=4, column=0, sticky="ew", padx=12, pady=(8, 10))
+            row=7, column=0, sticky="ew", padx=12, pady=(10, 10))
 
         self._protected_btn = ctk.CTkButton(self, text="Protected apps…", height=30, corner_radius=8, font=body,
                                             fg_color=T.RAISED, hover_color=T.RAISED_HOVER, text_color=T.TEXT,
                                             anchor="w", command=self.open_protected)
-        self._protected_btn.grid(row=5, column=0, sticky="ew", padx=12)
+        self._protected_btn.grid(row=8, column=0, sticky="ew", padx=12)
 
         self._msg = ctk.CTkLabel(self, text="", anchor="w", text_color=T.TEXT_2, font=small, height=16)
-        self._msg.grid(row=6, column=0, sticky="ew", padx=12, pady=(8, 2))
+        self._msg.grid(row=9, column=0, sticky="ew", padx=12, pady=(8, 2))
 
         btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=7, column=0, sticky="ew", padx=12, pady=(0, 12))
+        btns.grid(row=10, column=0, sticky="ew", padx=12, pady=(0, 12))
         btns.grid_columnconfigure((0, 1), weight=1, uniform="b")
         self._cancel_btn = ctk.CTkButton(btns, text="Cancel", height=30, fg_color="transparent", border_width=1,
                                          border_color=T.RAISED_HOVER, hover_color=T.RAISED, command=self.close)
@@ -117,6 +160,29 @@ class SettingsDialog(ctk.CTkToplevel):
 
         self._load_launchers()
         apply_modal(self, master)
+
+    # ------------------------------------------------------------------ endpoint
+    def _link_hover(self, on: bool) -> None:
+        self._link.configure(fg_color=T.RAISED if on else T.SURFACE)
+        self._link_text.configure(font=self._link_font_hover if on else self._link_font)
+
+    def open_dashboard(self) -> None:
+        """Strata's own web app in the default browser. Only offered while Strata is serving."""
+        if not (self._running and self._dashboard_url):
+            return
+        try:
+            webbrowser.open(self._dashboard_url)
+        except Exception:  # noqa: BLE001
+            log.exception("could not open %s", self._dashboard_url)
+
+    def copy_api(self) -> None:
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self._api_url)
+            self._copy_btn.configure(text="Copied")
+            later(self, 1500, lambda: self._copy_btn.configure(text="Copy"))
+        except Exception:  # noqa: BLE001
+            log.debug("copy failed", exc_info=True)
 
     # ------------------------------------------------------------------ launcher list
     @staticmethod

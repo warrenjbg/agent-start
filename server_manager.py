@@ -337,8 +337,10 @@ class EndpointManager:
             return set()
 
     def strata_memory_mb(self) -> float | None:
-        """RAM charged to the running Strata tree: sum over processes of max(working set, private commit).
+        """Physical RAM held by the running Strata tree: the sum of working sets.
 
+        Not private commit: in full-RAM mode strata.exe commits far more than it has resident (measured: working set
+        48.7 GB, private commit 63.3 GB on a 64 GB PC), so max(rss, private) booked the whole machine to Strata.
         None when no Strata server is found. Cheap (no HTTP); call from a worker thread.
         """
         try:
@@ -349,7 +351,7 @@ class EndpointManager:
             for p in self._tree(root):
                 try:
                     mi = p.memory_info()
-                    total += max(mi.rss, getattr(mi, "private", 0) or 0)
+                    total += mi.rss                        # working set = resident physical RAM
                 except (psutil.Error, OSError):
                     continue
             return round(total / (1024 * 1024), 1)

@@ -128,9 +128,11 @@ class SweepDialog(ctk.CTkToplevel):
     WIDTH = 372
     HEIGHT = 320
     RAM_LINE_H = 34                              # extra height when the full-speed RAM check is shown
+    REOPEN_H = 26                                # extra height for the "Reopen these when Strata stops" checkbox
 
     def __init__(self, master, candidates: list[dict],
-                 on_decision: Callable[[str, list[tuple[int, float]]], None], ram=None) -> None:
+                 on_decision: Callable[[str, list[tuple[int, float]]], None], ram=None,
+                 reopen_default: bool | None = None) -> None:
         """ram: an optional ram_plan.RamPlan. When it knows Strata's full-RAM requirement, its pre-ticks replace the
         detector's and a live line says whether the ticked apps free enough for the fast full-RAM mode."""
         super().__init__(master, fg_color=_BG)
@@ -139,16 +141,20 @@ class SweepDialog(ctk.CTkToplevel):
         self._decided = False
         self._rows: list[tuple[ctk.BooleanVar, dict]] = []
         self._ram = ram if ram is not None and getattr(ram, "need_mb", 0) > 0 else None
+        # None = feature off (no checkbox). The choice is read by the caller after the decision.
+        self._reopen_var = ctk.BooleanVar(value=bool(reopen_default)) if reopen_default is not None else None
+        self.reopen_choice = bool(reopen_default)
         pre = set(self._ram.preticked_pids) if self._ram else None
 
         self.title("Close apps before start")
         self.resizable(False, False)
-        center_over(self, master, self.WIDTH, self.HEIGHT + (self.RAM_LINE_H if self._ram else 0))
+        center_over(self, master, self.WIDTH, self.HEIGHT + (self.RAM_LINE_H if self._ram else 0)
+                    + (self.REOPEN_H if self._reopen_var is not None else 0))
         self.protocol("WM_DELETE_WINDOW", lambda: self._decide("cancel"))
         self.bind("<Escape>", lambda _e: self._decide("cancel"))
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)       # rows: title, warning, RAM check (optional), list, buttons
+        self.grid_rowconfigure(3, weight=1)       # rows: title, warning, RAM check (opt.), list, reopen (opt.), buttons
         self._ram_head = self._ram_live = None
         if self._ram:
             ram_box = ctk.CTkFrame(self, fg_color="transparent")
@@ -192,8 +198,15 @@ class SweepDialog(ctk.CTkToplevel):
                 w.bind("<Button-1>", lambda _e, c=cb: c.toggle())
             self._rows.append((var, cand))
 
+        if self._reopen_var is not None:
+            ctk.CTkCheckBox(self, text="Reopen these when Strata stops (games: one click)", variable=self._reopen_var,
+                            font=small, text_color=_MUTED, fg_color=T.TEXT, hover_color=T.PRIMARY_HOVER,
+                            checkmark_color=T.BG, border_color=T.TEXT_3, corner_radius=4,
+                            checkbox_width=16, checkbox_height=16).grid(
+                row=4, column=0, sticky="w", padx=14, pady=(8, 0))
+
         btns = ctk.CTkFrame(self, fg_color="transparent")
-        btns.grid(row=4, column=0, sticky="ew", padx=12, pady=(8, 12))
+        btns.grid(row=5, column=0, sticky="ew", padx=12, pady=(8, 12))
         btns.grid_columnconfigure((0, 1), weight=1, uniform="b")
         self._close_btn = ctk.CTkButton(btns, text="Close selected & start", height=32,
                                         fg_color=_DANGER, hover_color=_DANGER_HOVER,
@@ -248,6 +261,8 @@ class SweepDialog(ctk.CTkToplevel):
             return
         self._decided = True
         targets = self.selected_targets() if decision == "close_and_start" else []
+        if self._reopen_var is not None:
+            self.reopen_choice = bool(self._reopen_var.get())
         release_modal(self)
         try:
             self.destroy()

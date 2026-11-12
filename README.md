@@ -40,9 +40,9 @@ script); the Settings dialog and the log show the same number.
 
 | Area | Shows |
 |---|---|
-| Status line | LED + state: Idle (grey) · Starting / Loading / Stopping (amber) · Serving (green) · Error (red); elapsed timer while starting |
-| ⚙ | **Settings**: Strata launcher + Protected apps (see below). Disabled while starting/stopping |
-| Detail | Idle: what ON would close (refreshed every 5 s). Starting: load phase from Strata's log (*Reading weights → Loading experts into RAM → Filling GPU cache → Almost ready*) with a progress bar and "usually about m:ss" from the last cold load. Serving: model id and endpoint |
+| Status line | LED + state + a short summary: Idle (grey) *2 apps to close · 6.8 GB* · Starting (amber) *Loading experts into RAM* + timer · Serving (green) *model* · Low-RAM (amber) · Error (red) *what failed*. Click it to show or hide the detail line (remembered) |
+| ⚙ | **Settings**: Strata launcher, the Strata dashboard link + API address, Protected apps (see below). Disabled while starting/stopping |
+| Detail line | Optional: idle = which apps would be closed; serving = *Up 12 min · last reply 85 tok/s*. Always shown when it matters: loading (phase, *usually 0:58*, progress bar), Low-RAM mode, errors (click opens the log), notes such as *Stopped · freed 47 GB*, and the one-click *Reopen …* offer |
 | Button | **Turn on** · **Cancel** (while starting) · **Turn off** |
 | Memory | Bar + legend of physical RAM: other apps · Strata · free; "Freed" total for the session |
 | ⌄ (in the Memory card) | Expands the window downward to the **stats** section; click again to collapse |
@@ -59,6 +59,9 @@ script); the Settings dialog and the log show the same number.
   in the dialog.
   **Save** writes the choice to `config.json`. If Strata is running, nothing is restarted: the main window shows
   *"run-….bat applies next start"* and the new launcher is used the next time you turn it on.
+- **Endpoint** — **Open Strata dashboard** opens Strata's own web app (`http://127.0.0.1:<port>/`: chat, Monitor,
+  its settings) in your browser; greyed out with *not running* while Strata is off. Below it the API address
+  (`…/v1`) with **Copy**, for pasting into Hermes or other clients.
 - **Protected apps…** — the whitelist: apps that are never offered for closing.
 
 ## Stats section
@@ -113,8 +116,25 @@ once.
 - **While serving:** the status reads **Serving · Low-RAM mode** with an amber LED and the shortfall, e.g.
   *Low-RAM mode: reading from SSD (slower) · ~7.3 GB short*. Turn off, close apps, turn on again for full speed.
 
-Target = arena + 3 GiB headroom, measured against Windows *available* RAM. Freed RAM per app is its working set,
+Target = arena + 2.5 GiB headroom, measured against Windows *available* RAM (calibrated on real launches: ~49.6 GiB
+after a sweep still reached full RAM, after Strata waited ~13 s for the freed memory). Freed RAM per app is its working set,
 so the numbers are estimates (shown with "~"). Code: `engine_log.py`, `ram_plan.py`.
+
+### Reopening closed apps
+
+The start dialog has **Reopen these when Strata stops** (ticked by default, remembered). Before the sweep closes an
+app it records how that app was started (program, arguments, folder; Store apps by their app ID). After **Turn off**
+releases the memory, those apps are started again one at a time, a second apart: *Reopening apps 1/3 · Spotify
+started*, then *Reopened 3 apps*.
+
+- **Games are not restarted automatically** (launchers and anti-cheat expect to be started their own way). They stay
+  as a one-click **Reopen eldenring** line on the idle screen; it clears when you turn Strata on again.
+- **Skipped:** apps that ran as administrator, programs that no longer exist, Windows programs, and background Store
+  apps that Windows restarts itself. Apps you already reopened by hand are not started twice.
+- If Strata stopped some other way (crash, closed outside the app), the idle screen offers **Reopen N closed apps**.
+- Apps restart fresh: unsaved work in them is still lost (browsers usually restore their tabs).
+- Launching never goes through a shell: only the recorded `.exe` (checked to exist and to match the recorded command
+  line) or `explorer.exe shell:AppsFolder\<app id>`. Code: `reopen.py`; records are captured in `detector.py`.
 
 ## Configuration (`config.json`)
 

@@ -4,7 +4,9 @@ Strata needs its whole expert arena in RAM (46.84 GiB for swift-iq3_s, 39.97 GiB
 engine log by engine_log.learned_arena_gib). With less available it waits 20 s and falls back to reading experts from
 the SSD (~20 tok/s instead of ~90-100). Verified: 52.0 GiB available at launch -> full RAM; 35.3 GiB -> fallback.
 
-Target: available_at_launch >= arena + headroom (default 3 GiB: Strata's 2.5 GiB floor + pinned buffers).
+Target: available_at_launch >= arena + headroom (default 2.5 GiB). Calibrated on real launches of swift-iq3_s
+(arena 46.84 GiB): 52.0 GiB available -> full RAM; ~49.6 GiB after a sweep -> full RAM after Strata waited 12.8 s
+for the freed memory (the old 3 GiB target called that 0.2 GB short); 35-39 GiB -> Low-RAM fallback.
 Freed RAM per app is estimated from its working set (detector ram_mb), so every number shown is "~".
 
 Rules (plan):
@@ -23,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 GIB = 1024.0
-DEFAULT_HEADROOM_GIB = 3.0
+DEFAULT_HEADROOM_GIB = 2.5
 _CATEGORY_RANK = {"game": 0, "gpu": 1, "background": 2, "window": 3}
 _BUCKET_MB = 512.0
 
