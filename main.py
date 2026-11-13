@@ -61,13 +61,14 @@ from alias_controller import (  # noqa: F401  (re-exported: the Settings row's l
 from metrics_worker import (  # noqa: F401  (re-exported: the poll and usage-save periods, the fit probe)
     LIVE_POLL_S, USAGE_FLUSH_S, USAGE_RETRY_S, MetricsHost, MetricsWorker, _FitProbe)
 from app_consts import (  # noqa: F401  (re-exported: the layout sizes, the panels, the state names, the stats period)
-    ACTIVE, BAR_BLOCK, BASE_H, ERROR, HEIGHT, HEIGHT_EXPANDED, IDLE, MEM_CARD_H, PANELS, STARTING, STATS_GAP, STATS_H,
-    STATS_MS, STOPPING, WIDTH)
+    ACTIVE, APP_TITLE, BAR_BLOCK, BASE_H, ERROR, HEIGHT, HEIGHT_EXPANDED, IDLE, MEM_CARD_H, PANELS, STARTING, STATS_GAP,
+    STATS_H, STATS_MS, STOPPING, WIDTH)
 from main_view import (  # noqa: F401  (re-exported: the drawing code's constants and the work-area lookup)
     ACT_BAR_RIGHT, ACT_BAR_X, ACT_STATUS, BAR_H, BAR_PAD, CARD_TOP, DETAIL_INDENT, DETAIL_WRAP, GAP_AFTER_DETAIL,
     GAP_DETAIL_TOP, GAP_HEAD_BUTTON, LOADING_COLOR, LOADING_STATUS, LOW_RAM_STATUS, METRICS_FAILS_SHOWN, PENDING_GAP,
     PENDING_H, PILL_COLORS, PIN_GLYPH, PINNED_GLYPH, SETUP_CARD_GAP, SETUP_CARD_H, SETUP_H, SETUP_HINT_GAP, STATUS,
     SWITCH_GLYPH, TOGGLE_CANCEL, TOGGLE_OFF, TOGGLE_ON, TOGGLE_WAIT, AppView, _work_area)
+from main_tray import AppTray
 from app_workers import (  # noqa: F401  (re-exported: the worker functions, the small helpers, the pre-check wait)
     FIT_PRECHECK_WAIT_S, _find_install_worker, _fit_check_worker, _fit_largest_worker, _park_foreign_config, _released,
     _refresh_autostart_worker, _save_backend_worker, _save_reopen_records, _stop_info, fit_largest_text, format_preview)
@@ -78,7 +79,6 @@ from whitelist_modal import WhitelistModal
 
 log = logging.getLogger("agent_start")
 
-APP_TITLE = "Agent Start"
 # The layout sizes and the state names are in app_consts.py, the drawing constants in main_view.py (imported above).
 DETAIL_H = 18                            # added while the detail line shows (16 px line + spacing)
 PROGRESS_H = 14                          # added while the load progress bar shows
@@ -236,7 +236,7 @@ def _build_real_deps(cfg: dict) -> tuple[Any, Any]:
     return detector, endpoint
 
 
-class AgentStartApp(AppView, ctk.CTk):
+class AgentStartApp(AppView, AppTray, ctk.CTk):
     def __init__(self, detector=None, endpoint=None, config: dict | None = None,
                  metrics_fetcher: Callable[[str], dict | None] | None = None, vram_sampler=None,
                  extras: bool | None = None, status_fetcher: Callable[[str], dict | None] | None = None) -> None:
@@ -1779,87 +1779,6 @@ class AgentStartApp(AppView, ctk.CTk):
         self._run_worker("hc-fit-largest", _fit_largest_worker, self.engine, trial, self.post, answered)
         return True
 
-    # ------------------------------------------------------------------ system tray
-    def _start_tray(self) -> None:
-        if self.tray is not None or self._no_tray:
-            return
-        try:
-            import tray as tray_mod
-            icon = str(config_store.APP_DIR / "assets" / "app.png")
-            post = self.post                       # tray callbacks run on the tray thread: marshal to Tk
-            t = tray_mod.TrayIcon(APP_TITLE, icon, on_open=lambda: post(self.show_window),
-                                  on_toggle=lambda: post(self._tray_toggle), on_quit=lambda: post(self.quit_app),
-                                  on_lost=lambda: post(self._tray_lost),
-                                  on_switch=lambda key: post(self._tray_switch, key))
-            self.tray = t                          # X keeps quitting until the icon is really there (is_running)
-            t.start_async(lambda ok: post(self._tray_started, t, ok))
-        except Exception:  # noqa: BLE001
-            self.tray = None
-            log.exception("tray start failed; the window X quits instead")
-            self._ensure_reachable()
-
-    def _tray_started(self, t, ok: bool) -> None:
-        if self._destroyed or self.tray is not t:
-            return
-        if not ok:
-            self.tray = None
-            if self._tray_retry_until == 0.0:      # Explorer may still be starting (logon): retry for 2 min
-                self._tray_retry_until = time.monotonic() + 120.0
-            log.warning("tray icon could not be added%s", "; retrying" if time.monotonic() < self._tray_retry_until
-                        else "; the window X quits instead")
-            self._ensure_reachable()             # meanwhile: minimised (started with Windows) or shown
-            return
-        self._tray_last = None
-        self._tray_models_last = None
-        self._sync_tray()
-
-    def _ensure_reachable(self) -> None:
-        """No tray icon: a window hidden to the tray must come back. Started with Windows: minimised to the taskbar,
-        else shown."""
-        try:
-            if self._destroyed or self.state() != "withdrawn":
-                return
-            if self._started_hidden:
-                self.deiconify()
-                self.iconify()
-            else:
-                self.show_window()
-        except Exception:  # noqa: BLE001
-            log.debug("ensure_reachable failed", exc_info=True)
-
-    def _tray_lost(self) -> None:
-        """The icon is gone (Explorer did not come back): the tray is no way back to a hidden window - show it."""
-        log.warning("tray icon lost; showing the window")
-        self.show_window()
-
-    def _tray_toggle(self) -> None:
-        self.show_window()                       # Turn on may open the start dialog; Turn off may ask first
-        if self._box_open or self._dialog_open():
-            return                               # a question is up: answer that first (the window is in front)
-        self.on_toggle()
-
-    def _sync_tray(self) -> None:
-        t = self.tray
-        if t is None or self._destroyed:
-            return
-        try:
-            led = self.led.cget("fg_color")
-            tip = f"{APP_TITLE} · {self.pill.cget('text')}" + (f" · {self._summary_text}" if self._summary_text else "")
-            label = self.toggle.cget("text")
-            enabled = str(self.toggle.cget("state")) == "normal" and not label.endswith("…")
-            key = (led, tip, label, enabled)
-            if key != self._tray_last:
-                self._tray_last = key
-                t.set_status(led if isinstance(led, str) else None, tip, label, enabled)
-            models = [(lbl.replace("  ✓", ""), path) for lbl, path in self._launchers]
-            cur = next((path for lbl, path in self._launchers if lbl.endswith("✓")), None)
-            mkey = (tuple(models), cur, self.state_name in (IDLE, ERROR, ACTIVE) and not self._box_open)
-            if mkey != getattr(self, "_tray_models_last", None) and hasattr(t, "set_models"):
-                self._tray_models_last = mkey
-                t.set_models(models if len(models) >= 2 else None, cur, mkey[2])
-        except Exception:  # noqa: BLE001
-            log.debug("tray sync failed", exc_info=True)
-
     # ------------------------------------------------------------------ native message boxes
     def _ask(self, fn, msg: str):
         """A native message box. While one is open the tray must not change state under it."""
@@ -1917,13 +1836,6 @@ class AgentStartApp(AppView, ctk.CTk):
         if err is None and self.state_name == IDLE:
             self._set_note(f"Found {self.engine.name} · ready to turn on\n{_short(self.engine.launch_title(info), 44)}")
         self._request_preview()
-
-    def _tray_switch(self, bat_path: str) -> None:
-        """Tray menu > Switch model: the same as the ⇄ menu (asks first while a reply runs)."""
-        self.show_window()
-        if self._box_open or self._dialog_open():
-            return
-        self.switch_model(bat_path)
 
     # ------------------------------------------------------------------ other apps (watch_controller)
     def game_off_requested(self) -> None:

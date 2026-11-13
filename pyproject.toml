@@ -85,6 +85,10 @@ module = "main_view"       # the window's drawing code, moved verbatim out of ma
 ignore_errors = true
 
 [[tool.mypy.overrides]]
+module = "main_tray"       # the app's tray code, moved verbatim out of main.AgentStartApp: inherits main's status
+ignore_errors = true
+
+[[tool.mypy.overrides]]
 module = "detector"
 disable_error_code = ["assignment", "arg-type", "call-overload"]   # 3 + 2 + 1
 

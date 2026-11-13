@@ -1,7 +1,10 @@
-"""Constants that both halves of the main window read: main.py (the on/off logic) and main_view.py (the drawing).
+"""Constants that both halves of the main window read: main.py (the on/off logic) and main_view.py (the drawing);
+APP_TITLE is also read by main_tray.py (the app's side of the tray icon).
 
 Moved unchanged out of main.py, which re-exports every name. Plain values only: no imports.
 """
+
+APP_TITLE = "Agent Start"
 
 # Logical layout heights. BASE: status line + button (detail hidden). Panels below: the memory card (MEM_CARD_H) and
 # the graph card (82 px per row + 1 px hairlines), then the expand bar (BAR_BLOCK) or, with everything pinned, a 16 px
