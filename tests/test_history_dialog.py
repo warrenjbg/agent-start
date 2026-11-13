@@ -27,7 +27,6 @@ HOME = Path(tempfile.mkdtemp(prefix="as_history_home_"))
 os.environ["AGENT_START_HOME"] = str(HOME)
 
 import customtkinter as ctk  # noqa: E402
-from PIL import ImageGrab  # noqa: E402
 
 import config_store  # noqa: E402
 import history_dialog as hd  # noqa: E402
@@ -180,19 +179,10 @@ def close_dialog(root, dlg) -> None:
 
 
 def shot(win, name: str) -> Path:
-    win.attributes("-alpha", 1.0)
-    win.attributes("-topmost", True)
-    win.lift()
-    win.update_idletasks()
-    win.update()
-    time.sleep(0.35)
-    win.update()
-    x, y = win.winfo_rootx(), win.winfo_rooty()
-    w, h = win.winfo_width(), win.winfo_height()
-    img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
-    path = HERE / f"ui_history_{name}.png"
-    img.save(path)
-    print(f"screenshot {path.name} ({w}x{h})", flush=True)
+    import shots                                  # on screen, or drawn by Windows on a hidden desktop
+    path, w, h = shots.grab(win, HERE / f"ui_history_{name}.png", opaque=True)
+    if w:
+        print(f"screenshot {path.name} ({w}x{h})", flush=True)
     return path
 
 

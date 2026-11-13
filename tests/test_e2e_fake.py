@@ -28,7 +28,6 @@ HOME = Path(tempfile.mkdtemp(prefix="hc-e2e-home-"))
 os.environ["AGENT_START_HOME"] = str(HOME)
 
 import psutil  # noqa: E402
-from PIL import ImageGrab  # noqa: E402
 
 import config_store  # noqa: E402
 import launcher_bat  # noqa: E402
@@ -81,15 +80,10 @@ def pump_until(app, cond, timeout: float) -> bool:
 
 
 def shot(app, name: str) -> None:
-    app.attributes("-topmost", True)
-    app.lift()
-    app.update()
-    time.sleep(0.35)
-    app.update()
-    x, y = app.winfo_rootx(), app.winfo_rooty()
-    path = HERE / f"ui_{name}.png"
-    ImageGrab.grab(bbox=(x, y, x + app.winfo_width(), y + app.winfo_height()), all_screens=True).save(path)
-    print(f"screenshot {path}")
+    import shots                                  # on screen, or drawn by Windows on a hidden desktop
+    path, w, _h = shots.grab(app, HERE / f"ui_{name}.png")
+    if w:
+        print(f"screenshot {path}")
 
 
 def write_bat(name: str, port: int, model: str, extra: str = "") -> Path:
