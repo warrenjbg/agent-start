@@ -197,6 +197,10 @@ class H(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     allow_reuse_address = False   # on Windows SO_REUSEADDR would let us steal a busy port
     daemon_threads = True
+    # socketserver's default listen backlog is 5. A test that probes the port many times in a row (is_running
+    # is a bare connect, with SYN retries off) fills it whenever this process is starved of CPU, and Windows
+    # then refuses the connect: the port reads as closed although the server is up.
+    request_queue_size = 128
 
 
 try:

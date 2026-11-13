@@ -825,6 +825,17 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             ok, err = False, f"{type(e).__name__}: {e}"
             traceback.print_exc()
+            # a failed assert skips the test's own stop: end what it left running now, so it cannot disturb
+            # the tests after it or show up as a second failure in the leak check at the end
+            left = leaked_processes()
+            for p in left:
+                try:
+                    p.kill()
+                except psutil.Error:
+                    pass
+            psutil.wait_procs(left, timeout=5)
+            if left:
+                err += f" (ended {len(left)} process(es) the failed test left running)"
         dt = time.monotonic() - t0
         results.append((t.__name__, ok, dt, err))
         print(f"[{'PASS' if ok else 'FAIL'}] {t.__name__}  ({dt:.2f} s) {err}")
