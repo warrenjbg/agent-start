@@ -1,5 +1,6 @@
-"""Launcher layer for tests: `python fake_launcher.py <serve\\server.py> args...` spawns the server as a child and
-waits, like the Strata venv redirector (its own cmdline also contains serve\\server.py)."""
+"""Launcher layer for tests: spawns the server (argv[1], with the remaining arguments) as a child and waits, like
+the Strata venv redirector. The tests copy this file to <tmp>\\redirector\\serve\\server.py, so that - as with the
+real redirector - the script its own command line runs is a serve\\server.py."""
 import subprocess
 import sys
 

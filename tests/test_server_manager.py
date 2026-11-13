@@ -35,7 +35,10 @@ PY = sys.executable
 FIX = HERE / "fixtures"
 TMP = Path(tempfile.mkdtemp(prefix="hc-smtest-"))
 SERVE = TMP / "serve" / "server.py"
-LAUNCHER = TMP / "launcher.py"
+# The launcher layer stands in for the venv python redirector, whose command line is `python serve\server.py ...`
+# (the script it RUNS is server.py). So the copy is itself named serve\server.py: a wrapper that was only GIVEN
+# the path (`python launcher.py ...\serve\server.py`) is, correctly, not an engine process for the stop path.
+LAUNCHER = TMP / "redirector" / "serve" / "server.py"
 FOREIGN = TMP / "foreign.py"
 LOGDIR = TMP / "logs"
 MARK = os.path.normcase(str(TMP))
@@ -43,6 +46,7 @@ NOWIN = subprocess.CREATE_NO_WINDOW
 
 SERVE.parent.mkdir(parents=True)
 shutil.copy(FIX / "fake_strata_server.py", SERVE)
+LAUNCHER.parent.mkdir(parents=True)
 shutil.copy(FIX / "fake_launcher.py", LAUNCHER)
 shutil.copy(FIX / "foreign_server.py", FOREIGN)
 KIDS_SERVE = TMP / "kids" / "serve" / "server.py"           # fake Strata that spawns children (under strata_dir)

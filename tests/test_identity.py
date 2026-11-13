@@ -27,6 +27,25 @@ CASES = [
     ("notepad", "notepad.exe", ["notepad", r"C:\x\serve\server.py"], False),
     ("python but path only inside argv[0]", "python.exe", [r"C:\serve\server.py"], False),
     ("python with server.py elsewhere", "python.exe", ["python", r"C:\x\notserve\server.py"], False),
+    # the script must be what python RUNS: only interpreter options may come before it
+    ("python options before the script", "python.exe",
+     ["python", "-u", "-B", "-X", "utf8", "-W", "ignore", S + r"\serve\server.py", "--port", "8080"], True),
+    ("attached option values", "python.exe", ["python", "-Xutf8", "-Wignore", S + r"\serve\server.py"], True),
+    ("-X value with c / m letters", "python.exe",
+     ["python", "-Xfrozen_modules=off", S + r"\serve\server.py"], True),
+    ("py launcher with a version", "py.exe", ["py", "-3.14", S + r"\serve\server.py"], True),
+    ("quoted script token", "python.exe", ["python", '"' + S + r'\serve\server.py"'], True),
+    ("IDLE with the file open", "pythonw.exe", ["pythonw.exe", "-m", "idlelib", S + r"\serve\server.py"], False),
+    ("py_compile on the file", "python.exe", ["python", "-m", "py_compile", S + r"\serve\server.py"], False),
+    ("pylint on the file", "python.exe", ["python", "-m", "pylint", S + r"\serve\server.py"], False),
+    ("clustered -Bm", "python.exe", ["python", "-Bm", "pdb", S + r"\serve\server.py"], False),
+    ("-c with the path as an argument", "python.exe",
+     ["python", "-c", "import sys", S + r"\serve\server.py"], False),
+    ("another script given the path", "python.exe",
+     ["python", r"C:\tools\lint.py", S + r"\serve\server.py"], False),
+    ("the path as a later argument of the real script", "python.exe",
+     ["python", r"C:\tools\tail.py", "--file", S + r"\serve\server.py"], False),
+    ("option that needs a value, value missing", "python.exe", ["python", "-X"], False),
 ]
 
 

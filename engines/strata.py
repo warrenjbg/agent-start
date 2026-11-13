@@ -55,36 +55,63 @@ def _is_python_exe(path: str) -> bool:
     return n in _PY_NAMES or n.startswith("python")
 
 
+def _is_server_token(tok: object) -> bool:
+    t = os.path.normcase(str(tok).strip('"'))
+    return t == SERVER_MARK or t.endswith(os.sep + SERVER_MARK)   # whole path segments only
+
+
+def run_script_index(cmd: list[str] | None) -> int | None:
+    """Index of the script this python command line RUNS: the first token after argv[0] that is not an
+    interpreter option. None when python runs something else (-c code, -m module) or nothing.
+
+    -X / -W take a value (attached or as the next token); every other token that starts with '-' is an option
+    (-u, -B, the py launcher's -3.14), unless its letters include c or m: those end the options and run code or
+    a module, and whatever follows is only an argument to it."""
+    toks = [str(t) for t in (cmd or [])]
+    i = 1
+    while i < len(toks):
+        tok = toks[i].strip('"')
+        if tok[:2] in ("-X", "-W"):
+            i += 2 if len(tok) == 2 else 1
+            continue
+        if tok.startswith("-") and len(tok) > 1:
+            if tok.startswith("--") or re.match(r"-[A-Za-z]*[cm]", tok):
+                return None                      # -c / -m (also clustered, -Bm); no long option runs a script
+            i += 1
+            continue
+        return i
+    return None
+
+
 def is_strata_cmd(name: str | None, cmd: list[str] | None) -> bool:
-    """STRICT identity for the kill path: a python interpreter whose argv (after argv[0]) has a token that ENDS
-    with serve\\server.py. A substring match on the joined cmdline would also match e.g.
-    `hermes chat -q "... serve\\server.py ..."`, `bash -c "python serve/server.py"`, or an editor with the file
-    open - and those (plus their whole trees) would be killed on OFF. The detector keeps the loose match because
-    there it only PROTECTS."""
+    """STRICT identity for the kill path: a python interpreter that RUNS serve\\server.py, i.e. the script token
+    (the first one after the interpreter's own options) ends with serve\\server.py. A substring match on the
+    joined cmdline would also match e.g. `hermes chat -q "... serve\\server.py ..."` or
+    `bash -c "python serve/server.py"`, and "any token" would match a python tool that was merely GIVEN the
+    file (`pythonw -m idlelib ...\\serve\\server.py`, py_compile, a linter) - and those (plus their whole trees)
+    would be killed on OFF. The detector keeps the loose match because there it only PROTECTS."""
     n = (name or "").casefold()
     if n.endswith(".exe"):
         n = n[:-4]
     if n not in _PY_NAMES and not n.startswith("python"):
         return False
-
-    def _hit(tok: str) -> bool:
-        t = os.path.normcase(str(tok).strip('"'))
-        return t == SERVER_MARK or t.endswith(os.sep + SERVER_MARK)   # whole path segments only
-    return any(_hit(t) for t in (cmd or [])[1:])
+    i = run_script_index(cmd)
+    return i is not None and _is_server_token((cmd or [])[i])
 
 
 def strata_scripts(proc: "psutil.Process") -> list[str]:
-    """Absolute paths of the serve\\server.py tokens in proc's argv (relative ones resolved against its cwd)."""
+    """Absolute path of the serve\\server.py that proc RUNS (see run_script_index), as a list of 0 or 1 items; a
+    relative one is resolved against its cwd. A serve\\server.py that is only an argument does not count."""
     try:
         cmd = proc.cmdline() or []
     except Exception:  # noqa: BLE001 - psutil.Error / OSError: unknown = no proof
         return []
     out = []
     cwd = None
-    for tok in cmd[1:]:
+    run_i = run_script_index(cmd)
+    for tok in ([cmd[run_i]] if run_i is not None else []):
         t = str(tok).strip('"')
-        nt = os.path.normcase(t)
-        if not (nt == SERVER_MARK or nt.endswith(os.sep + SERVER_MARK)):
+        if not _is_server_token(t):
             continue
         if not os.path.isabs(t):
             if cwd is None:
