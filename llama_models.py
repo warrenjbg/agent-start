@@ -274,6 +274,31 @@ class Session:
         self._set(model_key(model, self._base), own, alias=True)
         return (*llama_finder.default_args(str(model), port), *own)
 
+    def mark_fit(self, args: Any, tokens: int) -> None:
+        """Remember that `tokens` is the context the GPU-fit check found for the arguments' model (the arguments
+        must already carry -c tokens; anything else leaves no mark)."""
+        try:
+            parts = split(args)
+            key = model_key(parts.model, self._base) if parts.model else ""
+            if not key:
+                return
+            before = self._table.get(key)
+            _put(self._table, key, parts.own, fit_context=int(tokens))
+            if self._table.get(key) != before:
+                self._touched.add(key)
+        except Exception:  # noqa: BLE001
+            return
+
+    def fit_of(self, args: Any) -> int | None:
+        """The context the fit check found for the arguments' model, while the arguments still name it."""
+        try:
+            parts = split(args)
+            ent = self._table.get(model_key(parts.model, self._base)) if parts.model else None
+            fit = ent.get("fit_context") if ent else None
+            return fit if isinstance(fit, int) and llama_finder.context_of(parts.own) == fit else None
+        except Exception:  # noqa: BLE001
+            return None
+
     def touched(self) -> Snapshot:
         """What this session changed, to travel with the launch (LlamaLaunch.models)."""
         return _snapshot(self._table, self._touched)

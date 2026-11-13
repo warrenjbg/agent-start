@@ -406,6 +406,18 @@ class Engine:
         """Turn the FitCheck program's stdout into a FitReport. Must never raise on junk."""
         return FitReport()
 
+    def fit_largest_reason(self, cfg: Mapping[str, Any]) -> str | None:
+        """Why the largest context that fits the GPU cannot be worked out for this launch, in a few words for a
+        dropdown entry ("no NVIDIA card"); None when it can. Default: the engine has no such check."""
+        return "not available"
+
+    def largest_context(self, cfg: Mapping[str, Any], run: Callable[[FitCheck], str | None]) -> tuple[int | None, str]:
+        """Work out the largest context that fits the GPU for this launch. `run(check)` executes one FitCheck and
+        returns its stdout or None (the app's runner; the engine itself starts nothing). Returns (tokens, state):
+        state "ok" (tokens > 0), "full" (tokens 0: the model's whole context fits, no context option needed),
+        "nofit" (no size fits), "unconfirmed" (a second run disagreed) or "failed". Must never raise."""
+        return None, "failed"
+
     def is_busy(self, http: Http) -> bool | None:
         """Is a request running right now? Asked before a NON-forced stop of an engine without CAP_UNLOAD (an
         unload call says "busy" itself): True makes the stop answer "busy" instead of ending the process

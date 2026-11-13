@@ -319,6 +319,39 @@ def _fit_check_worker(engine: Any, cfg: dict, chk: Any, post: Callable, done: Ca
     post(done, token, box[0] if box and not th.is_alive() else None)
 
 
+def _fit_largest_worker(engine: Any, cfg: dict, post: Callable, done: Callable) -> None:
+    """Worker: the largest context that fits the GPU for this launch (Settings). The engine decides what to run
+    and how to read it; fit_check.run stays the only place that runs the tool. ALWAYS posts done(tokens, state)
+    exactly once."""
+    tokens, state = None, "failed"
+    try:
+        import fit_check
+        cmd = cfg.get("launch_cmd") or []
+        prog = str(cmd[0]).strip().strip('"') if cmd else ""
+        tokens, state = engine.largest_context(cfg, lambda chk: fit_check.run(chk, prog))
+        log.info("largest context that fits the GPU: %s (%s)", tokens, state)
+    except Exception:  # noqa: BLE001
+        log.debug("largest-context check failed", exc_info=True)
+        tokens, state = None, "failed"
+    post(done, tokens, state)
+
+
+def fit_largest_text(tokens: int | None, state: str, used_gb: float | None) -> str:
+    """The line Settings shows under Context length after the largest-context check."""
+    if state == "ok" and tokens:
+        text = f"Fits the GPU at {tokens:,} tokens"
+        if used_gb is not None:
+            text += f" · measured with {used_gb:.1f} GB of video memory in use by other apps"
+        return text
+    if state == "full":
+        return "The model's whole context fits the GPU · left on Auto"
+    if state == "nofit":
+        return "Does not fit the GPU even at the smallest context llama.cpp tries"
+    if state == "unconfirmed":
+        return "Two checks disagreed (video memory in use changed?) · try again"
+    return "The check gave no answer"
+
+
 class _FitProbe:
     """The live GPU-fit check's measurements, kept by the metrics worker (never touched from the Tk thread): the
     engine's CPU share and the video memory, fed to fit_watch.decide once per poll. Read-only on processes."""
@@ -2714,7 +2747,8 @@ class AgentStartApp(ctk.CTk):
             engine=self.engine,
             on_history=self.open_history if self.usage is not None else None,
             engine_choices=engines.choices(), on_engine_change=self.set_backend, launch_options=options,
-            on_fit_preview=self.fit_preview)
+            on_fit_preview=self.fit_preview, on_fit_largest=self.fit_largest,
+            fit_largest_reason=self.fit_largest_reason)
 
     def fit_preview(self, info: Any, done: Callable[[str | None], None]) -> bool:
         """Settings: would this launch fit on the GPU? Runs the engine's read-only pre-check on a worker and
@@ -2737,6 +2771,46 @@ class AgentStartApp(ctk.CTk):
                 done(self.engine.gpu_fit_loading if fits is False else ("" if fits is True else None))
 
         self._run_worker("hc-fit-preview", _fit_check_worker, self.engine, trial, chk, self.post, answered, 0)
+        return True
+
+    def fit_largest_reason(self, info: Any) -> str | None:
+        """Settings: why the largest context that fits the GPU cannot be measured for this launch right now, in a
+        few words (None: it can). Never while the engine is up - its own video memory would be counted."""
+        if self._destroyed:
+            return "not available"
+        if self.state_name != IDLE:
+            return f"turn {self.engine.name} off first" if self.state_name != ERROR else "not available now"
+        try:
+            trial = dict(self.cfg)
+            self.engine.apply_launcher(trial, info)
+            self.engine.plan_launch(trial)
+        except Exception:  # noqa: BLE001 - not a launch the engine accepts
+            return "not with these arguments"
+        try:
+            return self.engine.fit_largest_reason(trial)
+        except Exception:  # noqa: BLE001
+            return "not available"
+
+    def fit_largest(self, info: Any, done: Callable[[int | None, str, str], None]) -> bool:
+        """Settings: work out the largest context that fits the GPU for this launch on a worker and call
+        done(tokens | None, state, text) on the Tk thread. False (nothing runs) when fit_largest_reason says no."""
+        if self.fit_largest_reason(info) is not None:
+            return False
+        trial = dict(self.cfg)
+        self.engine.apply_launcher(trial, info)
+        used: float | None = None
+        try:
+            snap = self.vram.snapshot()
+            if snap.available and snap.samples and snap.now - snap.samples[-1][0] <= 10.0:
+                used = snap.samples[-1][1] / 1024.0
+        except Exception:  # noqa: BLE001
+            used = None
+
+        def answered(tokens: int | None, state: str) -> None:
+            if not self._destroyed:
+                done(tokens, state, fit_largest_text(tokens, state, used))
+
+        self._run_worker("hc-fit-largest", _fit_largest_worker, self.engine, trial, self.post, answered)
         return True
 
     # ------------------------------------------------------------------ system tray

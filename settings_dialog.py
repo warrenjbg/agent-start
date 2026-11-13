@@ -58,6 +58,14 @@ VISION_ON = "On · {label}"
 VISION_NONE = "No vision file next to this model"
 VISION_OTHER = "Another file (in the arguments)"
 CONTEXT_CUSTOM = "{tokens:,} tokens (custom)"
+CONTEXT_FIT_VALUE = "Largest that fits · {size}"       # shown while the arguments carry the size the check found
+CONTEXT_FIT_BLOCKED = "Largest that fits · {reason}"   # the greyed-out entry says why it cannot be measured
+FIT_CHECKING = "Checking what fits the GPU…"
+
+
+def k_tokens(tokens: int) -> str:
+    """26112 -> '26K', 7936 -> '7.8K'."""
+    return f"{tokens / 1024:.0f}K" if tokens >= 10240 else f"{tokens / 1024:.1f}K"
 PORT_ERROR = "Port must be a number from 1 to 65535"
 FITS_TEXT = "Fits on the GPU"
 VISION_DROPPED = "Vision turned off · that vision file belongs to the other model"
@@ -126,6 +134,8 @@ class SettingsDialog(ctk.CTkToplevel):
                  on_history: Callable[[], Any] | None = None,
                  launch_options: dict | None = None,
                  on_fit_preview: Callable[[Any, Callable[[str | None], None]], bool] | None = None,
+                 on_fit_largest: Callable[[Any, Callable[[int | None, str, str], None]], bool] | None = None,
+                 fit_largest_reason: Callable[[Any], str | None] | None = None,
                  engine_choices: list[tuple[str, str]] | None = None,
                  on_engine_change: Callable[[str], str | None] | None = None,
                  tab: str | None = None) -> None:
@@ -168,6 +178,8 @@ class SettingsDialog(ctk.CTkToplevel):
         self._on_history = on_history
         self._on_engine_change = on_engine_change
         self._on_fit_preview = on_fit_preview
+        self._on_fit_largest = on_fit_largest
+        self._fit_largest_reason = fit_largest_reason
         self._engine_choices = [(str(i), str(n)) for i, n in (engine_choices or [])]
         self.has_engine_row = len(self._engine_choices) >= 2 and on_engine_change is not None
         self._can_check = bool(can_check_updates)
@@ -200,6 +212,14 @@ class SettingsDialog(ctk.CTkToplevel):
             except Exception:  # noqa: BLE001
                 log.debug("context choices unusable", exc_info=True)
             self._has_context = bool(self._context_choices)
+        # "Largest that fits the GPU": an extra Context entry when the engine names one and the app can measure
+        # (on_fit_largest(info, done(tokens, state, text)) -> started; fit_largest_reason(info) -> why not | None)
+        self._fit_label = (str(opts.get("context_fit_label") or "")
+                           if self._has_context and callable(on_fit_largest) else "")
+        self._fit_entry = ""                             # that entry's text right now (with the reason when greyed)
+        self._fit_reason: str | None = None
+        self._fit_busy = False
+        self.fit_largest_calls = 0                       # requests handed to on_fit_largest
         self._program_menu: ctk.CTkOptionMenu | None = None
         self._model_menu: ctk.CTkOptionMenu | None = None
         self._program_choice: ctk.StringVar | None = None
@@ -961,10 +981,14 @@ class SettingsDialog(ctk.CTkToplevel):
                 self._model_choice.set(lab or (f"Choose a {title}…" if not cur else "Another model (below)"))
             if self._context_choice is not None:
                 tokens = self._call("context_of", args)
+                self._sync_fit_entry(program, args)
                 lab = next((la for la, n in self._context_choices if n == tokens), None)
                 if lab is None:
                     lab = CONTEXT_CUSTOM.format(tokens=int(tokens)) if tokens else self._context_choices[0][0]
-                self._context_choice.set(lab)
+                if self._fit_label and tokens and self._call("fit_of", args) == tokens:
+                    lab = CONTEXT_FIT_VALUE.format(size=k_tokens(int(tokens)))   # the size the GPU check found
+                if not self._fit_busy:
+                    self._context_choice.set(lab)
             if self._vision_choice is not None and self._vision_menu is not None:
                 files = self._vision_list(self._model_path(args, program))
                 self._vision_paths = {VISION_ON.format(label=la): p for la, p in files}
@@ -1054,8 +1078,96 @@ class SettingsDialog(ctk.CTkToplevel):
         if note and str(self._msg.cget("text_color")) != str(T.RED_TEXT):
             self._msg.configure(text=note, text_color=T.TEXT_2)
 
+    def _sync_fit_entry(self, program: str, args: tuple) -> None:
+        """Keep the 'Largest that fits the GPU' entry in step: normal, or greyed out with the reason in its text."""
+        menu = self._context_menu
+        if not self._fit_label or menu is None:
+            return
+        reason: str | None = None
+        if callable(self._fit_largest_reason):
+            try:
+                reason = self._fit_largest_reason(CommandLaunch(program=program, args=tuple(args)))
+            except Exception:  # noqa: BLE001
+                log.debug("fit_largest_reason failed", exc_info=True)
+                reason = "not available"
+        entry = CONTEXT_FIT_BLOCKED.format(reason=reason) if reason else self._fit_label
+        self._fit_reason = reason
+        if entry != self._fit_entry:
+            self._fit_entry = entry
+            labels = [la for la, _n in self._context_choices]
+            menu.configure(values=labels[:1] + [entry] + labels[1:])
+        try:                                             # CTkOptionMenu rebuilds its tk menu on configure(values)
+            menu._dropdown_menu.entryconfigure(1, state="disabled" if reason else "normal")
+        except Exception:  # noqa: BLE001
+            log.debug("fit entry state not set", exc_info=True)
+
+    def _resync(self) -> None:
+        self._sync_option_menus(self._program_now(), self._args_now())
+
+    def _fit_largest_picked(self) -> None:
+        """The 'Largest that fits the GPU' entry: measure once (a worker of the app), then write -c <size>."""
+        cb = self._on_fit_largest
+        if self._fit_reason or cb is None or self._info is None or self._fit_busy:
+            self._resync()                               # greyed out / nothing to measure: the row shows the truth
+            return
+        self._cancel_fit()
+        self._fit_seq += 1
+        seq = self._fit_seq
+        self._fit_busy = True
+        self.fit_largest_calls += 1
+        self._show_fit_text(FIT_CHECKING, warn=False, state="checking")
+
+        def done(tokens: int | None, state: str, text: str) -> None:
+            self._fit_largest_answer(seq, tokens, state, text)
+
+        try:
+            started = bool(cb(self._info, done))
+        except Exception:  # noqa: BLE001
+            log.exception("largest-context check could not start")
+            started = False
+        if not started:
+            self._fit_busy = False
+            self._show_fit(None)
+            self._resync()
+
+    def _fit_largest_answer(self, seq: int, tokens: int | None, state: str, text: str) -> None:
+        self._fit_busy = False
+        if not self._alive():
+            return
+        if seq != self._fit_seq:                         # the launch changed while the check ran
+            self._resync()
+            return
+        good = state in ("ok", "full") and tokens is not None
+        try:
+            if good:
+                new = tuple(self._opts["with_context"](self._args_now(), tokens or None))
+                if tokens:
+                    self._call("mark_fit", new, int(tokens))
+                self._set_args(new)                      # the trace re-checks the command and asks for the usual
+                self._cancel_fit()                       # fit note, which this answer replaces
+                self._fit_seq += 1
+        except Exception:  # noqa: BLE001
+            log.exception("could not write the context that fits")
+            good = False
+        self._resync()
+        self._show_fit_text(text, warn=not good, state="largest" if good else "warn")
+
+    def _show_fit_text(self, text: str, warn: bool, state: str) -> None:
+        note = self._fit_note
+        if note is None:
+            return
+        try:
+            self.fit_state = state
+            note.configure(text=text, text_color=T.AMBER if warn else T.TEXT_2)
+            note.grid(row=self._fit_row, column=0, sticky="ew", pady=(0, 4))
+        except Exception:  # noqa: BLE001 - closing
+            log.debug("fit note not shown", exc_info=True)
+
     def _context_picked(self, label: str) -> None:
         if self._saving:
+            return
+        if self._fit_label and label == self._fit_entry:
+            self._fit_largest_picked()
             return
         hit = [n for la, n in self._context_choices if la == label]
         if not hit:                                      # the "(custom)" entry: nothing to change

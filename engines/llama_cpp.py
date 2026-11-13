@@ -36,7 +36,7 @@ from dataclasses import dataclass
 import re
 import struct
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, cast
 
 from .base import (
     CAP_FIND_INSTALL,
@@ -605,6 +605,60 @@ def fit_args(cfg: Mapping[str, Any]) -> tuple[str, ...] | None:
     return tuple(out)
 
 
+FIT_LARGEST_LABEL = "Largest that fits the GPU"     # the Context entry in Settings
+
+
+def _without_context(cfg: Mapping[str, Any]) -> dict:
+    """The config with the context option taken out of the launch (the fit then picks the context itself)."""
+    import llama_finder
+    raw = cfg.get("launch_cmd") or []
+    cmd = [str(x) for x in raw] if isinstance(raw, (list, tuple)) else []
+    return dict(cfg, launch_cmd=cmd[:1] + list(llama_finder.with_context(cmd[1:], None)))
+
+
+def _with_context(cfg: Mapping[str, Any], tokens: int) -> dict:
+    import llama_finder
+    raw = cfg.get("launch_cmd") or []
+    cmd = [str(x) for x in raw] if isinstance(raw, (list, tuple)) else []
+    return dict(cfg, launch_cmd=cmd[:1] + list(llama_finder.with_context(cmd[1:], int(tokens))))
+
+
+def fit_block_reason(cfg: Mapping[str, Any]) -> str | None:
+    """Why fit_args(cfg) gives no arguments, in a few words for a dropdown entry; None when it does. The same
+    refusals in the same order as fit_args."""
+    prog = configured_program(cfg)
+    raw = cfg.get("launch_cmd") or []
+    if prog is None or not isinstance(raw, (list, tuple)):
+        return "choose a build first"
+    args = [str(x) for x in raw[1:]]
+    flags = {_flag(a) for a in args}
+    if flags & _FIT_REMOTE:
+        return "the model comes from the network"
+    if flags & _FIT_PLACED_BY_USER:
+        return "not with weights placed by hand (-ot / -ts)"
+    spec = _last_value(args, {"--spec-type"})
+    if flags & _FIT_DRAFT or (spec and "mtp" in spec.casefold()):
+        return "not with a draft model"
+    for v in _values(args, _GPU_LAYER_FLAGS):
+        if (v or "").strip().casefold() not in ("auto", "-1"):
+            return f"not with -ngl {(v or '').strip()[:8]}".rstrip()
+    fit = _last_value(args, {"-fit", "--fit"})
+    if fit is not None and fit.casefold() in ("off", "0", "false", "disabled"):
+        return "not with --fit off"
+    dev = _last_value(args, {"-dev", "--device"})
+    if dev is not None and dev.casefold() == "none":
+        return "not with --device none"
+    sm = _last_value(args, {"-sm", "--split-mode"})
+    if sm is not None and sm.casefold() in ("row", "tensor"):
+        return f"not with --split-mode {sm.casefold()}"
+    model = fit_model_path(cfg)
+    if model is None or not os.path.isfile(model):
+        return "no model file"
+    if fit_args(cfg) is None:
+        return "not with these arguments"
+    return None
+
+
 # ---- GGUF header: the model's layer count (to judge "-ngl N")
 _GGUF_SCALAR = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}   # value type -> bytes
 _GGUF_INT = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 10: "<Q", 11: "<q"}
@@ -973,6 +1027,7 @@ class LlamaCppEngine(Engine):
                 "with_model": session.switch,
                 "default_args": lambda model: session.first_setup(model, DEFAULT_PORT),
                 "model_of": model_of, "launch_info": launch_info, "per_model": True,
+                "context_fit_label": FIT_LARGEST_LABEL, "mark_fit": session.mark_fit, "fit_of": session.fit_of,
                 "context_choices": list(llama_finder.CONTEXT_CHOICES),
                 "context_of": llama_finder.context_of, "with_context": llama_finder.with_context,
                 "vision_files": llama_finder.vision_files,
@@ -1171,6 +1226,58 @@ class LlamaCppEngine(Engine):
             return judge_fit(stdout, blocks)
         except Exception as exc:  # noqa: BLE001 - contract: never raises
             return FitReport(None, f"llama-fit-params: could not judge the answer ({type(exc).__name__})")
+
+    def fit_largest_reason(self, cfg: Mapping[str, Any]) -> str | None:
+        """None when llama-fit-params.exe can work out the largest context for this launch; else why not: the tool
+        is not beside llama-server.exe, there is no NVIDIA card, or the arguments make the check meaningless (the
+        user set the GPU layers, turned the fit off, placed weights by hand, uses a draft model ...). Disk access:
+        a few isfile checks. Never raises."""
+        try:
+            prog = configured_program(cfg)
+            if prog is None:
+                return "choose a build first"
+            if not os.path.isfile(os.path.join(os.path.dirname(prog), FIT_EXE)):
+                return "no llama-fit-params.exe"
+            import llama_finder
+            if not llama_finder.has_nvidia():
+                return "no NVIDIA card"
+            args = [str(x) for x in (cfg.get("launch_cmd") or [])[1:]]
+            if _values(args, {_KV_PER_SLOT}):
+                return "not with --kv-unified-per-slot"      # that option IS a context size
+            return fit_block_reason(_without_context(cfg))
+        except Exception:  # noqa: BLE001
+            return "not available"
+
+    def largest_context(self, cfg: Mapping[str, Any], run: Callable[[FitCheck], str | None]) -> tuple[int | None, str]:
+        """One run of llama-fit-params WITHOUT a context option: common/fit.cpp then lowers the context until
+        every layer fits (with its --fit-target margin) and prints `-c N -ngl -1`; a layer count instead means not
+        even its smallest context fits. A second run WITH -c N must agree (video memory in use can change between
+        the two). The same margin and rule as the server's own fit, so `-c N` starts fully on the GPU while the
+        video memory other apps hold stays what it was."""
+        try:
+            if self.fit_largest_reason(cfg) is not None:
+                return None, "failed"
+            chk = self.fit_check(_without_context(cfg))
+            out = run(chk) if chk is not None else None
+            line = parse_fit_line(out) if isinstance(out, str) else None
+            if line is None:
+                return None, "failed"
+            if line["-ngl"].casefold() not in ("-1", "auto"):
+                return None, "nofit"
+            ctx = line.get("-c", "")
+            if not re.fullmatch(r"\d{1,9}", ctx):
+                return None, "failed"
+            tokens = int(ctx)
+            if tokens == 0:
+                return 0, "full"                         # the model's own context fits: nothing to write
+            cfg2 = _with_context(cfg, tokens)
+            chk2 = self.fit_check(cfg2)
+            out2 = run(chk2) if chk2 is not None else None
+            if isinstance(out2, str) and self.parse_fit(out2, cfg2).fits is True:
+                return tokens, "ok"
+            return None, "unconfirmed"
+        except Exception:  # noqa: BLE001 - contract: never raises
+            return None, "failed"
 
     # ------------------------------------------------------------------ UI features
     setup_hint = "Open Settings (gear) and choose llama-server.exe and a model"

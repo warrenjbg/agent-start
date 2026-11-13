@@ -1035,13 +1035,122 @@ def t_model_label() -> None:
     check(eng.fetch_model_id(lambda m, p, t: HttpReply(), ServiceState()) is None, "fetch_model_id: no answer -> None")
 
 
+def t_fit_largest(tmp: Path) -> None:
+    """The largest context that fits the GPU: when it is offered, what is run (through a recorder) and how the
+    two answers are read. Nothing is started."""
+    e = ENG
+    import llama_finder
+    from engines.llama_cpp import FIT_EXE, FIT_LARGEST_LABEL, fit_block_reason
+    d = tmp / "largest llama"
+    d.mkdir()
+    exe = d / "llama-server.exe"
+    exe.write_bytes(b"")                       # stand-ins: never executed
+    tool = d / FIT_EXE
+    model = write_gguf(tmp / "largest-model.gguf", QWEN_KVS)
+    mp = os.path.abspath(str(model))
+
+    def c(*args):
+        return cfg_of(launch_cmd=[str(exe), *args], launch_cwd=str(d), port=9931)
+
+    base_args = ("-m", str(model), "--port", "9931")
+    real_nvidia = llama_finder.has_nvidia
+    try:
+        llama_finder.has_nvidia = lambda *a, **k: True          # type: ignore[assignment]
+        check(e.fit_largest_reason(c(*base_args, "-c", "65536")) == "no llama-fit-params.exe",
+              "no tool beside the server: greyed, with that reason")
+        tool.write_bytes(b"")
+        check(e.fit_largest_reason(c(*base_args, "-c", "65536")) is None and e.fit_largest_reason(c(*base_args)) is None,
+              "tool there, NVIDIA card, plain arguments: offered (with or without a context set)")
+        llama_finder.has_nvidia = lambda *a, **k: False         # type: ignore[assignment]
+        check(e.fit_largest_reason(c(*base_args)) == "no NVIDIA card", "no NVIDIA card: greyed")
+        llama_finder.has_nvidia = lambda *a, **k: True          # type: ignore[assignment]
+        for extra, want in ((("-ngl", "40"), "not with -ngl 40"), (("--gpu-layers", "0"), "not with -ngl 0"),
+                            (("--fit", "off"), "not with --fit off"),
+                            (("-ot", "blk=CPU"), "not with weights placed by hand (-ot / -ts)"),
+                            (("-ts", "1,1"), "not with weights placed by hand (-ot / -ts)"),
+                            (("-md", str(model)), "not with a draft model"),
+                            (("--spec-type", "mtp"), "not with a draft model"),
+                            (("--device", "none"), "not with --device none"),
+                            (("--split-mode", "row"), "not with --split-mode row"),
+                            (("--kv-unified-per-slot", "4096"), "not with --kv-unified-per-slot"),
+                            (("-hf", "org/repo"), "the model comes from the network"),
+                            (("-ngl", "auto", "-np", "2", "--jinja"), None)):
+            got = e.fit_largest_reason(c(*base_args, "-c", "8192", *extra))
+            check(got == want, f"{extra}: {want!r} (got {got!r})")
+        check(e.fit_largest_reason(c("--port", "9931", "-m", str(tmp / "missing.gguf"))) == "no model file"
+              and e.fit_largest_reason({}) == "choose a build first"
+              and e.fit_largest_reason(strata_cfg()) == "choose a build first"
+              and e.fit_largest_reason({"launch_cmd": 5}) == "choose a build first", "no model / nothing configured")
+        check(fit_block_reason(c(*base_args, "-c")) == "not with these arguments",
+              "anything else fit_args refuses: a plain 'not with these arguments'")
+        check(base.Engine().fit_largest_reason({}) == "not available"
+              and StrataEngine().largest_context({}, lambda chk: "-c 1 -ngl -1") == (None, "failed"),
+              "an engine without the check: not available, nothing runs")
+
+        calls: list = []
+
+        def runner(*answers):
+            it = iter(answers)
+
+            def run(chk):
+                calls.append(chk)
+                v = next(it)
+                if isinstance(v, Exception):
+                    raise v
+                return v
+            return run
+
+        cfg = c(*base_args, "-c", "65536", "-np", "1")
+        got = e.largest_context(cfg, runner("-c 26112 -ngl -1\n", "-c 26112 -ngl -1\n"))
+        check(got == (26112, "ok") and len(calls) == 2, f"two agreeing runs: the size ({got}, {len(calls)} runs)")
+        check(calls[0].program == str(tool) and calls[0].args == ("-m", mp, "-np", "1"),
+              f"the first run has NO context option: llama.cpp picks it ({calls[0].args})")
+        check(calls[1].args == ("-m", mp, "-c", "26112", "-np", "1"), f"the second run confirms that size ({calls[1].args})")
+        check(cfg["launch_cmd"][-4:] == ["-c", "65536", "-np", "1"], "the config is not changed")
+        for answers, want, runs, why in (
+                (("-c 26112 -ngl -1", "-c 26112 -ngl 60"), (None, "unconfirmed"), 2, "the second run disagrees"),
+                (("-c 26112 -ngl -1", None), (None, "unconfirmed"), 2, "the second run gives no answer"),
+                (("-c 4096 -ngl 50",), (None, "nofit"), 1, "layers had to be placed even at the smallest context"),
+                (("-c 0 -ngl -1",), (0, "full"), 1, "context 0: the model's own context fits"),
+                ((None,), (None, "failed"), 1, "no answer"),
+                (("junk",), (None, "failed"), 1, "an unreadable answer"),
+                (("-ngl -1",), (None, "failed"), 1, "an answer without a context"),
+                ((OSError("x"),), (None, "failed"), 1, "a runner that raises")):
+            calls.clear()
+            got = e.largest_context(cfg, runner(*answers))
+            check(got == want and len(calls) == runs, f"{why}: {want} after {runs} run(s) (got {got}, {len(calls)})")
+        calls.clear()
+        got = e.largest_context(c(*base_args, "-ngl", "40"), runner("-c 1 -ngl -1"))
+        check(got == (None, "failed") and not calls, "a greyed-out launch runs nothing")
+        llama_finder.has_nvidia = lambda *a, **k: False         # type: ignore[assignment]
+        check(e.largest_context(cfg, runner("-c 1 -ngl -1")) == (None, "failed") and not calls,
+              "no NVIDIA card: nothing runs")
+    finally:
+        llama_finder.has_nvidia = real_nvidia                   # type: ignore[assignment]
+    opts = e.launch_options(None, {})
+    check(opts is not None and opts.get("context_fit_label") == FIT_LARGEST_LABEL
+          and callable(opts.get("mark_fit")) and callable(opts.get("fit_of")), "Settings gets the entry and its marks")
+    assert opts is not None
+    args = ("-m", mp, "--port", "9931", "-c", "26112")
+    opts["mark_fit"](args, 26112)
+    check(opts["fit_of"](args) == 26112 and opts["fit_of"](("-m", mp, "--port", "9931", "-c", "8192")) is None
+          and opts["fit_of"](("-m", mp, "--port", "9931")) is None,
+          "the mark holds while the arguments name that size, and only then")
+    info = opts["launch_info"](CommandLaunch(str(exe), args))
+    saved = cfg_of(launch_cmd=[str(exe), "-m", mp, "--port", "9931", "-c", "65536"], port=9931)
+    e.apply_launcher(saved, info)
+    reopened = e.launch_options(None, saved)
+    assert reopened is not None
+    check(reopened["fit_of"](tuple(saved["launch_cmd"][1:])) == 26112, "and it is saved with the launch")
+
+
 def main() -> int:
     install_guards()
     tmp = Path(tempfile.mkdtemp(prefix="agentstart-llama-files-"))
     tests = (t_identity, t_probe, t_children_and_sweep, lambda: t_launch(tmp), t_busy_and_headers,
              lambda: t_log_parsing(tmp), lambda: t_poller(tmp), t_load_progress, t_supervisor_stop,
              t_supervisor_lookalikes, t_supervisor_hidden_pid_and_adopt, t_registry_and_compat,
-             lambda: t_fit(tmp), t_model_label)
+             lambda: t_fit(tmp), lambda: t_fit_largest(tmp), t_model_label)
     for t in tests:
         try:
             t()
