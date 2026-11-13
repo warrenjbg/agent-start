@@ -1783,9 +1783,14 @@ class AgentStartApp(ctk.CTk):
                         else:
                             served_last = None
                         if meter is not None:                # the whole card's energy, only while serving
-                            live = sample.live if sample is not None else None
-                            busy = fresh > 0 or (live is not None and live.state in ("reading", "generating"))
-                            meter.step(self.vram.energy_j(), now, serving, busy)
+                            try:                             # an extra: it must never cost the poll itself
+                                live = sample.live if sample is not None else None
+                                busy = fresh > 0 or (live is not None and live.state in ("reading", "generating"))
+                                read = getattr(self.vram, "energy_j", None)   # a sampler without energy metering
+                                meter.step(read() if callable(read) else None, now, serving, busy)
+                            except Exception:  # noqa: BLE001
+                                meter.pause()
+                                log.debug("GPU energy step failed", exc_info=True)
                         if self._served_acc >= USAGE_FLUSH_S:
                             self._flush_served(usage)
                             usage.flush()
@@ -1834,7 +1839,11 @@ class AgentStartApp(ctk.CTk):
             if isinstance(self.dialog, BusyDialog) and ok:
                 self.dialog.update_activity(self._busy_activity())
             self._check_pending_stop(data_ok=ok)
-            self._idle_check(epoch, sample)
+            try:
+                self._idle_check(epoch, sample)
+            except Exception:  # noqa: BLE001 - an extra: it must never cost the status line or a pending stop
+                self._idle.reset()
+                log.debug("idle check failed", exc_info=True)
         if not self._iconic:                              # hidden / minimised: no graph redraws
             self._refresh_stats()
 

@@ -297,7 +297,8 @@ def test_llama_tabs_and_controls() -> None:
         check(H.settings_option(d, "Build")["value"].startswith("CUDA")
               and H.settings_option(d, "Model")["value"] == _label_of(d, MODEL_A)
               and H.settings_option(d, "Context length")["value"] == "Auto (llama.cpp decides)"
-              and H.settings_option(d, "Vision")["value"] == SD.VISION_OFF and d._port_var.get() == "9931",
+              and H.settings_option(d, "Vision")["value"] == SD.VISION_OFF
+              and H.settings_option(d, "Port")["value"] == "Own port · 9931",
               f"the rows show the arguments ({[H.settings_option(d, x)['value'] for x in ('Build', 'Model', 'Context length', 'Vision')]})")
         check(not fit.calls, "opening Settings asks nothing about the GPU (only changes do)")
         ok, have = _tab_texts_ok(d, "Behaviour", ["A game starts", "Memory runs low", "That app closes",
@@ -362,33 +363,30 @@ def test_llama_tabs_and_controls() -> None:
               and H.settings_option(d, "Context length")["value"] == "Auto (llama.cpp decides)",
               "typed arguments: Model, Vision list and Context follow")
 
-        # ---- port: digits 1-65535, rewrites --port, follows typed arguments
-        e = d._port_entry
-        e.delete(0, "end")
-        e.insert(0, "9932")
+        # ---- port: a dropdown - the other engine's port (clients need no change) or this engine's own port;
+        # any other port is typed in the arguments and the row says so
+        port = H.settings_option(d, "Port")
+        same = port["choices"][0] if port["choices"] else ""
+        check(len(port["choices"]) == 2 and same.startswith("Same as Strata · ") and port["choices"][1] == "Own port · 9931"
+              and port["value"] == "Own port · 9931" and port["enabled"] and d._port_entry is None,
+              f"Port row: the other engine's port, or its own ({port})")
+        shared = int(same.rsplit(" ", 1)[-1]) if same else 0
+        check(H.choose_settings_option(d, "Port", same) and LF.port_of(_args(d)) == shared and shared != 9931
+              and str(d._save_btn.cget("state")) == "normal",
+              f"'{same}' writes --port {shared}, can be saved ({_args(d)})")
         pump(app, 0.05)
-        check(_args(d)[-2:] == ["--port", "9932"] and str(d._save_btn.cget("state")) == "normal",
-              f"port 9932 -> --port 9932, can be saved ({_args(d)})")
-        for bad in ("0", "70000", "99a", ""):
-            e.delete(0, "end")
-            if bad:
-                e.insert(0, bad)
-            pump(app, 0.05)
-            check(d._msg.cget("text") == SD.PORT_ERROR and str(d._save_btn.cget("state")) == "disabled"
-                  and str(d._msg.cget("text_color")) == str(T.RED_TEXT) and _args(d)[-2:] == ["--port", "9932"],
-                  f"port {bad!r}: '{SD.PORT_ERROR}', Save off, arguments untouched ({_args(d)})")
-        d.save()
-        pump(app, 0.1)
-        check(H.open_dialog(app) is d, "Save does nothing while the port is invalid")
-        e.insert(0, "9931")
+        check(H.settings_option(d, "Port")["value"] == same and H.settings_option(d, "Port")["choices"] == port["choices"],
+              "the row shows it; the choices stay the two")
+        d._args.set(d._args.get().replace(f"--port {shared}", "--port 9940"))
         pump(app, 0.05)
-        check(d._msg.cget("text") != SD.PORT_ERROR and _args(d)[-2:] == ["--port", "9931"],
-              "a valid port again: the message goes")
-        d._args.set(d._args.get().replace("--port 9931", "--port 9940"))
-        pump(app, 0.05)
-        check(d._port_var.get() == "9940", f"typed --port 9940: the box follows ({d._port_var.get()})")
-        d._args.set(d._args.get().replace("--port 9940", "--port 9931"))
+        check(H.settings_option(d, "Port")["value"] == SD.PORT_OTHER.format(port=9940),
+              f"typed --port 9940: the row says it is in the arguments ({H.settings_option(d, 'Port')['value']})")
+        check(H.choose_settings_option(d, "Port", SD.PORT_OTHER.format(port=9940)) and LF.port_of(_args(d)) == 9940,
+              "picking that entry changes nothing")
+        check(H.choose_settings_option(d, "Port", "Own port · 9931") and LF.port_of(_args(d)) == 9931,
+              f"back to its own port ({_args(d)})")
         pump(app, 0.3)
+        check(H.settings_option(d, "Port")["value"] == "Own port · 9931", "and the row follows")
 
         # ---- the GPU-fit note
         fit.calls.clear()
@@ -474,8 +472,7 @@ def test_llama_tabs_and_controls() -> None:
 
         # ---- Save saves exactly the arguments shown
         H.choose_settings_option(d, "Vision", "On · mmproj-F16")
-        e.delete(0, "end")
-        e.insert(0, "9933")
+        H.choose_settings_option(d, "Port", same)           # one port for both engines
         pump(app, 0.1)
         shown = [d._program.get()] + _args(d)
         with Saves() as s:
@@ -484,7 +481,9 @@ def test_llama_tabs_and_controls() -> None:
             got = s.config[-1].get("launch_cmd") if s.config else None
             check(got == shown and LF.vision_of(got[1:]) == PROJ_A and LF.context_of(got[1:]) == 32768,
                   f"saved launch_cmd == program + the arguments shown ({got} vs {shown})")
-            check(bool(s.config) and s.config[-1].get("port") == 9933, "the port comes from --port, as before")
+            check(bool(s.config) and s.config[-1].get("port") == shared
+                  and s.config[-1].get("endpoint_url") == f"http://127.0.0.1:{shared}/v1",
+                  f"the port and the endpoint come from --port, as before ({shared})")
         late("too late")
         pump(app, 0.1)
         check(H.open_dialog(app) is None, "a late GPU answer after closing touches nothing")
@@ -501,7 +500,7 @@ def test_advanced_fold() -> None:
         check(d is not None and d.advanced_open and _shown(d._program_entry) and _shown(d._adv_body)
               and d.option_rows == 0, "not configured, nothing found: Advanced opens by itself")
         if d is not None:
-            check(H.settings_option(d, "Context length")["enabled"] and d._port_entry is not None,
+            check(H.settings_option(d, "Context length")["enabled"] and H.settings_option(d, "Port")["enabled"],
                   "the context / vision / port controls are there for a hand-typed set-up")
             H.close_settings(d)
     finally:

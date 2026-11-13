@@ -53,6 +53,8 @@ def _model(name: str, gb: float) -> LF.Model:
 
 CUDA, VULKAN = _build("llama.cpp-cuda-b12314", "cuda"), _build("winget-pkg", "vulkan", "winget")
 M1, M2 = _model("Qwen-27B-Q3_K_XL", 12.2), _model("Qwen-27B-IQ4_XS", 13.4)
+# a model the app sets up gets a short name once (else llama-server reports the full path as the model id)
+A1, A2 = ["--alias", "Qwen-27B-Q3_K_XL"], ["--alias", "Qwen-27B-IQ4_XS"]
 
 
 def _found(models) -> FoundLlama:
@@ -112,7 +114,7 @@ def test_auto_config() -> None:
         app._maybe_find_strata()
         U.pump_until(app, lambda: bool(saved), 4.0)
         U.pump(app, 0.4)
-        check(len(saved) == 1 and saved[0]["launch_cmd"] == [CUDA.program, "-m", M1.path, "--port", "9931"]
+        check(len(saved) == 1 and saved[0]["launch_cmd"] == [CUDA.program, "-m", M1.path, "--port", "9931", *A1]
               and saved[0]["port"] == 9931 and saved[0]["endpoint_url"] == "http://127.0.0.1:9931/v1",
               f"one build + one model: saved without a click ({saved})")
         check(app.engine.is_configured(app.cfg) and app.cfg["port"] == 9931, "and applied to the running app")
@@ -139,15 +141,27 @@ def test_auto_config() -> None:
             d._model_picked(labels[0])
             U.pump(app, 0.2)
             first = d._opt_models[0][1]
-            check(first in d._args.get() and d._args.get().endswith("--port 9931") and d._args.get().startswith("-m "),
-                  f"picking a model writes the arguments ({d._args.get()!r})")
+            check(first in d._args.get() and d._args.get().endswith(f"--port 9931 --alias {Path(first).stem}")
+                  and d._args.get().startswith("-m "),
+                  f"picking a model writes the arguments, with its short name ({d._args.get()!r})")
             check(str(d._save_btn.cget("state")) == "normal" and d._model_choice.get() == labels[0],
                   "now it can be saved")
             d._args.set(d._args.get() + " -c 8192")
             d._model_picked(labels[1])
             U.pump(app, 0.2)
-            check(d._opt_models[1][1] in d._args.get() and first not in d._args.get() and "-c 8192" in d._args.get(),
-                  f"another model replaces only the model ({d._args.get()!r})")
+            second = d._opt_models[1][1]
+            check(second in d._args.get() and first not in d._args.get() and "-c 8192" not in d._args.get()
+                  and d._args.get().endswith(f"--port 9931 --alias {Path(second).stem}"),
+                  f"another model: its own arguments - the first model's context does not follow ({d._args.get()!r})")
+            d._model_picked(labels[0])
+            U.pump(app, 0.2)
+            check(first in d._args.get() and second not in d._args.get() and "-c 8192" in d._args.get()
+                  and f"--alias {Path(first).stem}" in d._args.get(),
+                  f"back to the first model: its context is recalled ({d._args.get()!r})")
+            d._model_picked(labels[1])
+            U.pump(app, 0.2)
+            check(second in d._args.get() and "-c 8192" not in d._args.get(),
+                  f"and the second model has its own again ({d._args.get()!r})")
             d._program_picked(d._opt_programs[1][0])
             U.pump(app, 0.2)
             check(d._program.get() == VULKAN.program and d._program_choice.get() == d._opt_programs[1][0],
@@ -202,7 +216,7 @@ def test_card_and_switch() -> None:
         app._on_model_menu(pick)
         U.pump_until(app, lambda: bool(saved), 4.0)
         U.pump(app, 0.5)
-        check(bool(saved) and saved[-1]["launch_cmd"] == [CUDA.program, "-m", M1.path, "--port", "9931"],
+        check(bool(saved) and saved[-1]["launch_cmd"] == [CUDA.program, "-m", M1.path, "--port", "9931", *A1],
               f"picking a model sets it up on the best build ({saved[-1:] and saved[-1]['launch_cmd']})")
         check(not app._setup_shown and app.toggle.cget("text") == "Turn on" and "Qwen-27B-Q3_K_XL" in U.status(app)
               and len(ep.start_calls) == n, f"set up: Turn on, says which model, nothing started ({U.status(app)!r})")
@@ -217,8 +231,9 @@ def test_card_and_switch() -> None:
         other = next(la for la, _k in app._launchers if "IQ4_XS" in la)
         app._on_model_menu(other)
         U.pump_until(app, lambda: saved[-1]["launch_cmd"][2] == M2.path, 4.0)
-        check(saved[-1]["launch_cmd"] == [CUDA.program, "-m", M2.path, "--port", "9931", "-c", "65536"],
-              f"switching replaces only the model ({saved[-1]['launch_cmd']})")
+        check(saved[-1]["launch_cmd"] == [CUDA.program, "-m", M2.path, "--port", "9931", *A2],
+              f"switching: the other model starts with its own arguments, not the first one's context "
+              f"({saved[-1]['launch_cmd']})")
         U.pump(app, 0.4)
         # serving: a switch goes through the app's own stop first
         U.to_active(app, ep)
@@ -230,8 +245,9 @@ def test_card_and_switch() -> None:
         U.pump(app, 0.5)
         U.pump_until(app, lambda: len(ep.stop_calls) == stops + 1, 4.0)
         check(len(ep.stop_calls) == stops + 1 and ep.stop_calls[-1][1] is False and len(saved) == count + 1
-              and saved[-1]["launch_cmd"] == [CUDA.program, "-m", M1.path, "--port", "9931", "-c", "65536"],
-              f"idle model: the switch goes ahead - saved, then the normal (not forced) stop ({len(ep.stop_calls) - stops})")
+              and saved[-1]["launch_cmd"] == [CUDA.program, "-m", M1.path, "--port", "9931", *A1, "-c", "65536"],
+              f"idle model: the switch goes ahead - saved with that model's own context recalled, then the normal "
+              f"(not forced) stop ({len(ep.stop_calls) - stops}, {saved[-1]['launch_cmd']})")
     finally:
         config_store.save_config, config_store.load_config = real_save, real_load
         app.destroy()
