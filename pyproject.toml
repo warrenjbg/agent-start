@@ -68,7 +68,7 @@ module = [
     "psutil",
     "pynvml",
     "pywintypes", "win32api", "win32con", "win32gui", "win32pdh", "win32process",
-    "win32event", "win32service", "win32ui",
+    "win32event", "win32service",
 ]
 ignore_missing_imports = true
 

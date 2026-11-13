@@ -1286,6 +1286,7 @@ class LlamaCppEngine(Engine):
     program_filetypes = (("llama-server", SERVER_EXE), ("Programs", "*.exe"), ("All files", "*.*"))
     has_dashboard = True                 # llama-server serves its web UI on / (unless started with --no-ui)
     watch_gpu_fit = True                 # run the live 'partly on the CPU' check (fit_watch) while serving
+    model_downloads = True               # .gguf models: Settings offers "Download a model…" (Hugging Face)
 
     def load_progress(self, log_text: str, elapsed_s: float, expected_s: float | None) -> tuple[str, float, str | None]:
         """A phase label from the log; the bar stays time-based (single-model mode reports no percentage)."""

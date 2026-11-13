@@ -693,6 +693,7 @@ class AgentStartApp(ctk.CTk):
         self._last_stop_game: str | None = None  # title of the game the running stop is for
         self._last_stop_reason = "game"          # "game" | "memory": why that stop was asked for (toast wording)
         self._skip_reopen_once = False           # Turn off from the game alert: offer the closed apps, don't relaunch
+        self._download_win: Any = None           # download_dialog.DownloadDialog while it is open
         self._idle = idle_watch.IdleWatch()      # idle auto-off: idle time of this serving run (Tk thread)
         self._idle_epoch = -1
         self._idle_stop = False                  # the running stop is the idle auto-off (no box if it gets busy)
@@ -2791,6 +2792,7 @@ class AgentStartApp(ctk.CTk):
             on_update=self.updates.install, switches=self._settings_switches(),
             on_check_updates=self.updates.check_now, can_check_updates=self.updates.available(),
             on_open_release=self.updates.open_unsigned_page,
+            on_download=self.open_download if getattr(self.engine, "model_downloads", False) else None,
             engine=self.engine,
             on_history=self.open_history if self.usage is not None else None,
             engine_choices=engines.choices(), on_engine_change=self.set_backend, launch_options=options,
@@ -3017,6 +3019,64 @@ class AgentStartApp(ctk.CTk):
 
     def _game_blocked(self) -> bool:
         return self._box_open or self.updates.updating or self._dialog_open()
+
+    # ------------------------------------------------------------------ model download
+    def _download_dir(self) -> str:
+        """Where a downloaded model goes: the folder of the model in use (the finder lists what is there), else
+        <Downloads>\\llama-models (Downloads is one of the finder's search roots)."""
+        try:
+            for a in list(self.cfg.get("launch_cmd") or [])[1:]:
+                p = str(a).strip().strip('"')
+                if p.lower().endswith(".gguf") and os.path.isfile(p):
+                    return os.path.dirname(os.path.abspath(p))
+        except Exception:  # noqa: BLE001
+            log.debug("no model folder from the launch", exc_info=True)
+        base = os.path.join(os.path.expanduser("~"), "Downloads")
+        try:
+            import strata_finder
+            roots = strata_finder.default_roots()        # Downloads first (its real location)
+            if roots:
+                base = roots[0]
+        except Exception:  # noqa: BLE001
+            log.debug("default roots unavailable", exc_info=True)
+        return os.path.join(base, "llama-models")
+
+    def open_download(self) -> Any:
+        """Settings > Download a model…: the download window (one at a time; not modal, not self.dialog - the app
+        stays usable and nothing waits for it). None when it cannot open."""
+        if self._destroyed:
+            return None
+        win = self._download_win
+        try:
+            if win is not None and win.winfo_exists():
+                win.lift()
+                win.focus_force()
+                return win
+        except Exception:  # noqa: BLE001
+            log.debug("download window gone", exc_info=True)
+        dest = self._download_dir()
+        try:
+            os.makedirs(dest, exist_ok=True)
+            import download_dialog
+            self._download_win = download_dialog.DownloadDialog(self, dest, on_done=self._model_downloaded)
+        except Exception:  # noqa: BLE001
+            log.exception("the download window could not be opened")
+            self._download_win = None
+            self._set_note("The download window could not be opened")
+        return self._download_win
+
+    def _model_downloaded(self, path: str) -> None:
+        """A model file arrived (checked by hf_download): look for models again, so Settings and the model menu
+        list it. Nothing is started and nothing about the running engine changes."""
+        log.info("model downloaded: %s", os.path.basename(str(path)))
+        if getattr(self, "_no_finder", False) or not self.engine.can(CAP_FIND_INSTALL):
+            return
+
+        def found(result: Any) -> None:
+            self._on_strata_found(result)
+            self._refresh_launchers()
+
+        self._run_worker("hc-find-install", _find_install_worker, self.engine, self.post, found, self._stop_evt)
 
     # ------------------------------------------------------------------ idle auto-off
     def _idle_supported(self) -> bool:
@@ -3522,6 +3582,8 @@ def _selftest() -> int:
         import strata_tuning  # noqa: F401
         import llama_finder  # noqa: F401
         import llama_models  # noqa: F401
+        import hf_download  # noqa: F401
+        import download_dialog  # noqa: F401
         import idle_watch  # noqa: F401
         import engine_profiles  # noqa: F401
         import fit_watch  # noqa: F401

@@ -50,6 +50,7 @@ GROUP_APP = "Agent Start"
 REOPEN_LABEL = "Reopen the apps that were closed"
 PROTECTED_LABEL = "Protected apps"
 HISTORY_LABEL = "Usage history"
+DOWNLOAD_LABEL = "Download a model…"
 # Behaviour rows: the app's switch keys -> the label shown (the callbacks and values are the app's, unchanged)
 ROW_LABELS = {"games": "A game starts", "memory": "Memory runs low", "resume": "That app closes",
               "idle": "Idle with no requests",
@@ -135,6 +136,7 @@ class SettingsDialog(ctk.CTkToplevel):
                  switches: list[dict] | None = None,
                  on_check_updates: Callable[[Callable[[str, str | None], bool]], str] | None = None,
                  on_open_release: Callable[[], Any] | None = None,
+                 on_download: Callable[[], Any] | None = None,
                  can_check_updates: bool = True, engine=None,
                  on_history: Callable[[], Any] | None = None,
                  launch_options: dict | None = None,
@@ -182,6 +184,9 @@ class SettingsDialog(ctk.CTkToplevel):
         self._on_check_updates = on_check_updates
         self._on_open_release = on_open_release  # opens the page of a release that was refused (bad signature)
         self._check_link = False                 # the check message is that link right now
+        # "Download a model…" (engines with launch options): Settings closes and the app opens its download window
+        self._on_download = on_download
+        self._download_btn: LinkRow | None = None
         self._on_history = on_history
         self._on_engine_change = on_engine_change
         self._on_fit_preview = on_fit_preview
@@ -466,6 +471,10 @@ class SettingsDialog(ctk.CTkToplevel):
                 self._program_menu, self._program_choice = menu, var
             else:
                 self._model_menu, self._model_choice = menu, var
+            r += 1
+        if self._on_download is not None:
+            self._download_btn = LinkRow(tab, DOWNLOAD_LABEL, self._download_clicked, self._body, self._glyph_font)
+            self._download_btn.grid(row=r, column=0, sticky="ew", pady=(0, 4))
             r += 1
         if self._has_context:
             line = self._labelled(tab, r, "Context length")
@@ -1445,6 +1454,16 @@ class SettingsDialog(ctk.CTkToplevel):
             log.debug("update check result not shown", exc_info=True)
             return False
         return True
+
+    def _download_clicked(self) -> None:
+        """Download a model…: this dialog closes (as Cancel would) and the app opens the download window, which is
+        not modal - a download can take a long time and the app stays usable meanwhile."""
+        cb = self._on_download
+        if cb is None or self._saving:
+            return
+        master = self.master
+        self.close()
+        master.after(50, cb)
 
     # ------------------------------------------------------------------ protected apps (nested modal)
     def _update_clicked(self) -> None:

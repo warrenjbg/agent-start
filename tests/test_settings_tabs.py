@@ -279,6 +279,36 @@ def _open_llama(app, fit: FakeFit | None = None):
     return d
 
 
+def test_download_link() -> None:
+    """Download a model…: only for an engine with .gguf models; the link closes Settings and opens the app's
+    download window (here a recorder: no window, no network)."""
+    app, det, ep = U.new_app()
+    try:
+        d = H.open_settings(app)
+        check(d is not None and d._download_btn is None, "Strata: no download link")
+        check(app._download_dir().endswith("llama-models"), f"no model in use: <Downloads>\\llama-models ({app._download_dir()})")
+        if d is not None:
+            H.close_settings(d)
+    finally:
+        app.destroy()
+    app, det, ep = _llama_app([EXE, "-m", MODEL_A, "--port", "9931"], _found())
+    opened: list = []
+    app.open_download = lambda: opened.append(1)      # type: ignore[method-assign]
+    try:
+        d = _open_llama(app)
+        check(d is not None and d._download_btn is not None and d._download_btn.text == SD.DOWNLOAD_LABEL,
+              "llama.cpp: the link is there")
+        if d is not None and d._download_btn is not None:
+            d._args.set(d._args.get() + " -c 8192")       # an unsaved change
+            with Saves() as s:
+                d._download_btn.invoke()
+                check(pump_until(app, lambda: bool(opened) and H.open_dialog(app) is None, 3),
+                      "the link closes Settings and opens the download window")
+                check(not s.config, "nothing is saved by it (unsaved changes are dropped, as Cancel does)")
+    finally:
+        app.destroy()
+
+
 def test_llama_tabs_and_controls() -> None:
     SD.FIT_DEBOUNCE_MS = 200                          # the debounce itself is the same code; shorter for the test
     fit = FakeFit()
@@ -306,6 +336,13 @@ def test_llama_tabs_and_controls() -> None:
         check(ok, f"llama.cpp Behaviour tab: the same rows ({have})")
         ok, have = _tab_texts_ok(d, "About", ["Version", "Endpoint", "Open llama.cpp dashboard", "Copy"])
         check(ok, f"llama.cpp About tab ({have})")
+        ok, have = _tab_texts_ok(d, "Model", ["Model", SD.DOWNLOAD_LABEL, "Context length"])
+        order = [have.index(t) for t in ("Model", SD.DOWNLOAD_LABEL, "Context length")] if ok else []
+        check(ok and order == sorted(order) and d._download_btn is not None
+              and H.settings_tab_of(d, d._download_btn) == "Model",
+              f"llama.cpp Model tab: '{SD.DOWNLOAD_LABEL}' sits under Model, before Context length ({have})")
+        check(os.path.normcase(app._download_dir()) == os.path.normcase(os.path.dirname(MODEL_A)),
+              f"a download goes beside the model in use ({app._download_dir()})")
 
         # ---- context length: rewrites -c, follows typed arguments, a custom value
         check(H.choose_settings_option(d, "Context length", "32K tokens") and _args(d)[-2:] == ["-c", "32768"],
@@ -547,7 +584,7 @@ def test_advanced_fold() -> None:
 
 
 def run() -> int:
-    for t in (test_strata_tabs, test_llama_tabs_and_controls, test_advanced_fold):
+    for t in (test_strata_tabs, test_download_link, test_llama_tabs_and_controls, test_advanced_fold):
         print(f"-- {t.__name__}")
         try:
             t()
