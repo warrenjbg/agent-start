@@ -264,11 +264,17 @@ def test_real_launch() -> None:
             check("venv launcher env var not leaked to the relaunched app",
                   "__PYVENV_LAUNCHER__" not in reopen._child_env())
         check("already_running True after relaunch", reopen.already_running(r))
+        rl = reopen.relaunched()
+        check("relaunched(): the app we started is remembered as (pid, create_time)",
+              len(rl) == 1 and all(psutil.Process(pid).create_time() == ct for pid, ct in rl)
+              and {pid for pid, _ in rl} <= {p.pid for p in ours()}, str(rl))
         res2 = reopen.reopen_one(r)
         check("reopen_one on running app -> already running, no 2nd launch",
               res2["status"] == "already_running" and len([p for p in ours() if _exe(p) == os.path.normcase(r.exe)]) == 1,
               str(res2))
         kill_ours()
+        time.sleep(0.3)
+        check("relaunched(): gone once the app has exited", reopen.relaunched() == set(), str(reopen.relaunched()))
         # cwd gone -> falls back to the exe's folder
         r2 = LaunchRecord.from_dict({**r.to_dict(), "cwd": str(TMP / "gone-dir")})
         ok, why = reopen.launch(r2)

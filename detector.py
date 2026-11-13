@@ -270,6 +270,11 @@ class GraphContext:
     """Everything build_apps needs besides the process table (all plain data)."""
     self_pid: int | None = None
     extra_hard_pids: set[int] = field(default_factory=set)
+    # (pid, create_time) of apps this program itself started again after a sweep (reopen.relaunched()). They are
+    # its children, and without this they would be protected as "descendants of self" until it restarts. Being
+    # listed lifts ONLY that rule, only for a direct child of self whose create time matches: protected names,
+    # the whitelist, the engine, system and session rules all still apply, and nothing is closed unticked.
+    released: set[tuple[int, float]] = field(default_factory=set)
     tree_protected: frozenset[str] = TREE_PROTECTED
     system_protected: frozenset[str] = SYSTEM_PROTECTED
     strata_dir: str = ""
@@ -342,6 +347,16 @@ class ProcGraph:
         return par is None or self.procs[par].nname != self.procs[pid].nname
 
 
+def _relaunched_by_us() -> set[tuple[int, float]]:
+    """(pid, create_time) of the apps reopen.py started in this run; empty when that cannot be read."""
+    try:
+        import reopen
+        return set(reopen.relaunched())
+    except Exception:  # noqa: BLE001 - unknown = nothing released (everything stays protected)
+        log.debug("relaunched() failed", exc_info=True)
+        return set()
+
+
 def compute_protection(procs: dict[int, ProcInfo], graph: ProcGraph,
                        ctx: GraphContext) -> tuple[set[int], set[int]]:
     """Return (hard_pids, rule_a_pids).
@@ -369,15 +384,33 @@ def compute_protection(procs: dict[int, ProcInfo], graph: ProcGraph,
             seeds.add(pid)
         if _tree_name(info.nname, ctx):
             seeds.add(pid)
+    released = _released_pids(procs, graph, ctx)
     rule_a: set[int] = set()
     for s in seeds:
         if s in procs:
-            rule_a |= graph.descendants(s)
+            rule_a |= graph.descendants(s) - (released if s == ctx.self_pid else set())
     # descendants of self / provider / Strata are themselves HARD
     for s in seeds:
         if s in hard and s in procs:
-            hard |= graph.descendants(s)
+            hard |= graph.descendants(s) - (released if s == ctx.self_pid else set())
     return hard, rule_a
+
+
+def _released_pids(procs: dict[int, ProcInfo], graph: ProcGraph, ctx: GraphContext) -> set[int]:
+    """The trees of ctx.released: a DIRECT, validated child of self with a matching create time, plus its
+    descendants. They are left out of what self's own tree protects - and of nothing else: if such a process is
+    reached from another protected root (the engine, a provider pid, a protected name), that still protects it."""
+    out: set[int] = set()
+    if ctx.self_pid is None or not ctx.released:
+        return out
+    for pid in graph.children.get(ctx.self_pid, ()):
+        ct = procs[pid].create_time
+        if ct is None:
+            continue
+        if any(rp == pid and abs(float(rct) - float(ct)) <= 0.01 for rp, rct in ctx.released):
+            out.add(pid)
+            out |= graph.descendants(pid)
+    return out
 
 
 def _engine_process(info: ProcInfo, ctx: GraphContext) -> bool:
@@ -669,6 +702,7 @@ class ProcessDetector:
         ctx = GraphContext(
             self_pid=self._self_pid,
             extra_hard_pids=self._provider_pids(),
+            released=_relaunched_by_us(),
             tree_protected=frozenset(tree_prot),
             system_protected=SYSTEM_PROTECTED,
             strata_dir=str(self.config.get("strata_dir") or ""),

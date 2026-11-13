@@ -326,6 +326,34 @@ def test_synthetic() -> None:
     check("self descendant not a candidate", 602 not in apps)
     check("sibling under explorer (ancestor) still eligible", 700 in apps)
 
+    # (e2) apps this program reopened are its children; they are released from the "descendants of self" rule,
+    # and from nothing else
+    G = "C:\\Games\\steamapps\\common\\G\\"
+    procs = {1: P(1, "explorer.exe", 0, 1, exe="C:\\Windows\\explorer.exe"),
+             100: P(100, "AgentStart.exe", 1, 10, exe="C:\\Apps\\AgentStart.exe"),
+             200: P(200, "Game.exe", 100, 20, rss_mb=6000, exe=G + "Game.exe"),
+             201: P(201, "GameHelper.exe", 200, 21, rss_mb=300, exe=G + "GameHelper.exe"),
+             210: P(210, "Editor.exe", 100, 22, rss_mb=2000),
+             220: P(220, "toast.exe", 100, 23, rss_mb=2000),
+             221: P(221, "nested.exe", 220, 24, rss_mb=2000),
+             230: P(230, "python.exe", 100, 25, rss_mb=2000, exe="C:\\Py\\python.exe",
+                    cmd=["C:\\Py\\python.exe", "C:\\Strata\\serve\\server.py"]),
+             240: P(240, "Guarded.exe", 100, 26, rss_mb=2000)}
+    apps = by_pid(build_apps(procs, ctx(self_pid=100, tree_protected=frozenset())))
+    check("nothing released: every child of self stays protected", not apps, str(sorted(apps)))
+    rel = {(200, 20.0), (210, 22.0), (221, 24.0), (230, 25.0), (240, 26.0), (220, 99.0)}
+    apps = by_pid(build_apps(procs, ctx(self_pid=100, tree_protected=frozenset({"guarded"}), released=rel)))
+    check("a reopened game is a candidate again, with its helper", 200 in apps and apps[200].category == "game"
+          and set(apps[200].member_pids) == {200, 201}, str({k: v.member_pids for k, v in apps.items()}))
+    check("a reopened app is a candidate again", 210 in apps)
+    check("same pid, other create time (pid reuse): still protected", 220 not in apps and 221 not in apps)
+    check("only a DIRECT child of self can be released", 221 not in apps)
+    check("the engine stays protected even if listed", 230 not in apps)
+    check("a protected name stays protected even if listed", 240 not in apps)
+    check("self is never a candidate", 100 not in apps)
+    apps = by_pid(build_apps(procs, ctx(self_pid=None, tree_protected=frozenset(), released={(200, 20.0)})))
+    check("released means nothing without self", 200 in apps and 210 in apps)   # no self: plain candidates anyway
+
     # (f) Strata: server process + engine + exe under strata_dir; launcher hosting it is dropped
     procs = {800: P(800, "wrapper.exe", 0, 10, rss_mb=2000),
              801: P(801, "python.exe", 800, 11, exe="C:\\Py\\python.exe",

@@ -289,6 +289,38 @@ def _child_env() -> dict[str, str]:
     return env
 
 
+_RELAUNCHED: set[tuple[int, float]] = set()
+_RELAUNCHED_LOCK = threading.Lock()
+
+
+def _remember(pid: int) -> None:
+    """Note an app we started ourselves (pid + create time), so the next scan can offer it again: as our child
+    it would otherwise count as part of this program. Best effort; unknown = not remembered = stays protected."""
+    try:
+        ident = (int(pid), float(psutil.Process(pid).create_time()))
+    except (psutil.Error, OSError, ValueError):
+        return
+    with _RELAUNCHED_LOCK:
+        _RELAUNCHED.add(ident)
+
+
+def relaunched() -> set[tuple[int, float]]:
+    """(pid, create_time) of the apps launch() started in this run and that still exist (dead ones are dropped;
+    a reused pid has another create time and does not match)."""
+    with _RELAUNCHED_LOCK:
+        idents = set(_RELAUNCHED)
+    alive = set()
+    for pid, ct in idents:
+        try:
+            if abs(psutil.Process(pid).create_time() - ct) <= 0.01:
+                alive.add((pid, ct))
+        except (psutil.Error, OSError):
+            continue
+    with _RELAUNCHED_LOCK:
+        _RELAUNCHED.difference_update(idents - alive)
+    return alive
+
+
 def _popen_detached(argv: list[str], executable: str | None, cwd: str | None) -> subprocess.Popen:
     flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     kw: dict[str, Any] = dict(executable=executable, cwd=cwd, close_fds=True, shell=False,
@@ -333,6 +365,7 @@ def launch(rec: LaunchRecord | dict) -> tuple[bool, str]:
             return False, "command line does not match the program"
         cwd = rec.cwd if rec.cwd and os.path.isdir(rec.cwd) else os.path.dirname(exe)
         p = _popen_detached(argv, exe, cwd)
+        _remember(p.pid)
         log.info("reopen: started %s pid %s", rec.name, p.pid)
         return True, "started"
     except Exception as exc:  # noqa: BLE001
