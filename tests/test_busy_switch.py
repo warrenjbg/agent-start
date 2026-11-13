@@ -28,6 +28,7 @@ import test_ui_smoke as U  # noqa: E402
 import customtkinter as ctk  # noqa: E402
 
 import main  # noqa: E402
+import metrics_worker  # noqa: E402
 import config_store  # noqa: E402
 import launcher_bat  # noqa: E402
 import reopen  # noqa: E402
@@ -41,7 +42,7 @@ FAILS: list[str] = []
 PASSES = 0
 
 GRACE = 0.8          # main.IDLE_GRACE_S during the run
-POLL = 0.2           # main.LIVE_POLL_S during the run
+POLL = 0.2           # metrics_worker.LIVE_POLL_S during the run
 
 pump, pump_until, status, pill, to_active, fire = U.pump, U.pump_until, U.status, U.pill, U.to_active, U.fire
 IDLE_STATUS, active_status, stop_result = U.IDLE_STATUS, U.active_status, U.stop_result
@@ -1027,9 +1028,9 @@ def test_switch_pending_then_strata_gone(S: Strata) -> None:
 def run() -> int:
     main.TOGGLE_DEBOUNCE_S = 0.0
     check(hasattr(main, "IDLE_GRACE_S"), "main.IDLE_GRACE_S exists")
-    old = (getattr(main, "IDLE_GRACE_S", None), main.LIVE_POLL_S)
+    old = (getattr(main, "IDLE_GRACE_S", None), metrics_worker.LIVE_POLL_S)
     info(f"main.IDLE_GRACE_S default = {old[0]!r}, LIVE_POLL_S = {old[1]!r}")
-    main.IDLE_GRACE_S, main.LIVE_POLL_S = GRACE, POLL
+    main.IDLE_GRACE_S, metrics_worker.LIVE_POLL_S = GRACE, POLL
     dialogs = U.Dialogs()
     dialogs.install()
     S = Strata()
@@ -1058,7 +1059,7 @@ def run() -> int:
                 del main.IDLE_GRACE_S
         else:
             main.IDLE_GRACE_S = old[0]
-        main.LIVE_POLL_S = old[1]
+        metrics_worker.LIVE_POLL_S = old[1]
         reopen.clear_pending()
         shutil.rmtree(S.tmp, ignore_errors=True)
         shutil.rmtree(U.HOME, ignore_errors=True)

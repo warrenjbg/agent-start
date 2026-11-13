@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(ROOT, "tests"))
 import test_ui_smoke as U  # noqa: E402  (first: it redirects the data dir)
 
 import main  # noqa: E402
+import metrics_worker  # noqa: E402
 import theme as T  # noqa: E402
 from engines.base import FitCheck, FitReport  # noqa: E402
 
@@ -217,7 +218,7 @@ class _Vram:
 
 
 def test_probe() -> None:
-    probe = main._FitProbe()
+    probe = metrics_worker._FitProbe()
     cpu = {"v": 49.0}
     probe._cpu_pct = lambda now, endpoint: cpu["v"]         # type: ignore[method-assign]
     vram = _Vram()
@@ -235,7 +236,7 @@ def test_probe() -> None:
     check(any(o[0] is False for o in hits) and any(o[1] for o in hits),
           f"20 s of clean generating: cleared, and the pre-check is overruled ({hits})")
     # short bursts never add up across idle gaps longer than the allowed gap
-    p2 = main._FitProbe()
+    p2 = metrics_worker._FitProbe()
     cpu["v"] = 49.0
     p2._cpu_pct = lambda now, endpoint: cpu["v"]            # type: ignore[method-assign]
     res = []
@@ -247,14 +248,14 @@ def test_probe() -> None:
     check(probe.observe(2, 100.0, gen, vram, None, cfg) is None and probe.state.slow is False and probe.epoch == 2,
           "new server run: state reset")
     # no video-memory figure: never a verdict
-    p3 = main._FitProbe()
+    p3 = metrics_worker._FitProbe()
     p3._cpu_pct = lambda now, endpoint: 49.0                # type: ignore[method-assign]
     none_vram = types.SimpleNamespace(snapshot=lambda: types.SimpleNamespace(samples=(), total_mb=None,
                                                                              available=False, now=1.0))
     check(all(p3.observe(1, float(t), gen, none_vram, None, cfg) is None for t in range(0, 20)),
           "no video-memory reading: no verdict")
     # a stale / unavailable video-memory reading is not used
-    p5 = main._FitProbe()
+    p5 = metrics_worker._FitProbe()
     p5._cpu_pct = lambda now, endpoint: 49.0                # type: ignore[method-assign]
     old = types.SimpleNamespace(snapshot=lambda: types.SimpleNamespace(samples=((0.0, 15800.0),), total_mb=16300.0,
                                                                        available=True, now=120.0))
@@ -264,13 +265,13 @@ def test_probe() -> None:
           and all(p5.observe(2, float(t), gen, off, None, cfg) is None for t in range(0, 20)),
           "an old or unavailable video-memory reading: no verdict")
     # the real CPU reader only reads: pids from the endpoint, nothing else
-    p4 = main._FitProbe()
+    p4 = metrics_worker._FitProbe()
     ep = types.SimpleNamespace(protected_pids=lambda: {1, 2, 3}, engine_pids=lambda: {os.getpid()})
     first = p4._cpu_pct(0.0, ep)
     second = p4._cpu_pct(1.0, ep)
     check(first is None and isinstance(second, float) and 0.0 <= second <= 100.0,
           f"CPU share: primed first, then a share of all cores ({first}, {second})")
-    check(main._FitProbe()._cpu_pct(0.0, types.SimpleNamespace(protected_pids=lambda: set())) is None,
+    check(metrics_worker._FitProbe()._cpu_pct(0.0, types.SimpleNamespace(protected_pids=lambda: set())) is None,
           "no engine process known: no figure")
 
 

@@ -48,7 +48,6 @@ from engines.base import (
     CAP_LIVE_ACTIVITY,
     CAP_LOAD_PROGRESS,
     CAP_RAM_MODES,
-    CAP_REQUEST_END,
     CAP_REQUEST_HISTORY,
     LoadReport,
     MetricsSample,
@@ -63,6 +62,8 @@ from update_controller import UpdateController, UpdateHost
 from sweep_dialog import SweepDialog
 from alias_controller import (  # noqa: F401  (re-exported: the Settings row's labels, the worker)
     ALIAS_LABEL, ALIAS_LABEL_MISSING, AliasController, AliasHost, _alias_note, _alias_worker)
+from metrics_worker import (  # noqa: F401  (re-exported: the poll and usage-save periods, the fit probe)
+    LIVE_POLL_S, USAGE_FLUSH_S, USAGE_RETRY_S, MetricsHost, MetricsWorker, _FitProbe)
 from text_util import gb as _gb, short as _short
 from version import __version__
 from vram_sampler import VramSampler
@@ -126,10 +127,6 @@ GAME_ACTION_LABELS = {"off": "Turn Strata off", "ask": "Ask me", "none": "Do not
 TOOL_WAIT_S = 600.0                      # after a request that ended in a tool call the agent comes back with the tool's
                                          # result; "when it's done" waits up to this long for that next request
 SWITCH_GLYPH = "\uE8AB"                  # Segoe Fluent Icons "Switch"
-USAGE_FLUSH_S = 60.0                     # usage history: serving time is added and the file saved this often
-USAGE_RETRY_S = 30.0                     # ...and while idle a save that failed is retried this often
-LIVE_POLL_S = 1.0                        # /metrics poll while serving (model state on the status line), as Strata's
-                                         # own Monitor; stopped while the window is minimised
 ACT_BAR_X = 22                           # activity bar under the status line: starts at the state text...
 ACT_BAR_RIGHT = 36                       # ...and ends before the gear (logical px)
 ACT_STATUS = {"reading": ("Reading", T.BLUE), "generating": ("Generating", T.ACCENT), "queued": ("Queued", T.AMBER)}
@@ -339,84 +336,6 @@ def fit_largest_text(tokens: int | None, state: str, used_gb: float | None) -> s
     return "The check gave no answer"
 
 
-class _FitProbe:
-    """The live GPU-fit check's measurements, kept by the metrics worker (never touched from the Tk thread): the
-    engine's CPU share and the video memory, fed to fit_watch.decide once per poll. Read-only on processes."""
-
-    def __init__(self) -> None:
-        self.epoch: int | None = None
-        self.state: Any = None
-        self.procs: list = []
-        self.procs_at = 0.0
-        self.clean_s = 0.0
-        self.last: float | None = None
-        self.pre_cleared = False
-
-    def _cpu_pct(self, now: float, endpoint: Any) -> float | None:
-        if not self.procs or now - self.procs_at > 30.0:
-            self.procs_at = now
-            procs = []
-            pids = getattr(endpoint, "engine_pids", None) or endpoint.protected_pids
-            for pid in pids():
-                try:
-                    p = psutil.Process(pid)
-                    p.cpu_percent(None)          # primes the counter: the first reading is from the next poll
-                    procs.append(p)
-                except psutil.Error:
-                    continue
-            known = {p.pid for p in self.procs}
-            fresh = {p.pid for p in procs} != known
-            self.procs = procs if fresh or not self.procs else self.procs
-            if fresh:
-                return None
-        total, seen = 0.0, False
-        for p in self.procs:
-            try:
-                total += p.cpu_percent(None)
-                seen = True
-            except psutil.Error:
-                continue
-        if not seen:
-            self.procs = []
-            return None
-        return total / max(1, psutil.cpu_count() or 1)
-
-    def observe(self, epoch: int, now: float, sample: Any, vram: Any, endpoint: Any, cfg: Any):
-        """-> None (nothing to tell) or (slow | None, pre_cleared) for the Tk thread."""
-        import fit_watch
-        if epoch != self.epoch:
-            self.__init__()
-            self.epoch = epoch
-            self.state = fit_watch.FitState()
-        live = getattr(sample, "live", None)
-        generating = getattr(live, "state", None) == "generating"
-        used = total = None
-        try:
-            snap = vram.snapshot()
-            fresh = snap.samples and getattr(snap, "now", None) is not None and snap.now - snap.samples[-1][0] <= 10.0
-            if getattr(snap, "available", True) and fresh and snap.total_mb:
-                used, total = snap.samples[-1][1], snap.total_mb
-        except Exception:  # noqa: BLE001
-            used = total = None
-        cpu = self._cpu_pct(now, endpoint) if generating else None
-        fcfg = fit_watch.FitConfig.from_config(cfg)
-        changed, self.state = fit_watch.decide(self.state, now, generating=generating, vram_used_mb=used,
-                                               vram_total_mb=total, cpu_share_pct=cpu, cfg=fcfg)
-        cleared = False
-        if generating and not self.pre_cleared:
-            clean = fit_watch.symptoms(fcfg, used, total, cpu) is False
-            if clean and self.last is not None and now - self.last <= fit_watch.MAX_GAP_S:
-                self.clean_s += now - self.last
-            elif not clean:
-                self.clean_s = 0.0
-            if self.clean_s >= fcfg.clear_s:     # enough clean generating: the pre-check's "will not fit" is overruled
-                self.pre_cleared = cleared = True
-        self.last = now if generating else None
-        if changed or cleared:
-            return (self.state.slow if changed else None, cleared)
-        return None
-
-
 def _protocol_registered() -> bool:
     """agentstart:// opens THIS exe (installer-registered): only then does a toast button work."""
     try:
@@ -613,7 +532,6 @@ class AgentStartApp(ctk.CTk):
             log.exception("usage history unavailable")
         self._metrics_fails = 0
         self._metrics_epoch = 0                  # bumped per start: a late poll of the old server is dropped
-        self._served_epoch = 0
         self.vram = vram_sampler if vram_sampler is not None else VramSampler()
         self._spans: list[list[float | None]] = []   # [start, end|None] (monotonic) while Strata was running
         self._avail_at_launch: float | None = None
@@ -674,8 +592,18 @@ class AgentStartApp(ctk.CTk):
         self._switch_to: str | None = None       # engine chosen in Settings: switch (and restart) once it is off
         self._switch_at = 0.0
         self._can_relaunch = bool(extras)        # a test app never starts a second Agent Start
-        self._served_acc = 0.0                    # serving seconds not yet in the usage history (metrics worker)
-        self._served_model: str | None = None
+        # The hc-metrics thread's body (poll, usage history, live GPU-fit check): metrics_worker.py. It runs on
+        # that worker thread and reads the app through these callables each time it reads a value.
+        self.metrics_worker = MetricsWorker(MetricsHost(
+            # (looked up at call time, like a read of the app was: tests swap these after building the app)
+            stop_evt=lambda: self._stop_evt, state=lambda: self.state_name,
+            metrics_epoch=lambda: self._metrics_epoch, cfg=lambda: self.cfg, engine=lambda: self.engine,
+            endpoint=lambda: self.endpoint, vram=lambda: self.vram, usage=lambda: self.usage,
+            energy=lambda: self._energy, loaded=lambda: self.loaded, model_id=lambda: self.model_id,
+            fetch_metrics=lambda: self._fetch_metrics, fetch_status=lambda: self._fetch_status,
+            apply_metrics=lambda epoch, sample: self.post(self._apply_metrics, epoch, sample),
+            set_gpu_fit_live=lambda epoch, *verdict: self.post(self._set_gpu_fit_live, epoch, *verdict),
+            stats_ms=lambda: STATS_MS))
         self._no_tray = not extras or not self._tray_pref
         self._no_finder = not extras
         self._last_stop_game: str | None = None  # title of the game the running stop is for
@@ -768,7 +696,7 @@ class AgentStartApp(ctk.CTk):
         self._first_id = self.after(300, self._first_refresh)
         threading.Thread(target=self._monitor_loop, name="hc-monitor", daemon=True).start()
         threading.Thread(target=self._memory_loop, name="hc-memory", daemon=True).start()
-        threading.Thread(target=self._metrics_loop, name="hc-metrics", daemon=True).start()
+        threading.Thread(target=self.metrics_worker.loop, name="hc-metrics", daemon=True).start()
         self.vram.start()
 
     # ================================================================== layout
@@ -1704,124 +1632,6 @@ class AgentStartApp(ctk.CTk):
             row.set_value(f"{fmt_rate(series[-1])} tok/s", T.TEXT, "last")
         else:
             row.set_value("–", T.TEXT_3)
-
-    def _metrics_poller(self):
-        """The engine's poller. The test seams are looked up per call (tests swap the fetchers after building the
-        app); without seams the engine uses its own HTTP fetchers."""
-        seams = {}
-        if self._fetch_metrics is not None:
-            seams["fetch_metrics"] = lambda r, **kw: self._fetch_metrics(r, **kw)
-            seams["fetch_status"] = lambda r: self._fetch_status(r) if self._fetch_status is not None else None
-        http = getattr(self.endpoint, "engine_http", None)     # engines that ask the server themselves (live state)
-        if http is not None:
-            seams["http"] = http
-        return self.engine.metrics_poller(self.cfg, **seams)
-
-    def _run_log_path(self) -> str | None:
-        """The server log of the run this app started (None for an adopted server): some engines only report
-        per-request figures there."""
-        try:
-            st = self.endpoint.status()
-            return None if st.get("adopted") else (st.get("log_path") or None)
-        except Exception:  # noqa: BLE001
-            return None
-
-    def _metrics_loop(self) -> None:
-        """Worker: poll the engine's monitoring data every LIVE_POLL_S while it is serving."""
-        last_poll = 0.0
-        last_epoch = None
-        poller = None
-        served_last = None                       # serving time for the usage history, added once a minute
-        fit = _FitProbe()                        # GPU fit: the live check (engines with watch_gpu_fit)
-        usage_retry = 0.0                        # an unwritable usage file is retried this often, not every poll
-        while not self._stop_evt.is_set():
-            try:
-                # Every LIVE_POLL_S while serving: the status line shows what the model is doing (reading /
-                # generating / queued) and the stats graphs use the same samples.
-                # Also while minimised / hidden in the tray: Turn off from the tray must still know whether a reply
-                # or an agent's tool call is running (the request phases are only seen by polling).
-                if self.state_name in (ACTIVE, STOPPING):
-                    epoch = self._metrics_epoch
-                    root = config_store.server_root(str(self.cfg.get("endpoint_url") or ""))
-                    reports = any(self.engine.can(c) for c in (CAP_LIVE_ACTIVITY, CAP_REQUEST_HISTORY,
-                                                               CAP_REQUEST_END))
-                    if poller is None:
-                        poller = self._metrics_poller()
-                    # Engines return only their newest finished requests per poll: after a gap (section collapsed,
-                    # window minimised, a new server) ask once for all of them so the 30 bars are complete.
-                    now = time.monotonic()
-                    catch_up = epoch != last_epoch or now - last_poll > 3 * STATS_MS / 1000.0
-                    if epoch != last_epoch:          # a new server run: forget the previous one's counters
-                        poller.reset(log_path=self._run_log_path())
-                    if reports:
-                        sample = poller.poll(root, catch_up) if root else None
-                    else:
-                        # nothing to ask: an empty sample ("nothing reported"), not a failed poll - a pending
-                        # stop then waits the engine's idle time instead of being treated as a dead server
-                        sample = MetricsSample()
-                    last_poll, last_epoch = now, epoch
-                    if getattr(self.engine, "watch_gpu_fit", False) and sample is not None:
-                        verdict = fit.observe(epoch, now, sample, self.vram, self.endpoint, self.cfg)
-                        if verdict is not None:
-                            self.post(self._set_gpu_fit_live, epoch, *verdict)
-                    usage = self.usage
-                    if usage is not None:
-                        if epoch != self._served_epoch:  # another server run: its model is not the last one's
-                            self._flush_served(usage)
-                            self._served_epoch, self._served_model = epoch, None
-                        meter = self._energy
-                        fresh = 0
-                        if sample is not None:
-                            # requests seen while GPU energy was being counted also count toward tokens per Wh
-                            fresh = usage.record(sample, now=time.time(),
-                                                 metered=meter is not None and meter.metering)
-                            if sample.model:             # the same name the requests are counted under
-                                self._served_model = sample.model
-                        serving = self.state_name == ACTIVE and self.loaded is not False
-                        if serving:
-                            if served_last is not None:      # capped: sleep / hibernation is not serving time
-                                self._served_acc += min(max(0.0, now - served_last), 5.0)
-                            served_last = now
-                        else:
-                            served_last = None
-                        if meter is not None:                # the whole card's energy, only while serving
-                            try:                             # an extra: it must never cost the poll itself
-                                live = sample.live if sample is not None else None
-                                busy = fresh > 0 or (live is not None and live.state in ("reading", "generating"))
-                                read = getattr(self.vram, "energy_j", None)   # a sampler without energy metering
-                                meter.step(read() if callable(read) else None, now, serving, busy)
-                            except Exception:  # noqa: BLE001
-                                meter.pause()
-                                log.debug("GPU energy step failed", exc_info=True)
-                        if self._served_acc >= USAGE_FLUSH_S:
-                            self._flush_served(usage)
-                            usage.flush()
-                            usage_retry = now
-                    self.post(self._apply_metrics, epoch, sample)
-                else:
-                    served_last = None
-                    if self._energy is not None:
-                        self._energy.pause()
-                    usage = self.usage
-                    mono = time.monotonic()
-                    if usage is not None and (self._served_acc > 0 or usage.dirty) \
-                            and mono - usage_retry >= USAGE_RETRY_S:
-                        usage_retry = mono
-                        self._flush_served(usage)
-                        usage.flush()
-            except Exception:  # noqa: BLE001
-                log.debug("metrics poll failed", exc_info=True)
-            self._stop_evt.wait(LIVE_POLL_S)
-
-    def _flush_served(self, usage: Any) -> None:
-        """Move the serving seconds collected so far into the usage history (metrics worker; destroy())."""
-        acc, self._served_acc = self._served_acc, 0.0
-        if acc > 0:
-            usage.add_served(self._served_model or self.model_id, acc, now=time.time())
-        if self._energy is not None:
-            wh, busy_wh = self._energy.take()
-            if wh > 0:
-                usage.add_energy(self._served_model or self.model_id, wh, busy_wh, now=time.time())
 
     def _apply_metrics(self, epoch: int, sample: MetricsSample | None) -> None:
         if epoch != self._metrics_epoch or self.state_name not in (ACTIVE, STOPPING):
@@ -3470,7 +3280,7 @@ class AgentStartApp(ctk.CTk):
         self.watch.stop()
         if self.usage is not None:               # the metrics worker is a daemon: it may not get another turn
             try:
-                self._flush_served(self.usage)
+                self.metrics_worker.flush_served(self.usage)
                 self.usage.flush()
             except Exception:  # noqa: BLE001
                 log.debug("usage history flush failed", exc_info=True)

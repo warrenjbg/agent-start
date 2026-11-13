@@ -33,6 +33,7 @@ import tkinter.messagebox as tk_messagebox  # noqa: E402
 import customtkinter as ctk  # noqa: E402
 
 import main  # noqa: E402  (must import without detector.py / server_manager.py)
+import metrics_worker  # noqa: E402
 import config_store  # noqa: E402
 import settings_dialog  # noqa: E402
 import theme as T  # noqa: E402
@@ -1055,8 +1056,8 @@ def test_strata_estimate(app, det, ep) -> None:
 def test_model_state(app, det, ep) -> None:
     """Strata's "Model state" on the status line: Reading (blue, prompt bar), Generating (green), Queued, back to Serving."""
     fetch = app._fetch_metrics
-    old_poll = main.LIVE_POLL_S
-    main.LIVE_POLL_S = 0.2
+    old_poll = metrics_worker.LIVE_POLL_S
+    metrics_worker.LIVE_POLL_S = 0.2
     try:
         if app.expanded:
             app.chevron.invoke()
@@ -1113,7 +1114,7 @@ def test_model_state(app, det, ep) -> None:
               and app.metrics.activity() is None, "Strata gone: activity and bar cleared")
         fetch.live = "idle"
     finally:
-        main.LIVE_POLL_S = old_poll
+        metrics_worker.LIVE_POLL_S = old_poll
 
 
 def test_pins(app, det, ep) -> None:
@@ -1251,6 +1252,55 @@ def test_reopen_flow(app, det, ep) -> None:
         main.NOTE_HOLD_S, main.REOPEN_STAGGER_S = old_hold, old_stagger
 
 
+def test_metrics_wiring(app, det, ep) -> None:
+    """The metrics worker (metrics_worker.py) reads the app through its host. Each host callable returns the app
+    attribute it stands for, looked up when it is called (tests swap these after building the app), and the two
+    results reach the app's own Tk-thread methods through app.post. The app is idle throughout (the worker thread
+    then reads only the state, the energy meter and the usage history) and nothing is pumped while a value is
+    swapped."""
+    ep.status_value = dict(IDLE_STATUS)
+    app._set_state("IDLE")
+    pump(app, 0.3)
+    w = app.metrics_worker
+    h = w.host
+    check(isinstance(w, metrics_worker.MetricsWorker) and isinstance(h, metrics_worker.MetricsHost),
+          "the app has its metrics worker")
+    th = [t for t in threading.enumerate() if t.name == "hc-metrics" and getattr(t, "_target", None) == w.loop]
+    check(len(th) == 1 and th[0].daemon and th[0].is_alive(),
+          f"the worker's loop runs on the app's hc-metrics daemon thread ({th})")
+    check(h.stop_evt() is app._stop_evt and h.engine() is app.engine and h.endpoint() is app.endpoint is ep
+          and h.vram() is app.vram and h.usage() is app.usage and h.energy() is app._energy and h.cfg() is app.cfg,
+          "wired to the app's stop event, engine, endpoint, VRAM sampler, usage history, energy meter and config")
+    check(h.stats_ms() == main.STATS_MS, "the catch-up gap is the app's stats period")
+    keep = (app.state_name, app._metrics_epoch, app.loaded, app.model_id, app._fetch_metrics, app._fetch_status)
+    real_post = app.post
+    posted: list = []
+    marker = 987654321
+    fm, fs = (lambda r, **kw: None), (lambda r: None)
+    try:
+        app.state_name, app._metrics_epoch, app.loaded, app.model_id = "ERROR", marker, "X-LOADED", "X-MODEL"
+        app._fetch_metrics, app._fetch_status = fm, fs
+        got = (h.state(), h.metrics_epoch(), h.loaded(), h.model_id(), h.fetch_metrics(), h.fetch_status())
+        app.post = lambda fn, *a: posted.append((fn, a)) if a[:1] == (marker,) else real_post(fn, *a)  # type: ignore[method-assign]
+        app._apply_metrics = "APPLY"  # type: ignore[method-assign, assignment]
+        app._set_gpu_fit_live = "FIT"  # type: ignore[method-assign, assignment]
+        h.apply_metrics(marker, "SAMPLE")
+        h.set_gpu_fit_live(marker, True, False)
+    finally:
+        vars(app).pop("_apply_metrics", None)
+        vars(app).pop("_set_gpu_fit_live", None)
+        vars(app).pop("post", None)
+        app.state_name, app._metrics_epoch, app.loaded, app.model_id, app._fetch_metrics, app._fetch_status = keep
+    check(got[:4] == ("ERROR", marker, "X-LOADED", "X-MODEL"),
+          f"wired to the app's state, metrics epoch, loaded flag and model, read when called ({got[:4]})")
+    check(got[4] is fm and got[5] is fs, "wired to the app's two fetcher seams, read when called")
+    check(posted == [("APPLY", (marker, "SAMPLE")), ("FIT", (marker, True, False))],
+          f"a sample goes to the app's _apply_metrics and a fit verdict to its _set_gpu_fit_live, through app.post "
+          f"({posted})")
+    check(not {"post", "_apply_metrics", "_set_gpu_fit_live"} & set(vars(app)) and h.state() == app.state_name == "IDLE"
+          and h.metrics_epoch() == keep[1] and h.fetch_metrics() is keep[4], "everything swapped is back")
+
+
 def load_state_file() -> dict:
     try:
         return json.loads((HOME / "state.json").read_text(encoding="utf-8"))
@@ -1316,7 +1366,7 @@ def test_stats_section(app, det, ep) -> None:
     scale = ctk.ScalingTracker.get_window_scaling(app)
     ep.status_value = dict(IDLE_STATUS)
     app._set_state("IDLE")
-    pump(app, main.LIVE_POLL_S + 0.3)        # earlier tests served: let a poll already in flight land
+    pump(app, metrics_worker.LIVE_POLL_S + 0.3)        # earlier tests served: let a poll already in flight land
     fetch.calls.clear()
     fetch.all_calls = 0
     check(not app.expanded and not app.stats.winfo_ismapped(), "starts collapsed (no state.json)")
@@ -1788,7 +1838,7 @@ def run() -> int:
                              (test_stats_section, (app, det, ep)), (test_notes_and_stale_status, (app, det, ep)),
                              (test_low_ram, (app, det, ep)), (test_review_fixes, (app, det, ep)),
                              (test_model_state, (app, det, ep)), (test_pins, (app, det, ep)),
-                             (test_reopen_flow, (app, det, ep))):
+                             (test_reopen_flow, (app, det, ep)), (test_metrics_wiring, (app, det, ep))):
                 print(f"-- {fn.__name__}")
                 try:
                     fn(*args)

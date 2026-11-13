@@ -20,6 +20,7 @@ import ui_helpers as H  # noqa: E402
 import config_store  # noqa: E402
 import engines  # noqa: E402
 import main  # noqa: E402
+import metrics_worker  # noqa: E402
 from busy_dialog import BusyDialog  # noqa: E402
 from game_watch import GameStart  # noqa: E402
 from mem_watch import MemReport  # noqa: E402
@@ -504,7 +505,7 @@ def test_usage() -> None:
         want_prompt = sum(metrics_store._prompt_read(r) or 0 for r in fm.requests)   # tokens actually read
         check(pump_until(app, lambda: u.totals().total.requests == base.requests + 5, 4),
               f"5 finished requests recorded ({u.totals().total.requests - base.requests})")
-        pump(app, 6 * main.LIVE_POLL_S + 0.5)        # the same requests come back in every poll
+        pump(app, 6 * metrics_worker.LIVE_POLL_S + 0.5)        # the same requests come back in every poll
         tot = u.totals().total
         check(tot.requests == base.requests + 5, f"repeated polls count them once ({tot.requests - base.requests})")
         check(tot.prompt_tokens == base.prompt_tokens + want_prompt,
@@ -698,7 +699,7 @@ def test_v110_review() -> None:
         # 4. serving time collected but not yet saved is added when the app closes
         u = app.usage
         before = u.totals().total.served_s
-        app._served_acc, app._served_model = 42.0, "model-x"
+        app.metrics_worker.served_acc, app.metrics_worker.served_model = 42.0, "model-x"
     finally:
         close(app)
     check(abs(u.totals().total.served_s - before - 42.0) < 1e-6, "the unsaved serving time is added on exit")
@@ -816,8 +817,8 @@ def _engine_picker_checks() -> None:
 def run() -> int:
     global DIALOGS
     main.TOGGLE_DEBOUNCE_S = 0.0
-    old = (main.LIVE_POLL_S, main.IDLE_GRACE_S)
-    main.LIVE_POLL_S, main.IDLE_GRACE_S = 0.2, 0.8
+    old = (metrics_worker.LIVE_POLL_S, main.IDLE_GRACE_S)
+    metrics_worker.LIVE_POLL_S, main.IDLE_GRACE_S = 0.2, 0.8
     DIALOGS = U.Dialogs()
     DIALOGS.install()
     real_toast = main._toast_worker
@@ -834,7 +835,7 @@ def run() -> int:
     finally:
         DIALOGS.restore()
         main._toast_worker = real_toast
-        main.LIVE_POLL_S, main.IDLE_GRACE_S = old
+        metrics_worker.LIVE_POLL_S, main.IDLE_GRACE_S = old
     print(f"\n{PASSES} checks passed, {len(FAILS)} failed")
     return 1 if FAILS else 0
 

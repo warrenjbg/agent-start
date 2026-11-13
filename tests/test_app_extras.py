@@ -18,6 +18,7 @@ import test_ui_smoke as U  # noqa: E402  (first: redirects the data dir, fakes r
 import config_store  # noqa: E402
 import launcher_bat  # noqa: E402
 import main  # noqa: E402
+import metrics_worker  # noqa: E402
 import reopen  # noqa: E402
 import strata_finder  # noqa: E402
 import updater  # noqa: E402
@@ -1247,8 +1248,8 @@ def test_engine_without_launcher_files(tmp: Path) -> None:
 def run() -> int:
     import tempfile
     main.TOGGLE_DEBOUNCE_S = 0.0
-    old = (main.LIVE_POLL_S, main.IDLE_GRACE_S)
-    main.LIVE_POLL_S, main.IDLE_GRACE_S = 0.2, 0.8
+    old = (metrics_worker.LIVE_POLL_S, main.IDLE_GRACE_S)
+    metrics_worker.LIVE_POLL_S, main.IDLE_GRACE_S = 0.2, 0.8
     dialogs = U.Dialogs()
     dialogs.install()
     main._toast_worker = _fake_toast             # never show real Windows toasts from the tests
@@ -1268,7 +1269,7 @@ def run() -> int:
                 print(f"FAIL: {FAILS[-1]}")
     finally:
         dialogs.restore()
-        main.LIVE_POLL_S, main.IDLE_GRACE_S = old
+        metrics_worker.LIVE_POLL_S, main.IDLE_GRACE_S = old
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{PASSES} checks passed, {len(FAILS)} failed")
