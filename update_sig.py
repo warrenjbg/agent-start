@@ -31,9 +31,17 @@ from dataclasses import dataclass
 log = logging.getLogger("agent_start")
 
 # Trusted Ed25519 release keys (32 raw bytes each): the primary key first, then the offline backup.
-# Empty until the owner generates the keys. To fill it, run `python tools/sign_release.py --show-key KEY.pub`
-# for each public key and paste the printed lines between the parentheses. Never put a private key here.
-PUBLIC_KEYS: tuple[bytes, ...] = ()
+# These are PUBLIC keys. To change the list, run `python tools/sign_release.py --show-key KEY.pub` for each
+# public key and paste the printed lines between the parentheses. Never put a private key here.
+# An empty tuple means "no keys": the updater then checks an update by SHA-256 only (see updater._check).
+PUBLIC_KEYS: tuple[bytes, ...] = (
+    # primary - SHA256:arDzY/jLSjal3Rrmn6wnZqTJQKPMpDKxpJxkN3uNvaY
+    b"\x78\xee\x51\x90\xa9\x8a\x30\x3b\x26\xa5\xad\x7e\x98\x45\x3e\xa8"
+    b"\x3c\x0d\x2a\xc1\x77\x88\x65\xea\xe9\xcd\x37\x7d\x77\xf7\xc6\xd2",
+    # backup - SHA256:WwJ+SKbTBfL2mqtfK56E5rg2nICBmXBHaJyxQ45+11g
+    b"\x9b\x9a\x55\x27\xe4\x1f\xfc\x32\x42\x56\xb8\xef\x02\x33\x90\xc3"
+    b"\x47\x73\x96\x62\x2b\xa6\xd4\xee\x13\x31\xb9\x02\x3f\xe3\x77\xe9",
+)
 
 NAMESPACE = "agent-start-release"
 MAX_SIG_BYTES = 4096

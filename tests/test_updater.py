@@ -1208,9 +1208,15 @@ def test_real_github():
 
 
 def main() -> int:
+    import update_sig
+    shipped = update_sig.PUBLIC_KEYS
+    check("the shipped release keys: a tuple of valid 32-byte keys (none, or primary + backup)",
+          isinstance(shipped, tuple) and len(shipped) in (0, 2) and len(set(shipped)) == len(shipped)
+          and all(update_sig.enabled((k,)) for k in shipped), repr(len(shipped)))
     srv, base = start_server()
     saved_base = updater._DOWNLOAD_BASE
     updater._DOWNLOAD_BASE = base
+    update_sig.PUBLIC_KEYS = ()                  # everything below except test_signature: a build without keys
     try:
         for fn in (test_versions, test_due, test_url_ok, lambda: test_check(base), lambda: test_download(base),
                    lambda: test_signature(base), test_cleanup, test_default_dir, test_launch, test_real_inno):
@@ -1227,6 +1233,7 @@ def main() -> int:
             traceback.print_exc()
             check("test_real_github raised", False, "exception")
     finally:
+        update_sig.PUBLIC_KEYS = shipped
         updater._DOWNLOAD_BASE = saved_base
         updater._ALLOW_LOCAL_HTTP_FOR_TESTS = False
         srv.shutdown()
