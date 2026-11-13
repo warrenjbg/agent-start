@@ -175,7 +175,12 @@ the endpoint. Everything on Behaviour and About applies at once.
   nothing is sent anywhere. History starts with the first request after 1.10 is installed, and days older than 400
   days are dropped. The average speed is weighted by tokens and leaves out very short answers. Prompt tokens are
   the tokens Strata actually read: the part of a prompt it still had cached (an agent re-sends its whole context
-  every turn) is not counted again.
+  every turn) is not counted again. On an NVIDIA card it also shows **GPU energy**: watt-hours per day and model
+  (*GPU Wh*) and generated tokens per watt-hour (*tok/Wh*). The energy is that of the whole graphics card while
+  the engine was serving, so other apps using the card are included; *tok/Wh* counts only the energy used while a
+  reply was running. It is read from the card's own energy counter (from power readings when the card has none)
+  and only between two checks at most 5 seconds apart, so time the PC was asleep is never counted. Days from
+  before 1.13 show a dash. Not yet compared with a real serving run.
 - **Switches** (apply at once): *Reopen closed apps after Turn off* (same as the start dialog's checkbox; off = the
   closed apps are offered as one click instead), *Keep running in the tray*, *Start with Windows*, *Keep Hermes'
   "llama" alias in step* (llama.cpp only), *When a game starts*, *When memory runs low*, *When that app closes*,
@@ -205,13 +210,32 @@ To use llama.cpp:
    **Choose model**: it lists the models, and picking one finishes the set-up. After that the ⇄ button next to
    the gear switches between the found models (only the model in the arguments changes; a running model is
    turned off first, the same way as a Strata model switch).
-3. Settings (Model tab) shows **Build**, **Model**, **Context length**, **Vision** and **Port**. On an NVIDIA
-   card the CUDA build comes first. Each control rewrites one option in the arguments and keeps the rest:
+3. Settings (Model tab) shows **Build**, **Model**, **Download a model…**, **Context length**, **Vision** and
+   **Port**. On an NVIDIA card the CUDA build comes first. Each control rewrites one option in the arguments and
+   keeps the rest:
+   - *Model*: each model keeps its own arguments. Picking another model puts the current model's arguments away
+     and brings back the ones the other model had; a model picked for the first time starts from the current
+     arguments without the context size, the vision file and `--alias`. The options that belong to the server
+     rather than the model (`--port`, `--host`, `--api-key`, `--api-key-file`, `--ssl-key-file`,
+     `--ssl-cert-file`) stay the same for every model. When a model is picked and its arguments have no `--alias`,
+     `--alias <file name without .gguf>` is added: without one llama-server reports the model under its full file
+     path. The arguments are kept in `config.json` under `llama_models`; a `config.json` from 1.12 loads unchanged.
+   - *Download a model…*: see [Downloading a model](#downloading-a-model-llamacpp) below.
    - *Context length*: Auto (the model's own), 8K to 128K; a value typed by hand shows as custom. While nothing is
      serving, a note under it says whether that choice fully fits the GPU (the same check as at Turn on).
+     **Largest that fits the GPU** asks llama.cpp's own `llama-fit-params.exe` for the largest context that keeps
+     the whole model on the card (one run to find it, one to confirm; a second or two each) and writes it as
+     `-c N`. The answer depends on how much video memory other apps hold at that moment, and the line under the
+     row says how much that was. It is only offered while the engine is off. The entry is greyed out, with the
+     reason in its text, when the tool is missing, there is no NVIDIA card, or the arguments make the check
+     meaningless (`-ngl`, `--fit off` and the like).
    - *Vision*: Off, or a vision file (`mmproj-*.gguf`) found in the model's folder. Not yet tried with a real
      model start.
-   - *Port*: the `--port` value.
+   - *Port*: *Own port · 9931*, or *Same as Strata · 8080* (the port Strata is set up with), which lets clients
+     that point at Strata's address reach llama.cpp without a change. Only one engine runs at a time, so the two
+     never share the port at the same moment; if the other engine's server is found on it, Turn on refuses and
+     nothing is stopped. A port typed by hand shows as *Port N (in the arguments)*. Not yet tried with a real
+     model start on Strata's port.
 
    The program box and the arguments box are under **Advanced · program and arguments**, which opens by itself
    when the arguments cannot be shown by the controls. You can *Browse…* for `llama-server.exe` and type the
@@ -257,6 +281,28 @@ runs partly on the CPU and is much slower.
 
 The four limits are `fit_watch_*` in `config.json`. They were set from a few runs of one 27B model on one 16 GB
 card, so treat them as a starting point. Strata is not checked: it manages its own memory plan.
+
+### Downloading a model (llama.cpp)
+
+Settings → Model → **Download a model…** closes Settings and opens a window on the main window; the app stays
+usable while it is open. Paste a Hugging Face repository (`owner/name` or a `huggingface.co` link) and press
+*List files*: the `.gguf` files are listed with their sizes. Pick one and press *Download*.
+
+- The file goes beside the model in use, or to `Downloads\llama-models` when there is none (*Change…* picks
+  another folder on a local drive). When it has arrived and been checked, the app looks for models again, so the
+  Model list and the ⇄ button show it. Nothing is started.
+- The window shows progress, speed and time left. *Cancel download* (or closing the window) stops it and keeps the
+  partial file; *Resume* continues it later, after hashing what is already there; *Discard partial download*
+  deletes it. One download at a time.
+- Checks: the first request goes only to `huggingface.co`, later ones only to it or a `*.hf.co` download host, over
+  HTTPS; the download is pinned to the listed commit; free space (the rest of the file plus 1 GB) is checked first;
+  the bytes are hashed while they arrive, and the file only gets its final name when size and SHA-256 match the
+  listing. An existing file is never overwritten. The app only resumes or deletes a `NAME.part` it marked as its
+  own (a small `NAME.part.json` beside it); another program's unfinished `NAME.part` is left alone and the
+  download refused. Nothing that was downloaded is opened or run.
+- Not supported: gated or private repositories (they need a Hugging Face login), and models split over several
+  files (listed greyed out). Vision files (`mmproj-*.gguf`) are listed and can be downloaded like a model.
+- Tested against local stand-in servers only; a download from the real Hugging Face has not been run yet.
 
 **Switching back and forth:** each engine keeps its own launch settings (program or launcher, port, model) in
 `config.json` under `engine_profiles`, so switching back restores them. A `config.json` from 1.11.0 that still
@@ -364,6 +410,7 @@ started*, then *Reopened 3 apps*.
 | `fit_watch_vram_pct`, `fit_watch_cpu_pct`, `fit_watch_sustain_s`, `fit_watch_clear_s` | llama.cpp only, the live GPU-fit check: video memory at least this full (90) and the server at least this share of all CPU cores (25) for this many seconds of generating (8) shows the warning; this many seconds without it (20) clears it |
 | `engine_profiles` | Written by the app: the launch settings of the engine that is not in use (`launch_cmd`, `launch_cwd`, `launcher_bat`, `strata_dir`, `model_name`, `endpoint_url`, `port`, `api_key`), restored when you switch back |
 | `strata_tuning` | Written by Settings: your Context length / Vision choice per Strata run config. Remove it and Strata gets its own file |
+| `llama_models` | Written by Settings (llama.cpp): each model's own arguments, by model file. Remove it and every model starts from the current arguments again |
 | `api_key` | llama.cpp only: the first `--api-key` from the arguments, saved by Settings; sent as a Bearer header only after the port identified itself as llama-server |
 | `mem_watch_app_mb`, `mem_watch_sustain_s` | Memory-pressure check: an app's memory that counts as large (4096), and how long both conditions must hold (15) |
 | `mem_watch_evict_pct`, `mem_watch_evict_sustain_s`, `mem_watch_evict_app_mb` | Pushed-out check: Strata's memory in RAM below this share of its peak (50) for this long (6), and the smallest new app that is named as the cause, in MB (512) |
@@ -371,7 +418,9 @@ started*, then *Reopened 3 apps*.
 | `resume_confirm_s`, `resume_expire_s` | When that app closes: how long the game or app must be gone before it counts as closed (10), and when the watch gives up (21600), in seconds |
 
 To serve another Strata model, pick its `run-*.bat` in ⚙ Settings — no hand-editing needed. `state.json` (next to
-`config.json`) remembers the last cold-load time and whether the stats section is open.
+`config.json`) remembers the last cold-load time, whether the stats section is open and the Behaviour switches
+(among them `idle_off_min`: 0, 15, 30, 60 or 120, anything else means off; and `hermes_alias`: on only when
+`true`).
 
 ## Known limitations
 
@@ -388,6 +437,9 @@ To serve another Strata model, pick its `run-*.bat` in ⚙ Settings — no hand-
   graphs show "Metrics unavailable". VRAM is the whole card (all apps), NVIDIA only.
 - **Only run-\*.bat launchers that call `python … serve\server.py` directly** are understood; a `.bat` that
   delegates to another script is rejected.
+- **Added in 1.13 and not yet run for real:** a model download from Hugging Face, the Hermes alias update
+  (`hermes config set`), llama.cpp on Strata's port, an idle turn-off of a real engine, and GPU energy against a
+  real serving run. Each is covered by tests with stand-ins.
 - Windows only.
 
 ## Tests
@@ -406,6 +458,11 @@ whether CI runs it, `--ci` runs the headless suites with the same switches as CI
 
 Lint and type check (dev tools: `pip install -r requirements-dev.txt`; config in `pyproject.toml`):
 `.venv\Scripts\python.exe -m ruff check .` and `.venv\Scripts\python.exe -m mypy`.
+
+The window suites (*Local* below) open real windows and take the keyboard focus. `tools\run_hidden.py` runs them
+on a separate, hidden Windows desktop instead, so nothing is shown and nothing takes the focus:
+`.venv\Scripts\python.exe tools\run_hidden.py` (all of them) or with suite names. Their pictures are then made
+with PrintWindow and saved as `tests\ui_hidden_*.png`.
 
 **CI** (`.github/workflows/ci.yml`, Windows runner, Python 3.11 and 3.14): ruff, mypy, then the suites marked *CI*
 below. *Advisory* suites run too, but a failure there does not fail the build (no GPU, timing limits, no guaranteed
@@ -431,6 +488,15 @@ notification area on a runner). *Local* suites open the real window and take scr
 | `tests\test_resume_watch.py` | CI | When that app closes: is the game/app still running (fake process lists), the confirm window, gaps and expiry, the watcher with a fake clock and on its own thread, one read-only real snapshot (starts no process) |
 | `tests\test_update_sig.py` | CI | Update signatures: Ed25519 against the RFC 8032 vectors, the OpenSSH signature format, the signed manifest, replay and downgrade refusals, signatures made at test time with a throwaway key when `ssh-keygen` exists |
 | `tests\test_idle_watch.py` | CI | Idle auto-off: the idle clock (activity, unknown polls, sleep gaps, short replies) and the app's glue on a stand-in object: when it turns off, everything that makes it wait, the busy answer |
+| `tests\test_llama_models.py` | CI | Per-model arguments for llama.cpp: what is kept per model and what is shared, a first-time model, the short `--alias`, an old config loading unchanged |
+| `tests\test_hf_download.py` | CI | The Hugging Face module against local stand-in servers: listing, allowed hosts and redirects, size and SHA-256, resume, free space, never overwriting, only touching its own partial files |
+| `tests\test_download_flow.py` | CI | The download window's logic without a window: listing, selection, progress, cancel, resume, discard, every error sentence |
+| `tests\test_download_dialog.py` | Local | The download window itself (opens windows), with a stand-in for the Hugging Face module |
+| `tests\test_hermes_alias.py` | CI | The Hermes alias module with a stand-in for `hermes.exe` (no process is started): the one-argument write, the read-back, reading first, leaving an entry with other keys alone |
+| `tests\test_alias_wiring.py` | CI | The app's side of the Hermes alias on a stand-in object: when an update starts, everything that keeps it from starting, one attempt per model and port |
+| `tests\test_settings_tabs.py` | Local | The Settings tabs for both engines (opens windows): rows per tab, per-model arguments, Largest that fits the GPU, the Port choice, the download link, the alias switch |
+| `tests\test_strata_tuning.py` | CI | Strata's Context length / Vision choice: the app-owned copy of the run config, on made-up Strata folders |
+| `tests\test_strata_tune_ui.py` | Local | Those two rows in the Settings window (opens one window) |
 | `tests\test_kill_path.py` | CI | What a stop may kill and when it refuses, on fake processes: kill targets, the launcher cmd.exe, identity, foreign listeners, busy, force |
 | `tests\test_engines.py` | CI | The engine interface: registry and `backend`, the Strata engine's answers, and a fake llama-server-shaped engine driving the supervisor (no unload, no launcher; an engine cannot widen a kill; API key never sent with the identity probe) |
 | `tests\test_fit_check.py` | CI | The pre-check runner: only `llama-fit-params.exe` next to the engine program is ever run, windowless, time-limited |
@@ -466,6 +532,7 @@ Environment switches:
 |---|---|
 | `AGENTSTART_TEST_OFFLINE=1` | `test_updater` skips its one read-only request to api.github.com (set in CI) |
 | `AGENTSTART_TEST_NO_INNO=1` | `test_updater` skips compiling and running its throwaway Inno Setup installer (set in CI) |
+| `AGENTSTART_TEST_HIDDEN=1` | Set by `tools\run_hidden.py`: window suites make their pictures with PrintWindow instead of a screen grab |
 | `STRATA_DIR=<your Strata folder>` | Optional: `test_launcher_bat`, `test_strata_finder` and `test_engine_log` also check your real install (read only). Unset in CI |
 
 Design and contracts: `SPEC.md` (v1 and the advisor review history in `docs\`).
