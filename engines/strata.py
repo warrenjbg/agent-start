@@ -408,9 +408,11 @@ class StrataEngine(Engine):
         except (OSError, ValueError) as exc:
             raise LaunchError(f"Could not prepare Strata's config with your context / vision choice: {exc}") from exc
         cmd = list(plan.cmd)
-        for i, a in enumerate(cmd[:-1]):
-            if str(a) == "--config":
+        for i, a in enumerate(cmd):
+            if str(a) == "--config" and i + 1 < len(cmd):
                 cmd[i + 1] = copy_file
+            elif str(a).startswith("--config="):          # the form launcher_bat keeps when the .bat used it
+                cmd[i] = f"--config={copy_file}"
         return LaunchPlan(cmd=cmd, cwd=plan.cwd, env=dict(plan.env))
 
     def load_progress(self, log_text: str, elapsed_s: float, expected_s: float | None) -> tuple[str, float, str | None]:
@@ -421,9 +423,11 @@ class StrataEngine(Engine):
     def config_path(cfg: Mapping[str, Any]) -> str | None:
         """The Strata config JSON from launch_cmd's --config (its "log" field names the engine log)."""
         cmd = list(cfg.get("launch_cmd") or [])
-        for i, a in enumerate(cmd[:-1]):
-            if str(a) == "--config":
+        for i, a in enumerate(cmd):
+            if str(a) == "--config" and i + 1 < len(cmd):
                 return str(cmd[i + 1])
+            if str(a).startswith("--config=") and len(str(a)) > len("--config="):
+                return str(a)[len("--config="):]
         return None
 
     def load_report(self, cfg: Mapping[str, Any], since: float | None = None) -> LoadReport | None:

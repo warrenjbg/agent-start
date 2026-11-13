@@ -326,6 +326,12 @@ def test_reopen_orchestration() -> None:
         check("stop_evt between launches: only first launched", [n for n, _ in launches] == ["a"], str(launches))
         check("rest reported cancelled", [r["status"] for r in res] == ["started", "cancelled", "cancelled", "cancelled"],
               str(res))
+        auto_recs = reopen.classify(recs)[0]
+        check("not_started(): exactly the records the interrupted run never reached, in order",
+              [r.name for r in reopen.not_started(auto_recs, res)] == ["b", "c", "d"],
+              str(reopen.not_started(auto_recs, res)))
+        check("not_started(): a finished run leaves nothing",
+              reopen.not_started(auto_recs, [{"status": s} for s in ("started", "already_running", "failed", "started")]) == [])
 
         launches.clear()
         running.clear()

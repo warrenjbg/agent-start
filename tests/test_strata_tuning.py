@@ -168,6 +168,18 @@ def t_engine() -> None:
     check(made["args"][made["args"].index("--max-context") + 1] == "131072" and "--vision" in made["args"]
           and sha(cfgp) == h, "the copy has the chosen context; Strata's file is untouched")
     check(ENG.config_path(cfg) == str(cfgp), "the engine log is still found through Strata's own file")
+    # a launcher written as --config=<path> (launcher_bat keeps that form): same file, same swap
+    eq = dict(cfg)
+    lc = list(cfg["launch_cmd"])
+    j = lc.index("--config")
+    eq["launch_cmd"] = lc[:j] + [f"--config={cfgp}"] + lc[j + 2:]
+    check(ENG.config_path(eq) == str(cfgp), "--config=<path>: the run config is found")
+    p_eq = LaunchPlan(cmd=plan.cmd[:i] + [f"--config={cfgp}"] + plan.cmd[i + 2:], cwd=plan.cwd, env=dict(plan.env))
+    n_eq = ENG.before_launch(eq, p_eq)
+    check(n_eq.cmd[i] == f"--config={copy_file}" and n_eq.cmd[:i] == p_eq.cmd[:i] and n_eq.cmd[i + 1:] == p_eq.cmd[i + 1:],
+          f"--config=<path>: before_launch swaps only that value ({n_eq.cmd[i]})")
+    check(ENG.config_path({"launch_cmd": ["python", "s.py", "--config"]}) is None
+          and ENG.config_path({"launch_cmd": ["python", "s.py", "--config="]}) is None, "--config without a value: none")
     # vision off, then back to the file's values
     ENG.apply_launcher(cfg, ENG.with_controls(info, 131072, False))
     new = ENG.before_launch(cfg, ENG.plan_launch(cfg))

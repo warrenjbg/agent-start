@@ -23,6 +23,9 @@ def check(cond, msg: str) -> None:
 
 
 def main() -> int:
+    ps = toasts._powershell()
+    check(os.path.isabs(ps) and os.path.isfile(ps) and os.path.basename(ps).lower() == "powershell.exe"
+          and "system32" in ps.lower(), f"PowerShell is started by its full System32 path ({ps})")
     hostile = [
         "$(7*6) PROBE $env:USERNAME",
         "Cash$Grab `whoami` \"@ quotes \"",

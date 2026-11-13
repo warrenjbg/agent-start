@@ -59,6 +59,14 @@ def build_xml(title: str, msg: str, icon: str = "", buttons: list[tuple[str, str
             + "</binding></visual>" + (f"<actions>{acts}</actions>" if acts else "") + "</toast>")
 
 
+def _powershell() -> str:
+    """Windows PowerShell by its full path. A bare "powershell.exe" is looked up in the application folder and
+    the current directory before System32, so a file of that name planted there would run on every toast."""
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    full = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    return full if os.path.isfile(full) else "powershell.exe"
+
+
 def _env(xml: str, app_id: str) -> dict:
     env = dict(os.environ)
     env[ENV_XML] = xml
@@ -71,7 +79,7 @@ def show(title: str, msg: str, app_id: str, icon: str = "", buttons: list[tuple[
     """Start the toast; True if powershell.exe was started. Never raises."""
     try:
         xml = build_xml(title, msg, icon, buttons, launch)
-        subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        subprocess.Popen([_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                           "-Command", SCRIPT], env=_env(xml, app_id), stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), close_fds=True)
@@ -84,7 +92,7 @@ def show(title: str, msg: str, app_id: str, icon: str = "", buttons: list[tuple[
 def echo(title: str, msg: str, buttons: list[tuple[str, str]] | None = None, timeout: float = 30.0) -> list[str]:
     """Tests: what PowerShell reads back from the XML (texts, then 'label|url' per button). Shows nothing."""
     xml = build_xml(title, msg, "", buttons)
-    r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+    r = subprocess.run([_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                         "-Command", ECHO_SCRIPT], env=_env(xml, "test"), capture_output=True, timeout=timeout,
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return r.stdout.decode("utf-8", "replace").replace("\r", "").rstrip("\n").split("\n")

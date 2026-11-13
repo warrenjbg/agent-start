@@ -34,7 +34,7 @@ import subprocess
 import threading
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import psutil
 
@@ -347,6 +347,12 @@ def reopen_one(rec: LaunchRecord | dict) -> dict[str, Any]:
         return {"name": rec.name, "ok": True, "reason": "already running", "status": "already_running"}
     ok, msg = launch(rec)
     return {"name": rec.name, "ok": ok, "reason": msg, "status": "started" if ok else "failed"}
+
+
+def not_started(auto: Iterable[LaunchRecord], results: Iterable[Mapping[str, Any]]) -> list[LaunchRecord]:
+    """The auto records an interrupted reopen() never got to: results (one per auto record, same order) with
+    status 'cancelled'. The caller keeps them pending, so they are offered again instead of being forgotten."""
+    return [rec for rec, res in zip(auto, results) if res.get("status") == "cancelled"]
 
 
 def reopen(records: Iterable[LaunchRecord | dict], stagger_s: float = 1.0,
