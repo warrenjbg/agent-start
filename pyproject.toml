@@ -36,7 +36,8 @@ ignore = [
 "tests/**" = ["E401", "E501", "E701", "E702", "E741", "B007", "B023"]
 # Lines over 120 characters in app modules (13 lines in total; count per file). E501 stays on for every other module.
 "busy_dialog.py" = ["E501"]      # 1
-"main.py" = ["E501"]             # 4
+"main.py" = ["E501"]             # 5
+"main_view.py" = ["E501"]        # 1
 "metrics_store.py" = ["E501"]    # 2
 "sweep_dialog.py" = ["E501"]     # 2
 "theme.py" = ["E501"]            # 1
@@ -78,6 +79,10 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "main"            # 20 errors across 7 codes (assignment 7, attr-defined 5, union-attr 3, index 2, ...)
 ignore_errors = true       # too many to list per code; main.py is the next file to tighten
+
+[[tool.mypy.overrides]]
+module = "main_view"       # the window's drawing code, moved verbatim out of main.AgentStartApp: inherits main's status
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = "detector"
