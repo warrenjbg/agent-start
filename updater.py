@@ -48,6 +48,10 @@ CHUNK = 64 * 1024
 MAX_API_BYTES = 2 * 1024 * 1024
 MAX_INSTALLER_BYTES = 500 * 1024 * 1024
 CHECK_DEADLINE_S = 60.0          # overall cap for one API check (connect + body), on top of per-op timeout
+# A socket wait can end a hair before the same span has passed on time.monotonic() (measured: 0.05 ms early). When
+# the download's deadline is the nearer limit the socket waits this much past it, so that the deadline check, not
+# the socket, ends the download and the message is 'timed out'.
+DEADLINE_SLACK_S = 0.05
 
 # Test hooks only. Never changed by the app.
 _ALLOW_LOCAL_HTTP_FOR_TESTS = False
@@ -465,7 +469,7 @@ def _stream(info, hosts, timeout, deadline, f, progress, stop_evt) -> tuple[int,
 
     req = urllib.request.Request(info.asset_url, headers=_headers(_current_version(), "application/octet-stream"))
     try:
-        resp = _opener(hosts).open(req, timeout=min(timeout, left()))
+        resp = _opener(hosts).open(req, timeout=min(timeout, left() + DEADLINE_SLACK_S))
     except UpdateError:
         raise
     except urllib.error.HTTPError as e:
@@ -486,7 +490,7 @@ def _stream(info, hosts, timeout, deadline, f, progress, stop_evt) -> tuple[int,
         while True:
             if stop_evt is not None and stop_evt.is_set():
                 raise UpdateError("cancelled")
-            _set_sock_timeout(resp, min(timeout, left()))
+            _set_sock_timeout(resp, min(timeout, left() + DEADLINE_SLACK_S))
             try:
                 chunk = _read_some(resp, CHUNK)
             except Exception as e:  # noqa: BLE001  socket timeout, IncompleteRead, reset...

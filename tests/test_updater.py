@@ -577,6 +577,53 @@ def test_download(base: str):
     check("stall: message is exactly 'timed out'", m == "timed out", m)
     check("stall: ended near the deadline (< 5 s, per-op timeout was 30 s)", dt < 5, f"{dt:.2f}s")
 
+    # A socket wait can end a hair BEFORE the same span has passed on time.monotonic(); the stall above then read
+    # 'download failed: TimeoutError' on some runs. So the wait handed to the socket outlasts the deadline a little
+    # and the deadline check decides. Clock held still here: exactly deadline_s is left at every step.
+    serve({"body": body})
+    opens: list = []
+    waits: list = []
+    real_set, real_opener, real_time = updater._set_sock_timeout, updater._opener, updater.time
+
+    class StillClock:
+        monotonic = staticmethod(lambda: 5000.0)
+
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+    def spy_opener(h):
+        op = real_opener(h)
+        real_open = op.open
+
+        def open_(req, timeout=None, **kw):
+            opens.append(timeout)
+            return real_open(req, timeout=timeout, **kw)
+
+        op.open = open_
+        return op
+
+    def spy_set(resp, t):
+        waits.append(t)
+        real_set(resp, t)
+
+    updater._set_sock_timeout, updater._opener, updater.time = spy_set, spy_opener, StillClock()
+    try:
+        ok, r = no_raise(updater.download, info, str(dest), allowed_hosts=hosts, timeout=30, deadline_s=7.0)
+        near_opens, near_waits = list(opens), list(waits)
+        (dest / NAME).unlink(missing_ok=True)
+        del opens[:], waits[:]
+        ok2, r2 = no_raise(updater.download, info, str(dest), allowed_hosts=hosts, timeout=2.0, deadline_s=7.0)
+        (dest / NAME).unlink(missing_ok=True)
+    finally:
+        updater._set_sock_timeout, updater._opener, updater.time = real_set, real_opener, real_time
+    check("deadline nearer than the per-read limit: the download still completes", ok and ok2, f"{r!r} {r2!r}")
+    check("...the connect wait outlasts the deadline a little (7.02 to 7.2 s for 7 s left)",
+          len(near_opens) == 1 and 7.02 <= near_opens[0] <= 7.2, repr(near_opens))
+    check("...and so does every read wait", len(near_waits) >= 2 and all(7.02 <= t <= 7.2 for t in near_waits),
+          repr(near_waits[:4]))
+    check("per-read limit nearer than the deadline: it is used as given (2.0 s), connect and reads",
+          opens == [2.0] and len(waits) >= 2 and all(t == 2.0 for t in waits), f"{opens!r} {waits[:4]!r}")
+
     # one download at a time
     serve({"body": slowbig, "chunk": 64 * 1024, "chunk_sleep": 0.01})
     stop_a = threading.Event()
