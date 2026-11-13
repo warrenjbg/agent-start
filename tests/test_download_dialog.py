@@ -263,7 +263,7 @@ def test_enter_and_bad_repo(root) -> Path | None:
         pump(root, 0.1)
         eq(dlg.message_text(), hf_download._DEFAULT_MSG["bad_repo"], "bad repo sentence")
         eq(dlg.message_kind(), "error", "shown as an error")
-        eq(dlg.list_placeholder(), dd.HINT_NONE, "the list says nothing was listed")
+        eq(dlg.list_placeholder(), hf_download._DEFAULT_MSG["bad_repo"], "the list shows the failed listing's reason")
         path = shot(dlg, "bad_repo")
         dlg.set_repo(REPO)
         eq(dlg.message_text(), "", "typing clears the error")
@@ -413,6 +413,13 @@ def test_errors(root) -> Path | None:
         hf.listings[REPO] = HfError("gated")
         listed(root, dlg)
         eq(dlg.message_text(), hf_download._DEFAULT_MSG["gated"], "gated repo sentence")
+        eq(dlg.list_placeholder(), hf_download._DEFAULT_MSG["gated"], "the list shows the reason too")
+        hf.listings[REPO] = HfError("no_gguf")
+        dlg.list_files()
+        pump(root, 0.05)
+        ph = dlg.list_placeholder()
+        check(ph.startswith(hf_download._DEFAULT_MSG["no_gguf"]) and dd.NO_GGUF_HINT in ph,
+              f"the empty repo list names the reason and the -GGUF repos: {ph!r}")
         hf.listings[REPO] = LISTING
         dlg.list_files()
         pump(root, 0.05)

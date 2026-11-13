@@ -67,6 +67,9 @@ NO_SPACE_UNKNOWN = "Could not check the free space on the models drive."
 HINT_ENTER = "Paste owner/name or a huggingface.co link, then press List files."
 HINT_LISTING = "Listing the files…"
 HINT_NONE = "No files listed."
+# Shown in the list area under the no-.gguf reason: the Hub keeps its quants in repos whose name ends in -GGUF,
+# and the bare reason leaves the user without a next step.
+NO_GGUF_HINT = "On Hugging Face, .gguf models live in repos whose name ends in -GGUF. Look for one of those."
 
 # HfError kind -> message colour (everything not named here is an error)
 _KIND_TONE = {"cancelled": "info", "timeout": "warn", "rate_limited": "warn", "busy": "warn", "exists": "warn"}
@@ -259,6 +262,7 @@ class DownloadFlow:
         self.rate_bps: float | None = None
         self.message = ""
         self.message_kind = "info"
+        self.list_hint = ""               # shown in the empty list area when a listing failed ('' = no reason)
         self.result_path: str | None = None
         self.closing = False               # close() was asked while a download ran: the window closes after it
         self.closed = False
@@ -537,11 +541,14 @@ class DownloadFlow:
             self.phase = "error"
             if unexpected or err is None:
                 self._say(UNEXPECTED_LIST, "error")
+                self.list_hint = UNEXPECTED_LIST
             else:
                 self._say(err.message, _KIND_TONE.get(err.kind, "error"))
+                self.list_hint = f"{err.message} {NO_GGUF_HINT}" if err.kind == "no_gguf" else err.message
             self._changed()
             return
         self.listing = listing
+        self.list_hint = ""
         self._listed_text = text
         self._pending = dict(pend)
         if dest == self.dest_dir:
@@ -933,8 +940,9 @@ class DownloadDialog(ctk.CTkToplevel):
                                             scrollbar_button_hover_color=T.RAISED_HOVER)
         self._list.grid(row=2, column=0, sticky="ew", padx=PAD, pady=(8, 0))
         self._list.grid_columnconfigure(0, weight=1)
-        self._placeholder = ctk.CTkLabel(self._list, text=HINT_ENTER, anchor="w", height=ROW_H, font=self._small,
-                                         text_color=T.TEXT_3)
+        self._placeholder = ctk.CTkLabel(self._list, text=HINT_ENTER, anchor="w", font=self._small,
+                                         text_color=T.TEXT_3, wraplength=WIDTH - 2 * PAD - 48)
+        # (no fixed height: a listing failure shows its reason in the list area, which wraps onto several lines)
         self._row_widgets: list[tuple[Row, ctk.CTkFrame, ctk.CTkLabel, list[Any]]] = []
         self._rows_drawn: tuple[Row, ...] | None = None
         self._hover_row: int | None = None
@@ -1174,8 +1182,7 @@ class DownloadDialog(ctk.CTkToplevel):
         f = self.flow
         self._rows_drawn = f.rows
         if not f.rows:
-            hint = {"listing": HINT_LISTING, "error": HINT_NONE}.get(f.phase, HINT_ENTER)
-            self._placeholder.configure(text=hint)
+            self._placeholder.configure(text=self._hint_for(f))
             self._placeholder.grid(row=0, column=0, sticky="ew", padx=10)
             return
         self._placeholder.grid_remove()
@@ -1280,7 +1287,13 @@ class DownloadDialog(ctk.CTkToplevel):
 
     @staticmethod
     def _hint_for(f: DownloadFlow) -> str:
-        return {"listing": HINT_LISTING, "error": HINT_NONE}.get(f.phase, HINT_ENTER)
+        """The line shown in the empty list: the phase's hint; for a failed listing the reason itself (the
+        no-.gguf reason carries the -GGUF-repo advice)."""
+        if f.phase == "listing":
+            return HINT_LISTING
+        if f.phase == "error":
+            return f.list_hint or HINT_NONE
+        return HINT_ENTER
 
     # ------------------------------------------------------------------ closing
     def close(self) -> None:
