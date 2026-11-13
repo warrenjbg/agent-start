@@ -231,10 +231,14 @@ def parse_sshsig(armored: str | bytes) -> SshSig:
     body = lines[1:-1]
     if not all(_B64_LINE_RE.fullmatch(ln) for ln in body):
         raise SigError("bad base64 line")
+    joined = "".join(body)
     try:
-        blob = base64.b64decode("".join(body), validate=True)
+        blob = base64.b64decode(joined, validate=True)
     except (binascii.Error, ValueError):
         raise SigError("bad base64") from None
+    if base64.b64encode(blob).decode("ascii") != joined:
+        # one spelling only, on every Python: before 3.13 the decoder accepts a '=' too many
+        raise SigError("bad base64")
     if blob[:6] != _SSHSIG_MAGIC:
         raise SigError("bad magic")
     if len(blob) < 10 or int.from_bytes(blob[6:10], "big") != 1:

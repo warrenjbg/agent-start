@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,10 @@ from pathlib import Path
 
 os.environ["AGENT_START_HOME"] = tempfile.mkdtemp(prefix="agentstart-alias-test-")   # before any app module
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# Python before 3.12 runs `ver` once to answer platform.uname() and keeps the answer; a library asks at import.
+# Ask now, so the guard below only ever sees what the app itself would start.
+platform.uname()
 
 GUARD_HITS: list[str] = []
 
