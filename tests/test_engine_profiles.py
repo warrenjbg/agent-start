@@ -32,6 +32,27 @@ STRATA = dict(DEFAULTS, strata_dir=r"C:\AI\Strata", launcher_bat=r"C:\AI\Strata\
 LL = [r"C:\AI\llama\llama-server.exe", "-m", r"C:\models\m.gguf", "--port", "9931"]
 
 
+def t_port_choices() -> None:
+    inst = [("llama_cpp", "llama.cpp", 9931), ("strata", "Strata", 8080)]
+    check(P.port_choices({}, "llama_cpp", 9931, inst) == [("Same as Strata · 8080", 8080), ("Own port · 9931", 9931)],
+          "llama.cpp: Strata's default port, then its own")
+    parked = {P.PROFILES_KEY: {"strata": {"port": 8085, "launch_cmd": ["x"]}}}
+    check(P.port_choices(parked, "llama_cpp", 9931, inst)[0] == ("Same as Strata · 8085", 8085),
+          "the port Strata is really set to (its parked settings) wins over its default")
+    for junk in ("8080", True, 0, 70000, None, 8080.0):
+        got = P.port_choices({P.PROFILES_KEY: {"strata": {"port": junk}}}, "llama_cpp", 9931, inst)
+        check(got[0] == ("Same as Strata · 8080", 8080), f"a junk parked port {junk!r}: the default")
+    check(P.port_choices({}, "llama_cpp", 9931, [("llama_cpp", "llama.cpp", 9931)]) == [("Own port · 9931", 9931)],
+          "one engine installed: only its own port")
+    check(P.port_choices({}, "llama_cpp", 8080, inst) == [("Own port · 8080", 8080)],
+          "the other engine on the same default port is not listed twice")
+    three = inst + [("other", "Other", 8080), ("more", "More", 1234)]
+    check([p for _l, p in P.port_choices({}, "llama_cpp", 9931, three)] == [8080, 1234, 9931], "no port twice")
+    check(P.port_choices({}, "llama_cpp", "x", inst) == [] and P.port_choices(None, "a", 1, None) == []  # type: ignore[arg-type]
+          and P.port_choices({P.PROFILES_KEY: 5}, "llama_cpp", 9931, inst)[-1] == ("Own port · 9931", 9931),
+          "junk never raises")
+
+
 def t_switch() -> None:
     before = copy.deepcopy(STRATA)
     out = P.switch(STRATA, "strata", "llama_cpp", DEFAULTS)
@@ -111,7 +132,7 @@ def t_park_foreign() -> None:
 
 
 def main() -> int:
-    for t in (t_switch, t_garbage, t_park_foreign):
+    for t in (t_switch, t_garbage, t_park_foreign, t_port_choices):
         try:
             t()
         except Exception as exc:  # noqa: BLE001

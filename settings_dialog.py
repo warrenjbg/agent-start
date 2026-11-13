@@ -67,6 +67,8 @@ def k_tokens(tokens: int) -> str:
     """26112 -> '26K', 7936 -> '7.8K'."""
     return f"{tokens / 1024:.0f}K" if tokens >= 10240 else f"{tokens / 1024:.1f}K"
 PORT_ERROR = "Port must be a number from 1 to 65535"
+PORT_OTHER = "Port {port} (in the arguments)"          # a port that is none of the offered ones
+PORT_UNSET = "No port set"
 FITS_TEXT = "Fits on the GPU"
 VISION_DROPPED = "Vision turned off · that vision file belongs to the other model"
 FIT_DEBOUNCE_MS = 600                            # the GPU-fit check runs this long after the last change
@@ -230,6 +232,16 @@ class SettingsDialog(ctk.CTkToplevel):
         self._vision_choice: ctk.StringVar | None = None
         self._vision_paths: dict[str, str] = {}          # vision dropdown label -> projector path
         self._vision_cache: dict[str, list[tuple[str, str]]] = {}
+        # launch_options["port_choices"] [(label, port)]: the Port row is a dropdown of those (e.g. the port
+        # another engine uses, so clients need no change); any other port is typed in the arguments
+        self._port_choices: list[tuple[str, int]] = []
+        if self._has_port:
+            try:
+                self._port_choices = [(str(la), int(p)) for la, p in (opts.get("port_choices") or [])]
+            except Exception:  # noqa: BLE001
+                log.debug("port choices unusable", exc_info=True)
+        self._port_menu: ctk.CTkOptionMenu | None = None
+        self._port_choice: ctk.StringVar | None = None
         self._port_entry: ctk.CTkEntry | None = None
         self._port_var: ctk.StringVar | None = None
         self._port_bad = False
@@ -468,7 +480,14 @@ class SettingsDialog(ctk.CTkToplevel):
             self._vision_menu = self._option_menu(line, self._vision_choice, [VISION_OFF], self._vision_picked)
             self._vision_menu.grid(row=0, column=1, sticky="ew")
             r += 1
-        if self._has_port:
+        if self._has_port and self._port_choices:
+            line = self._labelled(tab, r, "Port")
+            self._port_choice = ctk.StringVar(value=self._port_choices[-1][0])
+            self._port_menu = self._option_menu(line, self._port_choice, [la for la, _p in self._port_choices],
+                                                self._port_picked)
+            self._port_menu.grid(row=0, column=1, sticky="ew")
+            r += 1
+        elif self._has_port:
             line = self._labelled(tab, r, "Port")
             self._port_var = ctk.StringVar(value="")
             self._port_entry = ctk.CTkEntry(line, textvariable=self._port_var, width=80, height=28, corner_radius=8,
@@ -1005,6 +1024,10 @@ class SettingsDialog(ctk.CTkToplevel):
                         lab = next((la for la, p in self._vision_paths.items() if self._same_vision(p, str(cur))),
                                    None)
                         self._vision_choice.set(lab or VISION_OTHER)
+            if self._port_choice is not None:
+                port = self._call("port_of", args)
+                lab = next((la for la, p in self._port_choices if p == port), None)
+                self._port_choice.set(lab or (PORT_UNSET if port is None else PORT_OTHER.format(port=port)))
             if self._port_var is not None and not self._port_typing:
                 port = self._call("port_of", args)
                 self._port_bad = False
@@ -1038,6 +1061,10 @@ class SettingsDialog(ctk.CTkToplevel):
                 if v and not any(self._same_vision(p, str(v)) for _l, p in
                                  self._vision_list(self._model_path(args, program))):
                     return True
+            if self._port_choices:
+                port = self._call("port_of", args)
+                if port is not None and not any(p == port for _l, p in self._port_choices):
+                    return True                          # a port typed by hand: only the arguments show it
         except Exception:  # noqa: BLE001
             log.debug("advanced check failed", exc_info=True)
             return True
@@ -1190,6 +1217,17 @@ class SettingsDialog(ctk.CTkToplevel):
             self._set_args(self._opts["with_vision"](self._args_now(), path))
         except Exception:  # noqa: BLE001
             log.exception("could not set the vision file")
+
+    def _port_picked(self, label: str) -> None:
+        if self._saving:
+            return
+        hit = [p for la, p in self._port_choices if la == label]
+        if not hit:                                      # the "(in the arguments)" entry: nothing to change
+            return
+        try:
+            self._set_args(self._opts["with_port"](self._args_now(), hit[0]))
+        except Exception:  # noqa: BLE001
+            log.exception("could not set the port")
 
     def _port_changed(self) -> None:
         if self._syncing or self._port_var is None:
@@ -1531,7 +1569,7 @@ class SettingsDialog(ctk.CTkToplevel):
         if self._paths:
             self._menu.configure(state=state)
         widgets: list[Any] = [self._program_menu, self._model_menu, self._context_menu, self._vision_menu,
-                              self._port_entry]
+                              self._port_entry, self._port_menu]
         if not self._files:
             widgets += [self._program_entry, self._args_entry]
         for w in widgets:

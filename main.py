@@ -2731,6 +2731,11 @@ class AgentStartApp(ctk.CTk):
         if not self.engine.can(CAP_LAUNCHER_FILES):
             try:
                 options = self.engine.launch_options(found, self.cfg)
+                if isinstance(options, dict) and callable(options.get("with_port")):
+                    options["port_choices"] = engine_profiles.port_choices(
+                        self.cfg, self.engine.id, self.engine.default_port,
+                        [(eid, name, engines.get_engine({"backend": eid}).default_port)
+                         for eid, name in engines.choices()])
             except Exception:  # noqa: BLE001
                 log.debug("launch options unavailable", exc_info=True)
         if found is not None and not self.engine.is_configured(self.cfg):

@@ -731,6 +731,60 @@ def t_supervisor_lookalikes() -> None:
           f"a protected name is never killed unless it is the server itself ({spy.killed})")
 
 
+def t_shared_port() -> None:
+    """One port for both engines (llama.cpp set to Strata's port): whichever engine the app supervises, the OTHER
+    engine's server on that port is a foreign listener - reported, never killed, never adopted, and it never gets
+    the API key."""
+    strata_health = HttpReply(200, {"status": "ok", "service": "strata", "loaded": True, "model": "swift"})
+
+    # 1. llama.cpp is the engine in use; a complete Strata tree holds the port
+    def strata_tree() -> None:
+        reset()
+        FakeProc(40, "cmd.exe", ["cmd.exe", "/c", S + r"\run-swift.bat"], r"C:\Windows\System32\cmd.exe", None, ctime=1)
+        FakeProc(100, "python.exe", [PY, S + r"\serve\server.py", "--engine", "strata", "--port", str(PORT)], PY, 40)
+        FakeProc(101, "python.exe", [r"C:\Py\python.exe", S + r"\serve\server.py", "--engine", "strata", "--port",
+                                     str(PORT)], r"C:\Py\python.exe", 100)
+        FakeProc(102, "strata.exe", [S + r"\engine\strata.exe"], S + r"\engine\strata.exe", 101)
+
+    for reply, why in ((strata_health, "Strata's own /health"), (HttpReply(), "no answer"),
+                       (READY, "even a llama.cpp-looking answer")):
+        strata_tree()
+        net = Net({"/health": reply, "/slots": LLAMA(200, IDLE_SLOTS)})
+        m, spy = manager([101], net, api_key="sek-ret")
+        res = run_stop(m, force=True)
+        check(not res["ok"] and not spy.killed and (res["error"] or "").endswith("not llama.cpp"),
+              f"llama.cpp in use, Strata on the port ({why}): refused even with force, nothing killed ({res['error']})")
+        if reply is not READY:
+            check(not any("Authorization" in h for _m, _p, h in net.calls),
+                  f"...and the API key is not sent to it ({why})")
+            strata_tree()
+            m, _spy = manager([101], Net({"/health": reply}), api_key="sek-ret")
+            out = m._adopt(threading.Event())
+            check(out is not None and out[0] == "error" and out[1].endswith("not llama.cpp"),
+                  f"...and a Turn on does not adopt it ({why}: {out})")
+
+    # 2. Strata is the engine in use; a llama-server holds its port
+    scfg = dict(strata_cfg(), port=PORT, endpoint_url=f"http://127.0.0.1:{PORT}/v1")
+    scfg["launch_cmd"] = scfg["launch_cmd"][:-1] + [str(PORT)]
+    for reply, why in ((READY, "llama.cpp's own /health"), (HttpReply(), "no answer"),
+                       (strata_health, "even a Strata-looking answer")):
+        reset()
+        FakeProc(40, "cmd.exe", ["cmd.exe"], r"C:\Windows\System32\cmd.exe", None, ctime=1)
+        srv(100, 40)
+        FakeProc(101, "conhost.exe", ["conhost"], r"C:\Windows\System32\conhost.exe", 100)
+        sm_ = lmgr(StrataEngine(), **scfg)
+        spy = Spy(sm_, listening=True)
+        del sm_._locate_root                     # the REAL root search (Spy replaced it)
+        sm_._listener_pids = lambda: [100]       # type: ignore[method-assign]
+        sm_._http = Net({"/health": reply})      # type: ignore[method-assign]
+        res = run_stop(sm_, force=True)
+        check(not res["ok"] and not spy.killed,
+              f"Strata in use, llama-server on the port ({why}): refused even with force, nothing killed "
+              f"({res['error']})")
+        if reply is not strata_health:
+            check(not spy.unloads, f"...and no unload is sent to it ({why})")
+
+
 def t_supervisor_hidden_pid_and_adopt() -> None:
     # listener PID hidden: the process scan finds the server by its own --port
     world()
@@ -1150,7 +1204,7 @@ def main() -> int:
     tests = (t_identity, t_probe, t_children_and_sweep, lambda: t_launch(tmp), t_busy_and_headers,
              lambda: t_log_parsing(tmp), lambda: t_poller(tmp), t_load_progress, t_supervisor_stop,
              t_supervisor_lookalikes, t_supervisor_hidden_pid_and_adopt, t_registry_and_compat,
-             lambda: t_fit(tmp), lambda: t_fit_largest(tmp), t_model_label)
+             t_shared_port, lambda: t_fit(tmp), lambda: t_fit_largest(tmp), t_model_label)
     for t in tests:
         try:
             t()

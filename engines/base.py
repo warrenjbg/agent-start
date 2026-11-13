@@ -501,6 +501,7 @@ class Engine:
           vision_files  fn(model path) -> [(label, projector path)]   vision_of fn(args) -> path | None
                                                      with_vision fn(args, path | None) -> args
           port_of       fn(args) -> port | None      with_port fn(args, port) -> args
+          port_choices  [(label, port)], added by the app: the Port row becomes a dropdown of those
         Optional hooks:
           launch_info   fn(CommandLaunch) -> the launch object to check and save (an engine's own subclass)
           per_model     True: with_model already brings each model's own arguments (Settings then leaves the

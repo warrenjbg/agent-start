@@ -64,6 +64,30 @@ def switch(cfg: Mapping[str, Any], old_id: str, new_id: str, defaults: Mapping[s
     return out
 
 
+def port_choices(cfg: Mapping[str, Any], engine_id: str, own_port: Any,
+                 installed: Iterable[tuple[str, str, Any]]) -> list[tuple[str, int]]:
+    """The Port dropdown of an engine whose port is an argument: [(label, port)]. First the port each OTHER
+    installed engine uses - its parked settings here, else its default - so clients set up for that engine reach
+    this one without changes (only one engine runs at a time); last the engine's own default port.
+    installed: (engine id, display name, default port). Pure; never raises ([] on junk)."""
+    out: list[tuple[str, int]] = []
+    try:
+        own = int(own_port)
+        parked = _profiles(cfg)
+        for eid, name, default in installed:
+            if str(eid) == str(engine_id):
+                continue
+            port = parked.get(str(eid), {}).get("port")
+            if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                port = int(default)
+            if 1 <= port <= 65535 and port != own and all(p != port for _l, p in out):
+                out.append((f"Same as {name} · {port}", port))
+        out.append((f"Own port · {own}", own))
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
 def park_foreign(cfg: Mapping[str, Any], engine: Any, others: Iterable[Any],
                  defaults: Mapping[str, Any] | None = None) -> dict | None:
     """The live settings belong to ANOTHER engine (the engine was changed by a version that did not park them, or
