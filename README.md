@@ -445,6 +445,10 @@ To serve another Strata model, pick its `run-*.bat` in ⚙ Settings — no hand-
 
 ## Tests
 
+Changing the code, as a person or with a model: read [`AGENTS.md`](AGENTS.md) first. It holds the rules that are
+never broken, the commands, and the files whose changes need a second, stronger reviewer
+(`tools\protected_changes.py` lists the ones a branch touches).
+
 Each `tests\test_*.py` is a standalone script: run it from this folder with the project venv, it prints `[PASS]` /
 `[FAIL]` lines and a summary, and exits 0 when everything passed. There is no pytest.
 
@@ -495,6 +499,7 @@ notification area on a runner). *Local* suites open the real window and take scr
 | `tests\test_download_dialog.py` | Local | The download window itself (opens windows), with a stand-in for the Hugging Face module |
 | `tests\test_hermes_alias.py` | CI | The Hermes alias module with a stand-in for `hermes.exe` (no process is started): the one-argument write, the read-back, reading first, leaving an entry with other keys alone |
 | `tests\test_alias_wiring.py` | CI | The app's side of the Hermes alias on a stand-in object: when an update starts, everything that keeps it from starting, one attempt per model and port |
+| `tests\test_protected_changes.py` | CI | `tools\protected_changes.py`: which changed files need a stronger reviewer, and that `AGENTS.md` shows the same list |
 | `tests\test_settings_tabs.py` | Local | The Settings tabs for both engines (opens windows): rows per tab, per-model arguments, Largest that fits the GPU, the Port choice, the download link, the alias switch |
 | `tests\test_strata_tuning.py` | CI | Strata's Context length / Vision choice: the app-owned copy of the run config, on made-up Strata folders |
 | `tests\test_strata_tune_ui.py` | Local | Those two rows in the Settings window (opens one window) |
