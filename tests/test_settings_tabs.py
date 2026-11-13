@@ -422,7 +422,7 @@ def test_alias_switch() -> None:
     app, det, ep = U.new_app()
     try:
         d = H.open_settings(app)
-        check(d is not None and "hermes_alias" not in d.switches and app._alias_pref is False,
+        check(d is not None and "hermes_alias" not in d.switches and app.alias.pref is False,
               "Strata: no alias row; the setting is off by default")
         if d is not None:
             H.close_settings(d)
@@ -433,7 +433,7 @@ def test_alias_switch() -> None:
     orig = app._run_worker
     app._run_worker = lambda name, fn, *a: ran.append(name) if name == "hc-alias" else orig(name, fn, *a)  # type: ignore[method-assign]
     try:
-        check(app._alias_pref is False and app._can_alias is False and app._hermes_exe is None,
+        check(app.alias.pref is False and app.alias.can_run is False and app.alias.exe is None,
               "a stub-built app: off, never runs hermes, does not look for it")
         d = _open_llama(app)
         if d is not None:
@@ -447,14 +447,14 @@ def test_alias_switch() -> None:
             with Saves() as s:
                 H.toggle_settings_switch(d, main.ALIAS_LABEL_MISSING)
                 pump(app, 0.5)
-                check(app._alias_pref is False and not s.state, "a greyed switch cannot be turned on")
+                check(app.alias.pref is False and not s.state, "a greyed switch cannot be turned on")
             ok, info = _heights_fixed(app, d)
             check(ok, f"llama.cpp with the alias row: one height, nothing clipped ({info})")
             H.show_settings_tab(d, "Behaviour")
             pump(app, 0.2)
             U.shot(d, "settings_tabs_llama_alias_missing")
             H.close_settings(d)
-        app._hermes_exe = os.path.join(str(TMP), "hermes", "bin", "hermes.exe")      # found (never run: gated)
+        app.alias.exe = os.path.join(str(TMP), "hermes", "bin", "hermes.exe")        # found (never run: gated)
         d = _open_llama(app)
         if d is not None:
             sw = H.settings_switch(d, main.ALIAS_LABEL)
@@ -462,19 +462,53 @@ def test_alias_switch() -> None:
                   f"hermes.exe found: the row is live and off ({sw})")
             with Saves() as s:
                 H.toggle_settings_switch(d, main.ALIAS_LABEL)
-                check(app._alias_pref is True, "the switch -> set_alias_pref")
+                check(app.alias.pref is True, "the switch -> alias.set_pref")
                 pump_until(app, lambda: any("hermes_alias" in st for st in s.state), 3)
                 check(any(st.get("hermes_alias") is True for st in s.state) and not s.config,
                       f"saved as hermes_alias in state.json, config.json untouched ({s.state})")
                 H.toggle_settings_switch(d, main.ALIAS_LABEL)
                 pump_until(app, lambda: any(st.get("hermes_alias") is False for st in s.state), 3)
-                check(app._alias_pref is False and any(st.get("hermes_alias") is False for st in s.state),
+                check(app.alias.pref is False and any(st.get("hermes_alias") is False for st in s.state),
                       "and off again")
             H.show_settings_tab(d, "Behaviour")
             pump(app, 0.2)
             U.shot(d, "settings_tabs_llama_alias")
             H.close_settings(d)
         check(not ran, f"no hermes worker was started ({ran})")
+        # The controller reads the app through its host. With the test gate lifted for a moment and recorders in
+        # place of the worker launcher and the note, a serving app starts exactly one update for the model and the
+        # port it serves, and the result becomes the window's note. Nothing is pumped, nothing runs.
+        calls: list = []
+        notes: list[str] = []
+        keep = (app.state_name, app.loaded, app.model_id, app._set_note)
+        app._run_worker = lambda name, fn, *a: calls.append((name, fn, a)) if name == "hc-alias" else orig(name, fn, *a)  # type: ignore[method-assign]
+        app._set_note = notes.append  # type: ignore[method-assign]
+        url = "http://127.0.0.1:9931/v1"
+        try:
+            app.alias.can_run, app.alias.pref, app.alias.done = True, True, None
+            app.loaded, app.model_id = True, "Qwen-W"         # so that only the state can refuse
+            app.alias.check()
+            check(not calls and app.alias.done is None and app.state_name != main.ACTIVE,
+                  "wired to the app's state: nothing starts while the engine is off")
+            app.state_name = main.ACTIVE
+            app._destroyed = True
+            app.alias.check()
+            app._destroyed = False
+            check(not calls and app.alias.done is None, "wired to the app's closing flag: nothing starts while it closes")
+            app.loaded = False
+            app.alias.check()
+            app.loaded = True
+            check(not calls, "wired to the app's loaded flag: nothing starts while the model loads")
+            app.alias.check()
+            check(len(calls) == 1 and calls[0][0] == "hc-alias" and calls[0][1] is main._alias_worker
+                  and calls[0][2][:3] == (app.alias.exe, "Qwen-W", url) and calls[0][2][4] == app.alias.result,
+                  f"serving: one update for the app's model and port, through the app's worker launcher ({calls})")
+            import hermes_alias
+            app.alias.result(("Qwen-W", url), hermes_alias.AliasResult(True, True, "x"))
+            check(notes == ["Hermes alias llama updated\nQwen-W"], f"the result is shown as the window's note ({notes})")
+        finally:
+            app.alias.can_run, app.alias.pref, app.alias.done, app.alias.busy = False, False, None, False
+            app.state_name, app.loaded, app.model_id, app._set_note = keep  # type: ignore[method-assign]
     finally:
         app.destroy()
 

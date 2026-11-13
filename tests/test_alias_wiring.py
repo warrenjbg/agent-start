@@ -1,6 +1,7 @@
 """Headless tests for the app's glue around hermes_alias.py (Settings > Keep Hermes' "llama" alias in step):
-main.AgentStartApp._alias_check / _alias_result / set_alias_pref / _alias_target / _hermes_path, the worker and the
-note text, called on a stand-in object. No window, no Tk root, no network, no engine, and NO process: subprocess.run
+alias_controller.AliasController (check / result / set_pref / target / hermes_path), the worker and the note text,
+wired to a stand-in for the app the way main.py wires it, and main.AgentStartApp.on_status, which calls it.
+No window, no Tk root, no network, no engine, and NO process: subprocess.run
 and subprocess.Popen are replaced by a guard before any app module is imported, the worker launcher is a recorder,
 and hermes_alias.sync_alias is only ever a recorder here. The data folder is a temp folder.
 
@@ -8,7 +9,6 @@ Run:  .venv\\Scripts\\python.exe tests\\test_alias_wiring.py
 """
 from __future__ import annotations
 
-import functools
 import os
 import platform
 import subprocess
@@ -35,12 +35,13 @@ def _forbidden(*args, **kwargs):
 subprocess.run = _forbidden  # type: ignore[assignment]
 subprocess.Popen = _forbidden  # type: ignore[assignment, misc]
 
+import alias_controller as AC  # noqa: E402
 import main as M  # noqa: E402
 
 PASSED = FAILED = 0
 EXE = r"C:\Apps\hermes\bin\hermes.exe"
 URL = "http://127.0.0.1:9931/v1"
-METHODS = ("_alias_supported", "_hermes_path", "_alias_target", "_alias_check", "_alias_result", "set_alias_pref")
+OWN = {"pref", "can_run", "busy", "exe"}       # what the controller holds; everything else is the app's
 
 
 def check(cond: bool, name: str) -> None:
@@ -53,51 +54,56 @@ def check(cond: bool, name: str) -> None:
 
 
 def _app(**over):
-    """A stand-in for the app with only what the alias glue reads; the worker launcher and the note are recorders."""
+    """A stand-in for the app with only what the alias controller reads, wired to a real AliasController the way
+    main.py wires it; the worker launcher and the note are recorders. Keys in OWN set the controller's own state."""
     a = types.SimpleNamespace(
-        _alias_pref=True, _can_alias=True, _alias_done=None, _alias_busy=False, _destroyed=False, _hermes_exe=EXE,
-        state_name=M.ACTIVE, loaded=True, model_id="Qwen-A", cfg={"port": 9931},
+        _destroyed=False, state_name=M.ACTIVE, loaded=True, model_id="Qwen-A", cfg={"port": 9931},
         engine=types.SimpleNamespace(name="llama.cpp", syncs_hermes_alias=True),
         workers=[], notes=[], saved=[], posted=[])
     a._run_worker = lambda name, fn, *args: a.workers.append((name, fn, args))
     a._set_note = a.notes.append
     a._save_state_later = lambda k, v: a.saved.append((k, v))
     a.post = lambda fn, *args: a.posted.append((fn, args))
-    for name in METHODS:
-        setattr(a, name, functools.partial(getattr(M.AgentStartApp, name), a))
+    a.alias = AC.AliasController(
+        AC.AliasHost(post=a.post, run_worker=lambda *x: a._run_worker(*x), set_note=lambda s: a._set_note(s),
+                     save_state_later=lambda k, v: a._save_state_later(k, v), state=lambda: a.state_name,
+                     loaded=lambda: a.loaded, model_id=lambda: a.model_id, port=lambda: a.cfg.get("port"),
+                     engine=lambda: a.engine, destroyed=lambda: a._destroyed),
+        pref=True, can_run=True, exe=EXE)
     for k, v in over.items():
-        setattr(a, k, v)
+        setattr(a.alias if k in OWN else a, k, v)
     return a
 
 
 def _res(ok: bool, changed: bool, note: str = ""):
-    return M.hermes_alias.AliasResult(ok, changed, note)
+    return AC.hermes_alias.AliasResult(ok, changed, note)
 
 
 def t_starts_one_update() -> None:
     a = _app()
-    a._alias_check()
-    check(len(a.workers) == 1 and a.workers[0][0] == "hc-alias" and a.workers[0][1] is M._alias_worker
+    a.alias.check()
+    check(len(a.workers) == 1 and a.workers[0][0] == "hc-alias" and a.workers[0][1] is AC._alias_worker
+          and a.workers[0][1] is M._alias_worker
           and a.workers[0][2][:3] == (EXE, "Qwen-A", URL) and a.workers[0][2][3] is a.post
-          and a.workers[0][2][4] is a._alias_result,
+          and a.workers[0][2][4] == a.alias.result and a.workers[0][2][4].__self__ is a.alias,
           f"serving a loaded model with the switch on: one worker with hermes.exe, the model and the address ({a.workers})")
-    check(a._alias_busy is True and a._alias_done == ("Qwen-A", URL), "marked busy and handled")
+    check(a.alias.busy is True and a.alias.done == ("Qwen-A", URL), "marked busy and handled")
     for _ in range(5):
-        a._alias_check()
+        a.alias.check()
     check(len(a.workers) == 1, "later polls while hermes runs: no second run")
-    a._alias_result(("Qwen-A", URL), _res(True, True, "Hermes alias llama now points at Qwen-A"))
-    check(a._alias_busy is False and a.notes == ["Hermes alias llama updated\nQwen-A"],
+    a.alias.result(("Qwen-A", URL), _res(True, True, "Hermes alias llama now points at Qwen-A"))
+    check(a.alias.busy is False and a.notes == ["Hermes alias llama updated\nQwen-A"],
           f"the write was confirmed: one note ({a.notes})")
     for _ in range(5):
-        a._alias_check()
+        a.alias.check()
     check(len(a.workers) == 1, "the same model on the same address is handled once per app run")
     a.model_id = "Qwen-B"
-    a._alias_check()
+    a.alias.check()
     check(len(a.workers) == 2 and a.workers[1][2][:3] == (EXE, "Qwen-B", URL), "another model: another update")
-    a._alias_result(("Qwen-B", URL), _res(True, False))
+    a.alias.result(("Qwen-B", URL), _res(True, False))
     check(len(a.notes) == 1, "already in step (nothing written): no note")
     a.cfg = {"port": 8080}
-    a._alias_check()
+    a.alias.check()
     check(len(a.workers) == 3 and a.workers[2][2][:3] == (EXE, "Qwen-B", "http://127.0.0.1:8080/v1"),
           "the same model on another port: another update")
 
@@ -105,12 +111,12 @@ def t_starts_one_update() -> None:
 def t_does_nothing() -> None:
     """Every condition that must keep hermes from running: no worker, nothing marked, nothing noted."""
     cases: list[tuple[str, dict]] = [
-        ("the switch is off", {"_alias_pref": False}),
-        ("a stub-built app (the test gate)", {"_can_alias": False}),
+        ("the switch is off", {"pref": False}),
+        ("a stub-built app (the test gate)", {"can_run": False}),
         ("an engine Hermes has no alias for", {"engine": types.SimpleNamespace(name="Strata")}),
         ("the engine says no", {"engine": types.SimpleNamespace(name="x", syncs_hermes_alias=False)}),
         ("the app is closing", {"_destroyed": True}),
-        ("a run is already in flight", {"_alias_busy": True}),
+        ("a run is already in flight", {"busy": True}),
         ("the model is still loading", {"loaded": False}),
         ("whether a model is loaded is unknown", {"loaded": None}),
         ("no model name yet", {"model_id": None}),
@@ -125,66 +131,66 @@ def t_does_nothing() -> None:
         cases.append((f"state {st}", {"state_name": st}))
     for why, over in cases:
         a = _app(**over)
-        before = a._alias_busy
+        before = a.alias.busy
         for _ in range(3):
-            a._alias_check()
-        check(not a.workers and a._alias_done is None and not a.notes and a._alias_busy is before, f"{why}: nothing runs")
+            a.alias.check()
+        check(not a.workers and a.alias.done is None and not a.notes and a.alias.busy is before, f"{why}: nothing runs")
 
 
 def t_hermes_missing_and_lookup() -> None:
-    a = _app(_hermes_exe=None)
+    a = _app(exe=None)
     for _ in range(4):
-        a._alias_check()
-    check(not a.workers and a._alias_busy is False and a._alias_done == ("Qwen-A", URL) and not a.notes,
+        a.alias.check()
+    check(not a.workers and a.alias.busy is False and a.alias.done == ("Qwen-A", URL) and not a.notes,
           "hermes.exe not found: nothing runs, and it is not looked at again on every poll")
     looked: list[int] = []
-    saved = M.hermes_alias.find_hermes
-    M.hermes_alias.find_hermes = lambda *x, **k: looked.append(1) or EXE          # type: ignore[assignment]
+    saved = AC.hermes_alias.find_hermes
+    AC.hermes_alias.find_hermes = lambda *x, **k: looked.append(1) or EXE          # type: ignore[assignment]
     try:
-        a = _app(_hermes_exe=False)
-        got = [a._hermes_path(), a._hermes_path(), a._hermes_path()]
+        a = _app(exe=False)
+        got = [a.alias.hermes_path(), a.alias.hermes_path(), a.alias.hermes_path()]
         check(got == [EXE] * 3 and len(looked) == 1, f"hermes.exe is looked for once per app run ({len(looked)})")
-        M.hermes_alias.find_hermes = lambda *x, **k: looked.append(1) or None     # type: ignore[assignment]
-        a = _app(_hermes_exe=False)
-        got = [a._hermes_path(), a._hermes_path()]
+        AC.hermes_alias.find_hermes = lambda *x, **k: looked.append(1) or None     # type: ignore[assignment]
+        a = _app(exe=False)
+        got = [a.alias.hermes_path(), a.alias.hermes_path()]
         check(got == [None, None] and len(looked) == 2, "...also when it was not found")
     finally:
-        M.hermes_alias.find_hermes = saved                                        # type: ignore[assignment]
+        AC.hermes_alias.find_hermes = saved                                        # type: ignore[assignment]
 
 
 def t_failure_and_retry() -> None:
     a = _app()
-    a._alias_check()
-    a._alias_result(("Qwen-A", URL), _res(False, False, "Hermes alias not updated: hermes exited with code 1 (locked)"))
-    check(a.notes == ["Hermes alias not updated\nhermes exited with code 1 (locked)"] and a._alias_busy is False,
+    a.alias.check()
+    a.alias.result(("Qwen-A", URL), _res(False, False, "Hermes alias not updated: hermes exited with code 1 (locked)"))
+    check(a.notes == ["Hermes alias not updated\nhermes exited with code 1 (locked)"] and a.alias.busy is False,
           f"a failure shows its reason as a note ({a.notes})")
     for _ in range(5):
-        a._alias_check()
+        a.alias.check()
     check(len(a.workers) == 1, "a failure is not retried on every poll")
-    a.set_alias_pref(False)
-    check(a.saved == [("hermes_alias", False)] and a._alias_pref is False and len(a.workers) == 1,
+    a.alias.set_pref(False)
+    check(a.saved == [("hermes_alias", False)] and a.alias.pref is False and len(a.workers) == 1,
           "switch off: saved, nothing runs")
-    a.set_alias_pref(True)
-    check(a.saved[-1] == ("hermes_alias", True) and a._alias_pref is True and len(a.workers) == 2
+    a.alias.set_pref(True)
+    check(a.saved[-1] == ("hermes_alias", True) and a.alias.pref is True and len(a.workers) == 2
           and a.workers[1][2][:3] == (EXE, "Qwen-A", URL), "switch on again: saved, and the update is tried again now")
-    a = _app(state_name=M.IDLE, _alias_pref=False)
-    a.set_alias_pref(True)
+    a = _app(state_name=M.IDLE, pref=False)
+    a.alias.set_pref(True)
     check(a.saved == [("hermes_alias", True)] and not a.workers, "switch on while the engine is off: saved, nothing runs yet")
     a.state_name = M.ACTIVE
-    a._alias_check()
+    a.alias.check()
     check(len(a.workers) == 1, "...and the update runs once the engine serves")
 
     a = _app()
-    a._alias_check()
+    a.alias.check()
     a.model_id = "Qwen-B"                         # the model changed while hermes ran
-    a._alias_result(("Qwen-A", URL), _res(True, True, "x"))
-    check(len(a.workers) == 2 and a.workers[1][2][:3] == (EXE, "Qwen-B", URL) and a._alias_busy is True,
+    a.alias.result(("Qwen-A", URL), _res(True, True, "x"))
+    check(len(a.workers) == 2 and a.workers[1][2][:3] == (EXE, "Qwen-B", URL) and a.alias.busy is True,
           "a model change during a run is picked up when the run ends")
 
     a = _app()
-    a._alias_check()
+    a.alias.check()
     a._destroyed = True
-    a._alias_result(("Qwen-A", URL), _res(False, False, "Hermes alias not updated: x"))
+    a.alias.result(("Qwen-A", URL), _res(False, False, "Hermes alias not updated: x"))
     check(not a.notes and len(a.workers) == 1, "a result after the app closed: no note, nothing more runs")
 
     a = _app()
@@ -194,18 +200,18 @@ def t_failure_and_retry() -> None:
 
     a._run_worker = boom
     try:
-        a._alias_check()
-        check(a._alias_busy is False and not a.notes, "an error while starting the worker ends in the check (not busy forever)")
+        a.alias.check()
+        check(a.alias.busy is False and not a.notes, "an error while starting the worker ends in the check (not busy forever)")
     except Exception as exc:  # noqa: BLE001
-        check(False, f"_alias_check raised {exc!r}")
+        check(False, f"alias.check raised {exc!r}")
 
 
 def t_worker_and_note() -> None:
     calls: list = []
     posted: list = []
-    saved = M.hermes_alias.sync_alias
+    saved = AC.hermes_alias.sync_alias
     try:
-        M.hermes_alias.sync_alias = lambda model, url, **kw: calls.append((model, url, kw)) or _res(True, True, "ok")  # type: ignore[assignment]
+        AC.hermes_alias.sync_alias = lambda model, url, **kw: calls.append((model, url, kw)) or _res(True, True, "ok")  # type: ignore[assignment]
         M._alias_worker(EXE, "Qwen-A", URL, lambda fn, *args: posted.append((fn, args)), "DONE")
         check(calls == [("Qwen-A", URL, {"exe": EXE})], f"the worker calls sync_alias with the found hermes.exe ({calls})")
         check(posted == [("DONE", (("Qwen-A", URL), _res(True, True, "ok")))], "and posts the target and the result back")
@@ -213,13 +219,13 @@ def t_worker_and_note() -> None:
         def boom(*x, **k):
             raise RuntimeError("x")
 
-        M.hermes_alias.sync_alias = boom           # type: ignore[assignment]
+        AC.hermes_alias.sync_alias = boom          # type: ignore[assignment]
         posted.clear()
         M._alias_worker(EXE, "Qwen-A", URL, lambda fn, *args: posted.append((fn, args)), "DONE")
         check(len(posted) == 1 and posted[0][1][1].ok is False and posted[0][1][1].changed is False,
               "an error in the worker is posted as 'not updated'")
     finally:
-        M.hermes_alias.sync_alias = saved          # type: ignore[assignment]
+        AC.hermes_alias.sync_alias = saved         # type: ignore[assignment]
     n = M._alias_note
     check(n(_res(False, False, "Hermes alias not updated: hermes.exe was not found"))
           == "Hermes alias not updated\nhermes.exe was not found", "note: head and reason on two lines")
@@ -267,6 +273,8 @@ def t_status_path() -> None:
 
 
 def t_defaults() -> None:
+    check(M.ALIAS_LABEL is AC.ALIAS_LABEL and M.ALIAS_LABEL_MISSING is AC.ALIAS_LABEL_MISSING
+          and M._alias_note is AC._alias_note, "main still offers the labels and the note under their old names")
     check(M.ALIAS_LABEL == "Keep Hermes' \u201cllama\u201d alias in step"
           and M.ALIAS_LABEL_MISSING == "Hermes \u201cllama\u201d alias (Hermes not found)", "the Settings row's two labels")
     check(max(len(M.ALIAS_LABEL), len(M.ALIAS_LABEL_MISSING)) <= 40,
