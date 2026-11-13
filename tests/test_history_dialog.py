@@ -56,17 +56,21 @@ def eq(got, want, msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------------------------------- fake store
-def mu(model: str, requests: int, prompt: int, gen: int, tps: float | None, served_s: float) -> ModelUsage:
+def mu(model: str, requests: int, prompt: int, gen: int, tps: float | None, served_s: float,
+       wh: float = 0.0, busy_wh: float = 0.0, gpu_tokens: int = 0) -> ModelUsage:
     dec_s = gen / tps if tps and gen else 0.0
     return ModelUsage(model=model, requests=requests, prompt_tokens=prompt, generated_tokens=gen,
-                      decode_s=dec_s, decode_tokens=gen if dec_s else 0, served_s=served_s)
+                      decode_s=dec_s, decode_tokens=gen if dec_s else 0, served_s=served_s,
+                      gpu_wh=wh, gpu_busy_wh=busy_wh, gpu_tokens=gpu_tokens)
 
 
 def _sum(rows) -> Usage:
     rows = list(rows)
     return Usage(requests=sum(r.requests for r in rows), prompt_tokens=sum(r.prompt_tokens for r in rows),
                  generated_tokens=sum(r.generated_tokens for r in rows), decode_s=sum(r.decode_s for r in rows),
-                 decode_tokens=sum(r.decode_tokens for r in rows), served_s=sum(r.served_s for r in rows))
+                 decode_tokens=sum(r.decode_tokens for r in rows), served_s=sum(r.served_s for r in rows),
+                 gpu_wh=sum(r.gpu_wh for r in rows), gpu_busy_wh=sum(r.gpu_busy_wh for r in rows),
+                 gpu_tokens=sum(r.gpu_tokens for r in rows))
 
 
 class FakeHistory:
@@ -101,11 +105,13 @@ class BrokenHistory:
 
 
 def populated() -> FakeHistory:
+    """Today has GPU energy (tok/Wh 1,258 / 1,167, day 1,240); two days ago is from before energy metering (dashes);
+    the served-only day has energy but no reply energy (Wh shown, tok/Wh a dash)."""
     return FakeHistory({
-        TODAY: [mu("swift-1.5-iq3_s", 171, 2_900_000, 151_000, 101.7, 4 * 3600 + 2 * 60),
-                mu("swift-1.5-iq3_xxs", 43, 520_000, 35_000, 84.1, 3600 + 10 * 60)],
+        TODAY: [mu("swift-1.5-iq3_s", 171, 2_900_000, 151_000, 101.7, 4 * 3600 + 2 * 60, 310.0, 120.0, 151_000),
+                mu("swift-1.5-iq3_xxs", 43, 520_000, 35_000, 84.1, 3600 + 10 * 60, 62.4, 30.0, 35_000)],
         TODAY - D(days=2): [mu("swift-1.5-iq3_s", 96, 1_180_000, 74_000, 102.3, 2 * 3600 + 40 * 60)],
-        TODAY - D(days=3): [mu("swift-1.5-iq3_s", 0, 0, 0, None, 18 * 60)],          # served, no requests
+        TODAY - D(days=3): [mu("swift-1.5-iq3_s", 0, 0, 0, None, 18 * 60, 4.2)],    # served, no requests
         TODAY - D(days=20): [mu("a-model-with-a-really-quite-long-name-q4_k_m", 12, 9_400, 1_902, 55.0, 600)],
         TODAY - D(days=40): [mu("swift-1.5-iq3_s", 5, 4_000, 800, 90.0, 300)],       # outside 30 days
     })
@@ -214,10 +220,36 @@ def test_formatters() -> None:
     eq(hd.fmt_day(TODAY - D(days=1), TODAY), "Yesterday", "fmt_day yesterday")
     eq(hd.fmt_day(dt.date(2026, 11, 11), TODAY), "Wed 11 Nov", "fmt_day weekday form")
     eq(hd.fmt_date(dt.date(2026, 10, 14)), "14 Oct", "fmt_date")
-    eq(hd.usage_cells(Usage(served_s=18 * 60)), ("0", "–", "–", "–", "18 m"), "0 requests: tokens are dashes")
-    eq(hd.usage_cells(mu("m", 3, 0, 0, None, 0)), ("3", "0", "0", "–", "–"), "requests without tokens: zeros")
-    eq(hd.card_values(Usage()), {"requests": "0", "generated tokens": "0", "avg tok/s": "–", "served": "–"},
-       "empty cards")
+    eq(hd.usage_cells(Usage(served_s=18 * 60)), ("0", "–", "–", "–", "18 m", "–", "–"),
+       "0 requests: tokens are dashes")
+    eq(hd.usage_cells(mu("m", 3, 0, 0, None, 0)), ("3", "0", "0", "–", "–", "–", "–"), "requests without tokens: zeros")
+    eq(hd.card_values(Usage()), {"requests": "0", "generated tokens": "0", "avg tok/s": "–", "served": "–",
+                                 "GPU energy": "–"}, "empty cards")
+    # GPU energy: the card, the two table cells
+    for v, want in ((None, "–"), (0, "–"), (-1, "–"), (float("nan"), "–"), (0.001, "< 0.01 Wh"), (0.42, "0.42 Wh"),
+                    (9.994, "9.99 Wh"), (12.34, "12.3 Wh"), (842.4, "842 Wh"), (999.4, "999 Wh"),
+                    (999.6, "1.00 kWh"), (1234.0, "1.23 kWh"), (12_345.0, "12.3 kWh"), (123_456.0, "123 kWh"),
+                    (1_234_567.0, "1,235 kWh")):
+        eq(hd.fmt_energy(v), want, f"fmt_energy({v!r})")
+    for v, want in ((None, "–"), (0, "–"), (0.001, "< 0.01"), (0.42, "0.42"), (62.4, "62.4"), (372.4, "372"),
+                    (1234.4, "1,234")):
+        eq(hd.fmt_wh(v), want, f"fmt_wh({v!r})")
+    for v, want in ((None, "–"), (0, "–"), (float("inf"), "–"), (812.4, "812"), (1240.0, "1,240"),
+                    (123_456.6, "123,457")):
+        eq(hd.fmt_tok_per_wh(v), want, f"fmt_tok_per_wh({v!r})")
+    eq(hd.usage_cells(mu("m", 2, 10, 300, 50.0, 60, 0.5, 0.25, 300))[-2:], ("0.50", "1,200"), "energy cells")
+    eq(hd.usage_cells(mu("m", 2, 10, 300, 50.0, 60, 0.5, 0.0, 300))[-2:], ("0.50", "–"),
+       "energy without reply energy: Wh shown, tok/Wh a dash")
+    eq(hd.usage_cells(mu("m", 2, 10, 300, 50.0, 60, 0.0, 0.0, 300))[-2:], ("–", "–"),
+       "no energy (a day from before energy metering): dashes")
+    eq(hd.card_values(Usage(gpu_wh=1500.0))["GPU energy"], "1.50 kWh", "GPU energy card in kWh")
+    # layout constants: CARD_KEYS / COLUMNS are the source of truth
+    eq((hd.WIDTH, len(hd.CARD_KEYS), len(hd.COLUMNS), len(hd.COL_RIGHT)), (620, 5, 8, 7), "620 px, 5 cards, 8 columns")
+    eq(hd.COLUMNS[-2:], ("GPU Wh", "tok/Wh"), "the two new columns are on the right")
+    check(all(a > b for a, b in zip(hd.COL_RIGHT, hd.COL_RIGHT[1:])) and hd.COL_RIGHT[-1] > 0,
+          f"column right edges strictly ordered: {hd.COL_RIGHT}")
+    check("whole graphics card" in hd.ENERGY_NOTE and "not only the engine" in hd.ENERGY_NOTE
+          and "tok/Wh" in hd.ENERGY_NOTE and hd.NOTE_H > 0, "the energy note says it is the whole card")
     eq(hd.range_start(TODAY, 30, None), TODAY - D(days=29), "range_start 30 days")
     eq(hd.range_start(TODAY, None, TODAY - D(days=10)), TODAY - D(days=10), "range_start All")
     eq(hd.range_start(TODAY, None, TODAY - D(days=300)), TODAY - D(days=89), "range_start All capped at 90")
@@ -252,14 +284,21 @@ def test_populated(root) -> Path | None:
         eq(dlg.range_days, 30, "default range")
         eq(dlg.range_buttons(), {"7 days": False, "30 days": True, "All": False}, "range switch state")
         eq(dlg.card_texts(), {"requests": "322", "generated tokens": "262 K", "avg tok/s": "98.5",
-                              "served": "8 h 20 m"}, "30-day cards")
+                              "served": "8 h 20 m", "GPU energy": "377 Wh"}, "30-day cards")
         rows = dlg.table_rows()
-        eq(rows[:4], [("day", "Today", "214", "3.42 M", "186 K", "97.8", "5 h 12 m"),
-                      ("model", "swift-1.5-iq3_s", "171", "2.90 M", "151 K", "101.7", "4 h 02 m"),
-                      ("model", "swift-1.5-iq3_xxs", "43", "520 K", "35.0 K", "84.1", "1 h 10 m"),
-                      ("day", "Wed 11 Nov", "96", "1.18 M", "74.0 K", "102.3", "2 h 40 m")], "first table rows")
-        eq(rows[5], ("day", "Tue 10 Nov", "0", "–", "–", "–", "18 m"), "served-only day row")
-        eq(rows[6], ("model", "swift-1.5-iq3_s", "0", "–", "–", "–", "18 m"), "served-only model row")
+        eq(rows[:4], [("day", "Today", "214", "3.42 M", "186 K", "97.8", "5 h 12 m", "372", "1,240"),
+                      ("model", "swift-1.5-iq3_s", "171", "2.90 M", "151 K", "101.7", "4 h 02 m", "310", "1,258"),
+                      ("model", "swift-1.5-iq3_xxs", "43", "520 K", "35.0 K", "84.1", "1 h 10 m", "62.4", "1,167"),
+                      ("day", "Wed 11 Nov", "96", "1.18 M", "74.0 K", "102.3", "2 h 40 m", "–", "–")],
+           "first table rows")
+        eq(rows[4][-2:], ("–", "–"), "a model row from before energy metering: dashes")
+        eq(rows[5], ("day", "Tue 10 Nov", "0", "–", "–", "–", "18 m", "4.20", "–"), "served-only day row")
+        eq(rows[6], ("model", "swift-1.5-iq3_s", "0", "–", "–", "–", "18 m", "4.20", "–"), "served-only model row")
+        eq(dlg.note_text(), hd.ENERGY_NOTE, "the energy note is shown")
+        check(dlg._note.winfo_ismapped(), "the energy note is mapped")
+        head = [dlg._thead.itemcget(i, "text") for i in dlg._thead.find_all() if dlg._thead.type(i) == "text"]
+        eq(head, list(hd.COLUMNS), "table header draws every column")
+        eq(dlg.logical_width, 620, "the window is 620 px wide")
         eq(len(rows), 9, "4 day rows + 5 model rows in 30 days (every day shows its models)")
         bars = dlg.bar_values()
         eq(len(bars), 30, "bar count 30")
@@ -303,8 +342,9 @@ def test_populated(root) -> Path | None:
         eq(dlg.range_days, None, "All via its button")
         eq(len(dlg.bar_values()), 41, "All: 41 bars (first day with data .. today)")
         eq(dlg.card_texts()["requests"], "327", "All: requests card counts everything")
-        eq(dlg.table_rows()[-2:], [("day", "Sun 4 Oct", "5", "4,000", "800", "90.0", "5 m"),
-                                   ("model", "swift-1.5-iq3_s", "5", "4,000", "800", "90.0", "5 m")],
+        eq(dlg.card_texts()["GPU energy"], "377 Wh", "All: GPU energy card")
+        eq(dlg.table_rows()[-2:], [("day", "Sun 4 Oct", "5", "4,000", "800", "90.0", "5 m", "–", "–"),
+                                   ("model", "swift-1.5-iq3_s", "5", "4,000", "800", "90.0", "5 m", "–", "–")],
            "All: the oldest day is in the table")
         eq(dlg.axis_texts()[0], "4 Oct", "All: axis starts at the first day")
         try:
@@ -325,8 +365,9 @@ def test_empty(root) -> Path | None:
     dlg, closed = open_dialog(root, FakeHistory({}), hidden=False)
     path = None
     try:
-        eq(dlg.card_texts(), {"requests": "0", "generated tokens": "0", "avg tok/s": "–", "served": "–"},
-           "empty cards")
+        eq(dlg.card_texts(), {"requests": "0", "generated tokens": "0", "avg tok/s": "–", "served": "–",
+                              "GPU energy": "–"}, "empty cards")
+        eq(dlg.note_text(), hd.ENERGY_NOTE, "empty: the energy note is still shown")
         eq(dlg.chart_message(), hd.EMPTY_CHART, "empty chart message")
         eq(dlg.table_rows(), [], "no table rows")
         eq(dlg.table_note(), hd.EMPTY_TABLE, "empty table line")
@@ -391,6 +432,46 @@ def test_long_history_scrolls(root) -> Path | None:
         eq(dlg.table_view()[0], 0.0, "a range change scrolls back to the top")
         ok, why = fits(dlg)
         check(ok, f"long-history window still fits: {why}")
+    finally:
+        close_dialog(root, dlg)
+    return path
+
+
+def test_columns_fit(root) -> Path | None:
+    """The widest realistic cell of every column, measured in the table's own fonts: no two columns overlap and the
+    first number column clears the day labels; the wrapped energy note fits its row."""
+    wide = FakeHistory({
+        TODAY - D(days=2): [mu("swift-1.5-iq3_s", 9_999, 999_000, 999_000, 1234.5, 61 * 3600 + 5 * 60,
+                               1234.4, 8.1, 999_000)],
+        TODAY - D(days=3): [mu("m", 1, 10, 10, 10.0, 60, 0.001, 0.001, 10)],
+    })
+    dlg, _closed = open_dialog(root, wide, hidden=False)
+    path = None
+    try:
+        rows = dlg.table_rows()
+        eq(rows[0][2:], ("9,999", "999 K", "999 K", "1,234.5", "61 h 05 m", "1,234", "123,333"), "widest cells")
+        eq(rows[2][-2:], ("< 0.01", "10,000"), "a trace of energy")
+        s = dlg._scale()
+        w = dlg._tbody.winfo_width()
+        rights = dlg._col_rights(w, s)
+        ui = hd.T.ui_family()
+        head_font, cell_font = hd._font(ui, 11, s), hd._font(ui, 12, s)
+        widths = []
+        for k, name in enumerate(hd.COLUMNS[1:]):
+            cells = [r[2 + k] for r in rows]
+            widths.append(max([dlg._measure(head_font, name)] + [dlg._measure(cell_font, c) for c in cells]))
+        gap = 4 * s
+        bad = [f"{hd.COLUMNS[k + 1]} ({rights[k] - widths[k]:.0f}) hits {hd.COLUMNS[k]} ({rights[k - 1]:.0f})"
+               for k in range(1, len(rights)) if rights[k] - widths[k] < rights[k - 1] + gap]
+        day_right = max(hd.DAY_X * s + dlg._measure(cell_font, "Wed 30 Sep"), dlg._measure(head_font, "Day"))
+        if rights[0] - widths[0] < day_right + gap:
+            bad.append(f"Requests ({rights[0] - widths[0]:.0f}) hits the day labels ({day_right:.0f})")
+        check(not bad and rights[-1] <= w, f"columns fit at {w} px without overlapping: {bad or rights}")
+        note_h = dlg._note._label.winfo_reqheight()
+        check(note_h <= round(hd.NOTE_H * s) + 1, f"the energy note fits its {hd.NOTE_H} px row ({note_h} at {s})")
+        ok, why = fits(dlg)
+        check(ok, f"wide-number window content fits: {why}")
+        path = shot(dlg, "wide_numbers")
     finally:
         close_dialog(root, dlg)
     return path
@@ -520,7 +601,7 @@ def run() -> int:
     shots: list[Path] = []
     try:
         for fn in (test_populated, test_empty, test_range_without_data, test_long_history_scrolls,
-                   test_close_paths, test_destroy_master):
+                   test_columns_fit, test_close_paths, test_destroy_master):
             gc.collect()
             print(f"-- {fn.__name__}", flush=True)
             try:

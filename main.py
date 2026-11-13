@@ -614,10 +614,12 @@ class AgentStartApp(ctk.CTk):
         self._fetch_status = status_fetcher if status_fetcher is not None or metrics_fetcher is None \
             else (lambda _root: None)
         self.metrics = MetricsStore()
+        self._energy: Any = None
         self.usage = None                        # usage_history.UsageHistory: per-day / per-model totals (local file)
         try:
             import usage_history
             self.usage = usage_history.UsageHistory()
+            self._energy = usage_history.EnergyMeter()   # GPU energy while serving (metrics worker)
         except Exception:  # noqa: BLE001 - the history is optional: the app works without it
             log.exception("usage history unavailable")
         self._metrics_fails = 0
@@ -1760,16 +1762,25 @@ class AgentStartApp(ctk.CTk):
                         if epoch != self._served_epoch:  # another server run: its model is not the last one's
                             self._flush_served(usage)
                             self._served_epoch, self._served_model = epoch, None
+                        meter = self._energy
+                        fresh = 0
                         if sample is not None:
-                            usage.record(sample, now=time.time())
+                            # requests seen while GPU energy was being counted also count toward tokens per Wh
+                            fresh = usage.record(sample, now=time.time(),
+                                                 metered=meter is not None and meter.metering)
                             if sample.model:             # the same name the requests are counted under
                                 self._served_model = sample.model
-                        if self.state_name == ACTIVE and self.loaded is not False:
+                        serving = self.state_name == ACTIVE and self.loaded is not False
+                        if serving:
                             if served_last is not None:      # capped: sleep / hibernation is not serving time
                                 self._served_acc += min(max(0.0, now - served_last), 5.0)
                             served_last = now
                         else:
                             served_last = None
+                        if meter is not None:                # the whole card's energy, only while serving
+                            live = sample.live if sample is not None else None
+                            busy = fresh > 0 or (live is not None and live.state in ("reading", "generating"))
+                            meter.step(self.vram.energy_j(), now, serving, busy)
                         if self._served_acc >= USAGE_FLUSH_S:
                             self._flush_served(usage)
                             usage.flush()
@@ -1777,6 +1788,8 @@ class AgentStartApp(ctk.CTk):
                     self.post(self._apply_metrics, epoch, sample)
                 else:
                     served_last = None
+                    if self._energy is not None:
+                        self._energy.pause()
                     usage = self.usage
                     mono = time.monotonic()
                     if usage is not None and (self._served_acc > 0 or usage.dirty) \
@@ -1793,6 +1806,10 @@ class AgentStartApp(ctk.CTk):
         acc, self._served_acc = self._served_acc, 0.0
         if acc > 0:
             usage.add_served(self._served_model or self.model_id, acc, now=time.time())
+        if self._energy is not None:
+            wh, busy_wh = self._energy.take()
+            if wh > 0:
+                usage.add_energy(self._served_model or self.model_id, wh, busy_wh, now=time.time())
 
     def _apply_metrics(self, epoch: int, sample: MetricsSample | None) -> None:
         if epoch != self._metrics_epoch or self.state_name not in (ACTIVE, STOPPING):

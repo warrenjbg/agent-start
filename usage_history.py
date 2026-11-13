@@ -1,27 +1,35 @@
 """Local usage history: per day and per model - finished requests, prompt / generated tokens, average generation
-speed and time served - kept in one JSON file (<DATA_DIR>/usage.json). Nothing leaves this PC.
+speed, time served and GPU energy - kept in one JSON file (<DATA_DIR>/usage.json). Nothing leaves this PC.
 
-Fed by the app's metrics worker (`record()` per poll, `add_served()` periodically) and read by the History window
-(`days()`, `totals()`). Engine-neutral: it only reads `engines.base.MetricsSample` / `RequestSample` fields.
+Fed by the app's metrics worker (`record()` per poll, `add_served()` / `add_energy()` periodically) and read by the
+History window (`days()`, `totals()`). Engine-neutral: it only reads `engines.base.MetricsSample` / `RequestSample`
+fields.
 
 File schema (version 1):
 
     {"version": 1,
      "days": {"YYYY-MM-DD": {"<model id>": {"requests": int, "prompt_tokens": int, "generated_tokens": int,
-                                            "decode_s": float, "decode_tokens": int, "served_s": float}}},
+                                            "decode_tokens": int, "gpu_tokens": int, "decode_s": float,
+                                            "served_s": float, "gpu_wh": float, "gpu_busy_wh": float}}},
      "recent": [["<request key>", <request time or null>], ...]}
 
 The day is the LOCAL calendar day of the request's own time (the poll's wall clock when the engine gives none).
 Average speed = decode_tokens / decode_s; a request adds to both only when it has a usable speed AND a token count,
 so the average is token-weighted and requests without a speed do not distort it.
 
+GPU energy (added within version 1: files written before it simply lack the three fields, which read as 0 = "not
+measured"): gpu_wh = watt-hours the WHOLE graphics card used while the engine was serving, gpu_busy_wh = the part of
+it while a reply was running (<= gpu_wh), gpu_tokens = generated tokens of the requests recorded while energy was
+being metered. Tokens per watt-hour = gpu_tokens / gpu_busy_wh, by the same reasoning as decode_tokens / decode_s.
+
 De-duplication: engines return their recent finished requests again on every poll (and all of them on a catch-up
 poll), so each request is counted once by its identity (key, time). The newest identities are kept in memory and the
 newest RECENT_PERSIST of them in the file, so a restart of the app while the same server keeps serving does not
 count the re-read requests again. `begin_session()` (a new server run: keys may repeat) forgets them.
 
-Threading: one state lock; record/add_served/flush/days/totals may be called from any thread. record/add_served only
-mark the history dirty; the caller flushes from a worker thread. Never raises on a bad file or a failed write.
+Threading: one state lock; record/add_served/add_energy/flush/days/totals may be called from any thread.
+record/add_served/add_energy only mark the history dirty; the caller flushes from a worker thread. Never raises on
+a bad file or a failed write.
 """
 from __future__ import annotations
 
@@ -49,9 +57,10 @@ DEFAULT_RETENTION_DAYS = 400
 MAX_SEEN = 5000              # request identities kept in memory per serving session
 RECENT_PERSIST = 1000        # ... of which the newest are saved (Strata keeps <= 500 requests: one catch-up fits)
 
-INT_FIELDS = ("requests", "prompt_tokens", "generated_tokens", "decode_tokens")
-FLOAT_FIELDS = ("decode_s", "served_s")
+INT_FIELDS = ("requests", "prompt_tokens", "generated_tokens", "decode_tokens", "gpu_tokens")
+FLOAT_FIELDS = ("decode_s", "served_s", "gpu_wh", "gpu_busy_wh")
 FIELDS = INT_FIELDS + FLOAT_FIELDS
+WH_FIELDS = ("gpu_wh", "gpu_busy_wh")     # saved with 4 decimals (a few seconds of serving are a few mWh)
 
 Row = dict[str, Any]                 # one model's counters for one day (FIELDS)
 Days = dict[str, dict[str, Row]]     # "YYYY-MM-DD" -> model id -> Row
@@ -84,7 +93,13 @@ def model_key(model: Any) -> str:
 
 def empty_row() -> Row:
     return {"requests": 0, "prompt_tokens": 0, "generated_tokens": 0, "decode_s": 0.0, "decode_tokens": 0,
-            "served_s": 0.0}
+            "served_s": 0.0, "gpu_tokens": 0, "gpu_wh": 0.0, "gpu_busy_wh": 0.0}
+
+
+def joules_to_wh(j: Any) -> float:
+    """Joules -> watt-hours (1 Wh = 3600 J); anything not a finite number >= 0 -> 0.0."""
+    f = _num(j)
+    return f / 3600.0 if f is not None and f > 0 else 0.0
 
 
 def request_ident(req: RequestSample) -> Ident | None:
@@ -97,12 +112,13 @@ def request_ident(req: RequestSample) -> Ident | None:
 
 
 def merge_request(days: Days, req: RequestSample, model: Any, fallback_time: float,
-                  min_day: str | None = None) -> str | None:
+                  min_day: str | None = None, metered: bool = False) -> str | None:
     """Add one finished request to `days` (mutated). Returns the day key it went to (None: older than `min_day`,
     i.e. outside the retention window - not added).
 
     Day = local day of req.time (fallback_time when the request has none). Unknown token counts still count the
-    request; speed counts only with decode_tps > 0 AND generated_tokens > 0 (token-weighted average)."""
+    request; speed counts only with decode_tps > 0 AND generated_tokens > 0 (token-weighted average). metered: GPU
+    energy was being metered when it was seen, so its generated tokens also count toward tokens per watt-hour."""
     t = _num(getattr(req, "time", None))
     day = day_key(t if t is not None else fallback_time)
     if min_day is not None and day < min_day:
@@ -115,6 +131,8 @@ def merge_request(days: Days, req: RequestSample, model: Any, fallback_time: flo
         row["prompt_tokens"] += p
     if g:
         row["generated_tokens"] += g
+        if metered:
+            row["gpu_tokens"] += g
     tps = _num(getattr(req, "decode_tps", None))
     if g and tps is not None and tps > 0:
         row["decode_tokens"] += g
@@ -125,6 +143,66 @@ def merge_request(days: Days, req: RequestSample, model: Any, fallback_time: flo
 def add_seconds(days: Days, model: Any, seconds: float, day: str) -> None:
     """Add serving time to one day's row for `model` (mutated)."""
     days.setdefault(day, {}).setdefault(model_key(model), empty_row())["served_s"] += seconds
+
+
+def add_wh(days: Days, model: Any, wh: float, busy_wh: float, day: str) -> None:
+    """Add GPU energy (watt-hours; already validated, busy_wh <= wh) to one day's row for `model` (mutated)."""
+    row = days.setdefault(day, {}).setdefault(model_key(model), empty_row())
+    row["gpu_wh"] += wh
+    row["gpu_busy_wh"] += busy_wh
+
+
+class EnergyMeter:
+    """Splits a running GPU energy total (joules, e.g. VramSampler.energy_j()) into the energy used while the engine
+    was serving and the part of it used while a reply was running, poll by poll. One worker steps it; take() empties
+    it into the history. Pure: no clock, no I/O.
+
+    Only energy between two consecutive SERVING polls counts, and only when they are at most MAX_GAP_S apart
+    (sleep / hibernation / a stalled worker is not serving time - the same cap as the serving seconds). An interval
+    is 'busy' when a reply was running at either end of it."""
+
+    MAX_GAP_S = 5.0
+
+    def __init__(self) -> None:
+        self._last: tuple[float, float] | None = None    # (time, joules) of the previous serving poll
+        self._busy = False                               # a reply was running at that poll
+        self._wh = 0.0
+        self._busy_wh = 0.0
+
+    @property
+    def metering(self) -> bool:
+        """The previous poll left a baseline: the energy used since then is being counted."""
+        return self._last is not None
+
+    def pause(self) -> None:
+        """Not serving (or no reading): the next serving poll starts a new baseline and adds nothing."""
+        self._last, self._busy = None, False
+
+    def step(self, joules: Any, now: Any, serving: bool, busy: bool) -> float:
+        """One poll. Returns the watt-hours it added (0.0 for the first poll, a long gap, a total that did not
+        grow, junk)."""
+        j, t = _num(joules), _num(now)
+        if j is None or t is None or not serving:
+            self.pause()
+            return 0.0
+        prev, was_busy = self._last, self._busy
+        self._last, self._busy = (t, j), bool(busy)
+        if prev is None:
+            return 0.0
+        dt, dj = t - prev[0], j - prev[1]
+        if not 0 < dt <= self.MAX_GAP_S or dj <= 0:
+            return 0.0
+        wh = dj / 3600.0
+        self._wh += wh
+        if busy or was_busy:
+            self._busy_wh += wh
+        return wh
+
+    def take(self) -> tuple[float, float]:
+        """(watt-hours while serving, the part while a reply was running) collected since the last take()."""
+        out = (self._wh, min(self._busy_wh, self._wh))
+        self._wh = self._busy_wh = 0.0
+        return out
 
 
 def retention_cutoff(today: _dt.date, retention_days: int) -> str:
@@ -192,10 +270,11 @@ def parse_doc(doc: Any) -> tuple[Days, list[Ident]]:
 
 
 def build_doc(days: Days, recent: Iterable[Ident]) -> dict:
-    """The document flush() writes (floats rounded to keep the file small)."""
+    """The document flush() writes (floats rounded to keep the file small: 3 decimals, watt-hours 4)."""
     out: dict[str, dict[str, Row]] = {}
     for day in sorted(days):
-        out[day] = {m: {f: (round(r[f], 3) if f in FLOAT_FIELDS else int(r[f])) for f in FIELDS}
+        out[day] = {m: {f: (round(r[f], 4 if f in WH_FIELDS else 3) if f in FLOAT_FIELDS else int(r[f]))
+                        for f in FIELDS}
                     for m, r in sorted(days[day].items())}
     return {"version": VERSION, "days": out, "recent": [[k, t] for k, t in recent]}
 
@@ -203,17 +282,32 @@ def build_doc(days: Days, recent: Iterable[Ident]) -> dict:
 # ------------------------------------------------------------------------------------------------ read model
 @dataclass(frozen=True)
 class Usage:
-    """Counters over some span. decode_tps = token-weighted average generation speed (None: no usable speed)."""
+    """Counters over some span. decode_tps = token-weighted average generation speed (None: no usable speed).
+    gpu_wh / gpu_busy_wh: watt-hours of the whole graphics card while serving / while a reply ran (0 = not
+    measured, e.g. days from before energy metering); gpu_tokens: generated tokens recorded while metering."""
     requests: int = 0
     prompt_tokens: int = 0
     generated_tokens: int = 0
     decode_s: float = 0.0
     decode_tokens: int = 0
     served_s: float = 0.0
+    gpu_tokens: int = 0
+    gpu_wh: float = 0.0
+    gpu_busy_wh: float = 0.0
 
     @property
     def decode_tps(self) -> float | None:
         return self.decode_tokens / self.decode_s if self.decode_tokens > 0 and self.decode_s > 0 else None
+
+    @property
+    def tokens_per_wh(self) -> float | None:
+        """Generated tokens per watt-hour of the energy used while replies ran (None: not measured)."""
+        return self.gpu_tokens / self.gpu_busy_wh if self.gpu_tokens > 0 and self.gpu_busy_wh > 0 else None
+
+    @property
+    def has_energy(self) -> bool:
+        """Any GPU energy recorded for this span."""
+        return self.gpu_wh > 0
 
 
 @dataclass(frozen=True)
@@ -431,9 +525,11 @@ class UsageHistory:
                 self._dirty = True
         log.debug("usage history: new session (%s)", model_key(model))
 
-    def record(self, sample: MetricsSample | None, now: float | None = None) -> int:
+    def record(self, sample: MetricsSample | None, now: float | None = None, metered: bool = False) -> int:
         """Count the sample's finished requests not counted before. `now`: WALL-clock epoch seconds of the poll
-        (time.time(), not monotonic) - the day of requests without a time of their own. Returns how many were new."""
+        (time.time(), not monotonic) - the day of requests without a time of their own. metered=True: GPU energy is
+        being metered for this serving run, so the new requests' generated tokens also go to gpu_tokens (the
+        numerator of tokens per watt-hour). Returns how many were new."""
         if sample is None:
             return 0
         reqs = getattr(sample, "requests", None) or ()
@@ -454,7 +550,7 @@ class UsageHistory:
                     self._seen.move_to_end(ident)      # still being reported: keep it among the newest
                     continue
                 self._seen[ident] = None
-                if merge_request(self._days, r, model, fallback, min_day) is not None:
+                if merge_request(self._days, r, model, fallback, min_day, metered=metered) is not None:
                     added += 1
             while len(self._seen) > self._max_seen:
                 self._seen.popitem(last=False)
@@ -472,6 +568,24 @@ class UsageHistory:
         day = day_key(t if t is not None else self._clock())
         with self._lock:
             add_seconds(self._days, model, s, day)
+            self._dirty = True
+
+    def add_energy(self, model: str | None, wh: float, busy_wh: float, now: float | None = None) -> None:
+        """Add GPU energy in watt-hours to the day of `now` (default: the clock) for `model` (None -> '(unknown)'):
+        `wh` while the engine was serving, `busy_wh` the part of it while a reply was running (clamped to `wh`).
+        A non-finite or negative `wh` is ignored (the whole call); such a `busy_wh` counts as 0. Call it at short
+        intervals like add_served: each call goes to one day."""
+        w = _num(wh)
+        if w is None or w < 0:
+            return
+        b = _num(busy_wh)
+        b = min(b, w) if b is not None and b > 0 else 0.0
+        if w <= 0:
+            return
+        t = _num(now)
+        day = day_key(t if t is not None else self._clock())
+        with self._lock:
+            add_wh(self._days, model, w, b, day)
             self._dirty = True
 
     # ------------------------------------------------------------------ reads

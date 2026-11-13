@@ -424,17 +424,208 @@ def test_vram_sampler() -> None:
           f"thread samples on its interval and shuts NVML down on stop ({len(s.snapshot().samples)} samples)")
 
 
+def energy_nvml(counter: bool = True, power: bool = True, counter_raises: bool = False):
+    """fake_nvml plus the two energy calls, driven by `st`: st['mj'] (counter, millijoules), st['mw'] (power,
+    milliwatts), st['mem_fail'] (the memory read raises), st['counter_fail'] / st['power_fail'] (that call raises)."""
+    mod, calls = fake_nvml([4.0])
+    st = {"mj": 1_000_000.0, "mw": 150_000.0, "mem_fail": False, "counter_fail": counter_raises, "power_fail": False}
+    mem = mod.nvmlDeviceGetMemoryInfo
+
+    def mem2(h):
+        if st["mem_fail"] and h == "big":
+            raise RuntimeError("NVML_ERROR_GPU_IS_LOST")
+        return mem(h)
+
+    def energy(h):
+        calls["energy"] = calls.get("energy", 0) + 1
+        if st["counter_fail"]:
+            raise RuntimeError("NVML_ERROR_NOT_SUPPORTED")
+        return int(st["mj"])
+
+    def pw(h):
+        if st["power_fail"]:
+            raise RuntimeError("NVML_ERROR_NOT_SUPPORTED")
+        return int(st["mw"])
+
+    mod.nvmlDeviceGetMemoryInfo = mem2
+    if counter:
+        mod.nvmlDeviceGetTotalEnergyConsumption = energy
+    if power:
+        mod.nvmlDeviceGetPowerUsage = pw
+    return mod, calls, st
+
+
+def close(a: float | None, b: float) -> bool:
+    return a is not None and abs(a - b) < 1e-6
+
+
+def test_vram_energy() -> None:
+    # --- fakes without energy calls (the existing fake, NVML missing): no energy, VRAM sampling unchanged
+    mod, _calls = fake_nvml([4.0, 5.0])
+    clock = Clock()
+    s = vs.VramSampler(nvml=mod, clock=clock)
+    check(s.energy_j() is None and s.energy_source == "" and s.power_w() is None, "before any sample: no energy")
+    for _ in range(3):
+        s.sample_once()
+        clock.t += 2
+    check(s.energy_j() is None and s.energy_source == "" and s.power_w() is None
+          and [round(v) for _t, v in s.snapshot().samples] == [4096, 5120, 5120],
+          "fake without power functions: energy_j None, source '', VRAM samples unchanged")
+    def no_dll():
+        raise OSError("nvml.dll not found")
+    s = vs.VramSampler(nvml=types.SimpleNamespace(nvmlInit=no_dll, nvmlShutdown=lambda: None), clock=Clock())
+    s.sample_once()
+    check(s.energy_j() is None and s.energy_source == "", "NVML missing: energy_j None")
+    mod, _calls, st = energy_nvml(counter_raises=True, power=False)
+    s = vs.VramSampler(nvml=mod, clock=Clock())
+    s.sample_once()
+    check(s.energy_j() is None and s.energy_source == "" and s.snapshot().available is True,
+          "counter raising and no power call: energy_j None, VRAM still sampled")
+
+    # --- counter source: deltas, first reading, backwards counter, implausible step
+    mod, calls, st = energy_nvml()
+    clock = Clock()
+    s = vs.VramSampler(nvml=mod, clock=clock, interval_s=2.0)
+    s.sample_once()
+    check(s.energy_source == "counter" and s.energy_j() == 0.0, "counter: first reading adds nothing (0.0, not None)")
+    check(close(s.power_w(), 150.0), f"power_w = the power reading in W ({s.power_w()})")
+    clock.t += 2; st["mj"] += 300_000; s.sample_once()
+    check(close(s.energy_j(), 300.0), f"counter delta 300,000 mJ -> 300 J ({s.energy_j()})")
+    clock.t += 2; st["mj"] = 5_000.0; s.sample_once()
+    check(close(s.energy_j(), 300.0), "counter went backwards (driver restart): adds nothing")
+    clock.t += 2; st["mj"] += 200_000; s.sample_once()
+    check(close(s.energy_j(), 500.0), "after a backwards step the new value is the baseline")
+    clock.t += 2; st["mj"] += 10_000_000; s.sample_once()                 # 10 kJ in 2 s = 5000 W
+    check(close(s.energy_j(), 500.0), "a step implying > 2000 W is dropped")
+    clock.t += 30; st["mj"] += 900_000; s.sample_once()                   # 30 W over a long gap: real energy
+    check(close(s.energy_j(), 1400.0), "counter: a long gap still counts (the card measured it)")
+    clock.t += 7
+    check(s.power_w() is None, "power_w None when the latest reading is older than 3 intervals")
+    check(calls["init"] == 1, "energy uses the same NVML session (one init)")
+
+    # --- counter without a power call: power_w is the counter's average
+    mod, _calls, st = energy_nvml(power=False)
+    clock = Clock()
+    s = vs.VramSampler(nvml=mod, clock=clock)
+    s.sample_once()
+    check(s.power_w() is None, "counter only, first reading: no power figure yet")
+    clock.t += 2; st["mj"] += 240_000; s.sample_once()
+    check(s.energy_source == "counter" and close(s.power_w(), 120.0), f"counter only: power_w = 240 J / 2 s "
+          f"({s.power_w()})")
+
+    # --- counter fails later: that step adds nothing, re-decided (no energy across the failure)
+    mod, _calls, st = energy_nvml()
+    clock = Clock()
+    s = vs.VramSampler(nvml=mod, clock=clock)
+    s.sample_once(); clock.t += 2; st["mj"] += 100_000; s.sample_once()
+    st["counter_fail"] = True; clock.t += 2; st["mj"] += 100_000
+    check(s.sample_once() is True and close(s.energy_j(), 100.0) and s.energy_source == "",
+          "a failing counter read: VRAM sample kept, nothing added, source undecided")
+    clock.t += 2; s.sample_once()
+    check(s.energy_source == "power" and close(s.energy_j(), 100.0), "re-decided: counter still failing -> power, "
+          "first power reading adds nothing")
+    st["counter_fail"] = False; st["power_fail"] = True; clock.t += 2; s.sample_once()
+    clock.t += 2; st["mj"] += 50_000; s.sample_once()
+    check(s.energy_source == "counter" and close(s.energy_j(), 100.0),
+          "power fails too -> re-decided to the counter, its first reading adds nothing")
+
+    # --- power fallback: counter missing / raising
+    for label, kw in (("counter missing", {"counter": False}), ("counter raising", {"counter_raises": True})):
+        mod, _calls, st = energy_nvml(**kw)
+        clock = Clock()
+        s = vs.VramSampler(nvml=mod, clock=clock, interval_s=2.0)
+        s.sample_once()
+        check(s.energy_source == "power" and s.energy_j() == 0.0, f"{label}: power fallback, first reading adds 0")
+        clock.t += 2; s.sample_once()
+        check(close(s.energy_j(), 300.0), f"{label}: 150 W x 2 s = 300 J ({s.energy_j()})")
+        clock.t += 2; st["mw"] = 100_000; s.sample_once()
+        check(close(s.energy_j(), 500.0), f"{label}: the new reading x the time since the previous sample")
+        clock.t += 6.5; s.sample_once()                                   # > 3 intervals: sleep / stalled thread
+        check(close(s.energy_j(), 500.0), f"{label}: a gap longer than 3 intervals adds nothing")
+        clock.t += 6; s.sample_once()                                     # exactly 3 intervals: still counted
+        check(close(s.energy_j(), 1100.0), f"{label}: a gap of 3 intervals counts ({s.energy_j()})")
+        clock.t += 2; st["mw"] = 2_500_000; s.sample_once()
+        check(close(s.energy_j(), 1100.0) and close(s.power_w(), 100.0),
+              f"{label}: a 2500 W reading is dropped (and not shown as power)")
+        clock.t += 2; st["mw"] = 100_000; s.sample_once()
+        check(close(s.energy_j(), 1300.0), f"{label}: integration continues after the dropped step")
+
+    # --- the memory read fails: NVML re-init, the source re-decided, nothing counted across the outage
+    mod, calls, st = energy_nvml()
+    clock = Clock()
+    s = vs.VramSampler(nvml=mod, clock=clock, retry_s=30.0)
+    s.sample_once(); clock.t += 2; st["mj"] += 200_000; s.sample_once()
+    st["mem_fail"] = True; clock.t += 2; st["mj"] += 200_000
+    check(s.sample_once() is False and close(s.energy_j(), 200.0) and s.energy_source == "",
+          "failed read: energy kept, nothing added, source undecided until re-init")
+    st["mem_fail"] = False; clock.t += 31; st["mj"] += 5_000_000; s.sample_once()
+    check(calls["init"] == 2 and s.energy_source == "counter" and close(s.energy_j(), 200.0),
+          "after the re-init the first reading is a new baseline (the outage's energy is not guessed)")
+    clock.t += 2; st["mj"] += 100_000; s.sample_once()
+    check(close(s.energy_j(), 300.0), "after the re-init deltas count again")
+    mod, calls, st = energy_nvml(counter=False)
+    clock = Clock()
+    s = vs.VramSampler(nvml=mod, clock=clock, retry_s=1.0)
+    s.sample_once(); clock.t += 2; s.sample_once()
+    st["mem_fail"] = True; clock.t += 2; s.sample_once()
+    st["mem_fail"] = False; clock.t += 2; s.sample_once()
+    check(calls["init"] == 2 and s.energy_source == "power" and close(s.energy_j(), 300.0),
+          "power fallback: the reading right after a re-init adds nothing")
+
+    # --- monotonic under a jittery counter / power series, read from another thread while sampling
+    import random
+    rnd = random.Random(7)
+    for kw in ({}, {"counter": False}):
+        mod, _calls, st = energy_nvml(**kw)
+        clock = Clock()
+        s = vs.VramSampler(nvml=mod, clock=clock)
+        seen: list[float] = []
+        for _ in range(300):
+            clock.t += rnd.choice((0.0, 0.5, 2.0, 2.0, 2.0, 9.0))
+            st["mj"] = max(0.0, st["mj"] + rnd.choice((-500_000, 0, 50_000, 300_000, 9_000_000)))
+            st["mw"] = rnd.choice((0, 50_000, 300_000, 5_000_000))
+            st["power_fail"] = rnd.random() < 0.05
+            s.sample_once()
+            e = s.energy_j()
+            seen.append(-1.0 if e is None else e)
+        check(all(b >= a for a, b in zip(seen, seen[1:])) and seen[-1] > 0,
+              f"energy_j never decreases ({'power' if kw else 'counter'} source, 300 jittery steps)")
+    mod, _calls, st = energy_nvml()
+    s = vs.VramSampler(nvml=mod, interval_s=0.02)
+    reads: list[float | None] = []
+    s.start()
+    t_end = time.monotonic() + 0.3
+    while time.monotonic() < t_end:
+        st["mj"] += 1_000
+        reads.append(s.energy_j())
+        time.sleep(0.002)
+    s.stop()
+    vals = [r for r in reads if r is not None]
+    check(bool(vals) and all(b >= a for a, b in zip(vals, vals[1:])) and s.energy_j() is not None
+          and not s._thread.is_alive(), f"energy_j read from another thread while the sampler runs ({len(vals)} reads)")
+
+
 def test_real_nvml_smoke() -> None:
     """Read-only smoke test of the real NVML path on this machine (skipped if there is no NVIDIA driver)."""
     s = vs.VramSampler()
     ok = s.sample_once()
     snap = s.snapshot()
+    if ok:
+        time.sleep(0.5)
+        s.sample_once()
+    e, p, src = s.energy_j(), s.power_w(), s.energy_source      # before stop(): a shutdown resets the source
     s.stop()
     if not ok:
         print(f"[SKIP] real NVML not available here (available={snap.available})")
         return
     check(snap.total_mb and snap.total_mb > 1024 and 0 <= snap.samples[-1][1] <= snap.total_mb,
           f"real NVML: {snap.samples[-1][1] / 1024:.1f} / {snap.total_mb / 1024:.1f} GB")
+    if src:
+        check(e is not None and 0 <= e < vs.MAX_PLAUSIBLE_W * 2.5,
+              f"real NVML energy ({src}): {e if e is None else round(e, 1)} J over ~0.5 s, "
+              f"power {p if p is None else round(p, 1)} W")
+    else:
+        print("[SKIP] this card reports neither an energy counter nor power")
 
 
 def test_graph_helpers() -> None:
@@ -556,7 +747,7 @@ def test_activity() -> None:
 
 def main() -> int:
     for fn in (test_activity, test_rates, test_accumulation, test_live, test_stale_prefill_mean, test_parallel_live,
-               test_catchup_and_model_change, test_fetch, test_vram_sampler, test_real_nvml_smoke,
+               test_catchup_and_model_change, test_fetch, test_vram_sampler, test_vram_energy, test_real_nvml_smoke,
                test_graph_helpers, test_bar_graph_render, test_version_consistency):
         print(f"-- {fn.__name__}")
         try:

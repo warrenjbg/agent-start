@@ -93,7 +93,8 @@ def test_pure_helpers() -> None:
     uh.merge_request(days, rq("b", t, None, None, None), "m1", NOW)
     row = days["2026-11-12"]["m1"]
     check(row == {"requests": 2, "prompt_tokens": 1000, "generated_tokens": 100, "decode_s": 2.0,
-                  "decode_tokens": 100, "served_s": 0.0}, f"merge sums one row without a file: {row}")
+                  "decode_tokens": 100, "served_s": 0.0, "gpu_tokens": 0, "gpu_wh": 0.0, "gpu_busy_wh": 0.0},
+          f"merge sums one row without a file: {row}")
     uh.merge_request(days, rq("c", None), None, t)
     check(days["2026-11-12"]["(unknown)"]["requests"] == 1, "model None -> '(unknown)', time None -> fallback day")
     check(uh.model_key("  ") == "(unknown)" and uh.model_key(" x ") == "x", "model_key normalises")
@@ -474,7 +475,9 @@ def test_large_file_speed() -> None:
         for m in ("swift-1.5-iq3_s", "qwen-iq2_xs", "coder-iq1_m"):
             h._days.setdefault(d.isoformat(), {})[m] = {"requests": 120, "prompt_tokens": 2_000_000,
                                                         "generated_tokens": 90_000, "decode_s": 1000.123,
-                                                        "decode_tokens": 90_000, "served_s": 30000.5}
+                                                        "decode_tokens": 90_000, "served_s": 30000.5,
+                                                        "gpu_tokens": 90_000, "gpu_wh": 2345.6789,
+                                                        "gpu_busy_wh": 300.1234}
     h.record(sample("m", *[rq(f"r{i}", NOW - i) for i in range(1000)]))
     t0 = time.perf_counter()
     h.flush()
@@ -497,6 +500,258 @@ def test_large_file_speed() -> None:
     check(t_load < 500 and t_flush < 500 and t_flush2 < 500 and t_read < 500, "load / flush / read well under 0.5 s")
 
 
+def _near(a: float, b: float, eps: float = 1e-9) -> bool:
+    return abs(a - b) < eps
+
+
+def test_energy_old_file() -> None:
+    path = fresh()
+    old = {"version": 1, "days": {"2026-11-12": {"m": {"requests": 4, "prompt_tokens": 100, "generated_tokens": 50,
+                                                         "decode_s": 1.5, "decode_tokens": 40, "served_s": 600.0}}},
+           "recent": [["a", 1.0]]}
+    path.write_text(json.dumps(old))
+    h = UsageHistory(path, clock=clock)
+    u = h.totals().total
+    check(u.requests == 4 and u.prompt_tokens == 100 and u.generated_tokens == 50 and u.decode_tokens == 40
+          and _near(u.decode_s, 1.5) and _near(u.served_s, 600.0), "old-format file: every old number kept")
+    check(u.gpu_wh == 0.0 and u.gpu_busy_wh == 0.0 and u.gpu_tokens == 0 and not u.has_energy
+          and u.tokens_per_wh is None, "old-format file: energy fields read as zero, no energy, no tok/Wh")
+    check(not h.dirty and not path.with_name("usage.json.bad").exists() and h.record(sample("m", rq("a", 1.0))) == 0,
+          "old-format file: not set aside, not dirty, its saved keys still known")
+    h.add_served("m", 1.0, now=local(2026, 11, 12, 13))
+    check(h.flush() is True, "old-format file: saved after a change")
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    row = doc["days"]["2026-11-12"]["m"]
+    check(doc["version"] == 1 and row["requests"] == 4 and row["generated_tokens"] == 50 and row["served_s"] == 601.0
+          and row["decode_s"] == 1.5, "saved: version still 1, old numbers kept")
+    check(row["gpu_wh"] == 0.0 and row["gpu_busy_wh"] == 0.0 and row["gpu_tokens"] == 0
+          and isinstance(row["gpu_tokens"], int), "saved: the new fields are written (as 0)")
+    # a row with only some of the new fields: the missing ones read as 0
+    path2 = fresh()
+    path2.write_text(json.dumps({"version": 1, "days": {"2026-11-13": {"m": {"requests": 1, "gpu_wh": 2.5}}}}))
+    u2 = UsageHistory(path2, clock=clock).totals().total
+    check(u2.requests == 1 and u2.gpu_wh == 2.5 and u2.gpu_busy_wh == 0.0 and u2.gpu_tokens == 0 and u2.has_energy
+          and u2.tokens_per_wh is None, "partial energy fields: the missing ones are 0")
+
+
+def test_energy_round_trip_and_junk() -> None:
+    days: dict = {}
+    uh.merge_request(days, rq("a", NOW, 50.0, 10, 400), "m", NOW, metered=True)
+    uh.add_wh(days, "m", 1.23456789, 0.98765432, "2026-11-13")
+    doc = uh.build_doc(days, [])
+    row = doc["days"]["2026-11-13"]["m"]
+    check(row["gpu_wh"] == 1.2346 and row["gpu_busy_wh"] == 0.9877 and row["gpu_tokens"] == 400,
+          f"build_doc writes the energy fields, watt-hours rounded to 4 decimals ({row})")
+    back, _recent = uh.parse_doc(json.loads(json.dumps(doc)))
+    r2 = back["2026-11-13"]["m"]
+    check(r2["gpu_wh"] == 1.2346 and r2["gpu_busy_wh"] == 0.9877 and r2["gpu_tokens"] == 400
+          and isinstance(r2["gpu_tokens"], int), "parse_doc reads them back")
+    path = fresh()
+    h = UsageHistory(path, clock=clock)
+    h.record(sample("m", rq("a", NOW, 50.0, 10, 400)), now=NOW, metered=True)
+    h.add_energy("m", 1.23456789, 0.5, now=NOW)
+    h.flush()
+    u = UsageHistory(path, clock=clock).totals().total
+    check(u.gpu_tokens == 400 and _near(u.gpu_wh, 1.2346) and _near(u.gpu_busy_wh, 0.5)
+          and u.tokens_per_wh is not None and _near(u.tokens_per_wh, 800.0), "file round trip of the energy fields")
+    good_row = {"requests": 1, "prompt_tokens": 1, "generated_tokens": 1, "decode_s": 1.0, "decode_tokens": 1,
+                "served_s": 1.0, "gpu_tokens": 1, "gpu_wh": 1.0, "gpu_busy_wh": 0.5}
+
+    def doc_with(**over) -> str:
+        return json.dumps({"version": 1, "days": {"2026-11-13": {"m": dict(good_row, **over)}}, "recent": []})
+
+    ok_path = fresh()
+    ok_path.write_text(doc_with())
+    check(UsageHistory(ok_path, clock=clock).totals().total.gpu_tokens == 1, "a valid row with energy loads")
+    for field in ("gpu_wh", "gpu_busy_wh", "gpu_tokens"):
+        for junk in (-1, "1", None, True, [], {}):
+            _bad_case(doc_with(**{field: junk}), f"{field} = {junk!r}")
+    _bad_case(doc_with(gpu_tokens=1.5), "fractional gpu_tokens")
+    _bad_case(doc_with(gpu_wh="NaN"), "gpu_wh as text NaN")
+
+
+def test_add_energy() -> None:
+    path = fresh()
+    h = UsageHistory(path, clock=clock)
+    h.add_energy("m", 2.0, 1.5)                                 # now = the clock
+    h.add_energy("m", 1.0, 0.25, now=NOW + 10)
+    h.add_energy(None, 0.5, 0.1, now=NOW)
+    h.add_energy("m", 3.0, 1.0, now=local(2026, 11, 12, 22))
+    h.add_energy("other", 0.4, 0.4, now=local(2026, 11, 12, 23, 59, 59))
+    h.add_energy("m", 1.0, 5.0, now=NOW)                         # busy > wh: clamped to wh
+    h.add_energy("m", 1.0, float("nan"), now=NOW)                # bad busy: wh counts, busy 0
+    h.add_energy("m", 1.0, -2.0, now=NOW)
+    rows = {r.date.isoformat(): r for r in h.days()}
+    m13 = {m.model: m for m in rows["2026-11-13"].models}
+    check(_near(m13["m"].gpu_wh, 6.0) and _near(m13["m"].gpu_busy_wh, 2.75),
+          f"energy adds up per day and model, busy clamped ({m13['m'].gpu_wh}, {m13['m'].gpu_busy_wh})")
+    check(_near(m13["(unknown)"].gpu_wh, 0.5) and m13["(unknown)"].requests == 0, "model None -> '(unknown)' row")
+    m12 = {m.model: m for m in rows["2026-11-12"].models}
+    check(_near(m12["m"].gpu_wh, 3.0) and _near(m12["other"].gpu_busy_wh, 0.4) and _near(rows["2026-11-12"].total.gpu_wh,
+          3.4), "energy goes to the LOCAL day of now (23:59:59 stays on its day)")
+    before = h.totals().total
+    for wh, busy in ((-1.0, 0.5), (float("nan"), 0.5), (float("inf"), 0.0), (float("-inf"), 0.0), (0.0, 0.0),
+                     (0.0, 1.0), ("1", 0.5), (True, 0.5), (None, 0.5)):
+        h.add_energy("m", wh, busy, now=NOW)
+    after = h.totals().total
+    check(after.gpu_wh == before.gpu_wh and after.gpu_busy_wh == before.gpu_busy_wh,
+          "negative / non-finite / zero / non-number wh ignored")
+    check(all(m.gpu_busy_wh <= m.gpu_wh + 1e-12 for r in h.days() for m in r.models), "busy <= wh in every row")
+    h2 = UsageHistory(fresh(), clock=clock)
+    h2.add_energy("m", float("nan"), 1.0, now=NOW)
+    h2.add_energy("m", 0.0, 0.0, now=NOW)
+    check(not h2.dirty, "ignored calls do not dirty the history")
+    h2.add_energy("m", 0.001, 0.0, now=NOW)
+    check(h2.dirty, "a valid add_energy dirties it")
+    h.flush()
+    u = UsageHistory(path, clock=clock).totals().total
+    check(_near(u.gpu_wh, 9.9, 1e-6) and _near(u.gpu_busy_wh, 4.25, 1e-6), f"energy persisted ({u.gpu_wh})")
+    # threads: exact sum under the lock
+    h3 = UsageHistory(fresh(), clock=clock)
+
+    def worker() -> None:
+        for _ in range(500):
+            h3.add_energy("m", 0.25, 0.125, now=NOW)
+
+    ths = [threading.Thread(target=worker) for _ in range(4)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    u3 = h3.totals().total
+    check(u3.gpu_wh == 500.0 and u3.gpu_busy_wh == 250.0, f"4 threads x 500 add_energy: exact sums ({u3.gpu_wh})")
+
+
+def test_record_metered() -> None:
+    h = UsageHistory(fresh(), clock=clock)
+    n = h.record(sample("m", rq("a", NOW - 60, 50.0, 100, 1000), rq("b", NOW - 50, None, 10, 200)), now=NOW)
+    n += h.record(sample("m", rq("e", NOW - 45, 50.0, 100, 7)), now=NOW, metered=False)
+    u = h.totals().total
+    check(n == 3 and u.generated_tokens == 1207 and u.gpu_tokens == 0, "default / metered=False: no gpu_tokens")
+    n = h.record(sample("m", rq("c", NOW - 40, 50.0, 100, 300), rq("d", NOW - 30, None, None, None),
+                        rq("f", NOW - 20, None, 5, 20)), now=NOW, metered=True)
+    u = h.totals().total
+    check(n == 3 and u.generated_tokens == 1527 and u.gpu_tokens == 320 and u.requests == 6,
+          "metered=True: new requests' generated tokens also go to gpu_tokens (with or without a speed)")
+    h.record(sample("m", rq("a", NOW - 60, 50.0, 100, 1000), rq("c", NOW - 40, 50.0, 100, 300)), now=NOW, metered=True)
+    check(h.totals().total.gpu_tokens == 320, "a repeat of counted requests adds nothing, metered or not")
+    h.record(sample("m", rq("old", local(2026, 11, 12, 9), None, 1, 50)), now=NOW, metered=True)
+    rows = {r.date.isoformat(): r.total for r in h.days()}
+    check(rows["2026-11-12"].gpu_tokens == 50 and rows["2026-11-13"].gpu_tokens == 320,
+          "gpu_tokens go to the request's own day, like generated_tokens")
+    days: dict = {}
+    uh.merge_request(days, rq("x", NOW, None, 1, 9), "m", NOW)
+    uh.merge_request(days, rq("y", NOW, None, 1, 11), "m", NOW, metered=True)
+    check(days["2026-11-13"]["m"]["gpu_tokens"] == 11, "merge_request(metered=...)")
+
+
+def test_energy_meter() -> None:
+    m = uh.EnergyMeter()
+    check(not m.metering and m.take() == (0.0, 0.0), "a new meter: nothing, not metering")
+    check(m.step(1000.0, 10.0, True, False) == 0.0 and m.metering, "the first serving poll only sets the baseline")
+    check(abs(m.step(1360.0, 11.0, True, False) - 0.1) < 1e-9, "360 J between two serving polls = 0.1 Wh")
+    m.step(1720.0, 12.0, True, True)             # the reply started in this interval
+    m.step(2080.0, 13.0, True, False)            # ... and ended in this one: both count as busy
+    m.step(2440.0, 14.0, True, False)
+    wh, busy = m.take()
+    check(abs(wh - 0.4) < 1e-9 and abs(busy - 0.2) < 1e-9, f"serving 0.4 Wh, of it 0.2 Wh with a reply ({wh}, {busy})")
+    check(m.take() == (0.0, 0.0) and m.metering, "take() empties the totals and keeps the baseline")
+    check(m.step(2440.0, 15.0, True, True) == 0.0, "a total that did not grow (the sampler is slower) adds nothing")
+    check(abs(m.step(2800.0, 16.0, True, False) - 0.1) < 1e-9 and abs(m.take()[1] - 0.1) < 1e-9,
+          "...and the next growth counts as busy: the reply was running at the poll before")
+    check(m.step(999999.0, 30.0, True, True) == 0.0 and m.take() == (0.0, 0.0),
+          "a gap longer than 5 s (sleep, a stalled worker) adds nothing")
+    check(abs(m.step(999999.0 + 36.0, 35.0, True, False) - 0.01) < 1e-9, "exactly 5 s still counts")
+    m.take()
+    check(m.step(5.0, 36.0, True, False) == 0.0 and m.step(41.0, 37.0, True, False) > 0,
+          "a total that went backwards adds nothing and becomes the new baseline")
+    m.take()
+    check(m.step(100.0, 38.0, False, True) == 0.0 and not m.metering, "not serving: nothing, baseline dropped")
+    check(m.step(460.0, 39.0, True, True) == 0.0 and m.metering and m.take() == (0.0, 0.0),
+          "serving again: the energy used while it was not serving is never counted")
+    for junk in (None, "5", True, float("nan"), float("inf")):
+        m.step(500.0, 40.0, True, False)
+        check(m.step(junk, 41.0, True, False) == 0.0 and not m.metering, f"no reading ({junk!r}): baseline dropped")
+        m.step(500.0, 40.0, True, False)
+        check(m.step(900.0, junk, True, False) == 0.0 and not m.metering, f"junk time ({junk!r}): baseline dropped")
+    m.take()                                     # the loop's first step followed a serving poll: it counted
+    check(m.step(900.0, 39.0, True, False) == 0.0 and m.step(1000.0, 38.0, True, False) == 0.0 and m.take() == (0.0, 0.0),
+          "time going backwards adds nothing")
+    m.pause()
+    check(not m.metering, "pause()")
+    # into the history, the way the app does it
+    h = UsageHistory(fresh(), clock=clock)
+    m = uh.EnergyMeter()
+    for i, (j, busy) in enumerate(((0.0, False), (3600.0, True), (7200.0, False), (10800.0, False))):
+        metered = m.metering
+        m.step(j, 100.0 + i, True, busy)
+        if i == 2:
+            h.record(sample("m", rq("r", NOW, 50.0, 10, 500)), now=NOW, metered=metered)
+    h.add_energy("m", *m.take(), now=NOW)
+    u = h.totals().total
+    check(abs(u.gpu_wh - 3.0) < 1e-9 and abs(u.gpu_busy_wh - 2.0) < 1e-9 and u.gpu_tokens == 500
+          and u.tokens_per_wh == 250.0, f"meter -> history: 3 Wh, 2 Wh busy, 250 tok/Wh ({u.gpu_wh}, {u.gpu_busy_wh})")
+
+
+def test_energy_read_model() -> None:
+    U = uh.Usage
+    check(U(gpu_tokens=1000, gpu_busy_wh=0.5, gpu_wh=1.0).tokens_per_wh == 2000.0
+          and U(gpu_wh=1.0).has_energy, "tokens_per_wh = gpu_tokens / gpu_busy_wh; has_energy = gpu_wh > 0")
+    check(U(gpu_wh=1.0, gpu_busy_wh=0.0, gpu_tokens=10).tokens_per_wh is None
+          and U(gpu_wh=1.0, gpu_busy_wh=0.5).tokens_per_wh is None and U(gpu_tokens=10).tokens_per_wh is None,
+          "tokens_per_wh None without busy energy or without tokens")
+    check(not U().has_energy and not U(gpu_tokens=5, gpu_busy_wh=0.0).has_energy and U().tokens_per_wh is None,
+          "no energy: has_energy False")
+    mu = uh.ModelUsage(model="x", gpu_wh=2.0, gpu_busy_wh=1.0, gpu_tokens=300)
+    check(mu.has_energy and mu.tokens_per_wh == 300.0 and mu.model == "x", "ModelUsage carries the energy fields")
+    # sums over days and models
+    h = UsageHistory(fresh(), clock=clock)
+    d12, d13 = local(2026, 11, 12, 9), local(2026, 11, 13, 9)
+    h.record(sample("a", rq("1", d12, 50.0, 10, 100)), now=NOW, metered=True)
+    h.record(sample("b", rq("2", d12, 50.0, 10, 300)), now=NOW, metered=True)
+    h.record(sample("a", rq("3", d13, 50.0, 10, 500)), now=NOW, metered=True)
+    h.record(sample("a", rq("4", d13, 50.0, 10, 1000)), now=NOW)               # not metered
+    h.add_energy("a", 1.0, 0.5, now=d12)
+    h.add_energy("b", 2.0, 1.0, now=d12)
+    h.add_energy("a", 4.0, 2.0, now=d13)
+    rows = {r.date.isoformat(): r for r in h.days()}
+    t12 = rows["2026-11-12"].total
+    check(_near(t12.gpu_wh, 3.0) and _near(t12.gpu_busy_wh, 1.5) and t12.gpu_tokens == 400
+          and t12.tokens_per_wh is not None and _near(t12.tokens_per_wh, 400 / 1.5), "day total sums its models")
+    s = h.totals()
+    per = {m.model: m for m in s.models}
+    check(_near(s.total.gpu_wh, 7.0) and _near(s.total.gpu_busy_wh, 3.5) and s.total.gpu_tokens == 900
+          and s.total.generated_tokens == 1900, "totals() sums energy over days")
+    check(_near(per["a"].gpu_wh, 5.0) and per["a"].gpu_tokens == 600 and _near(per["b"].gpu_wh, 2.0)
+          and per["b"].tokens_per_wh is not None and _near(per["b"].tokens_per_wh, 300.0),
+          "totals() per model across days")
+    s1 = h.totals(days=1)
+    check(_near(s1.total.gpu_wh, 4.0) and s1.total.gpu_tokens == 500 and s1.total.tokens_per_wh == 250.0,
+          "totals(days=1): today's energy only")
+    e = UsageHistory(fresh(), clock=clock).totals().total
+    check(not e.has_energy and e.tokens_per_wh is None and e.gpu_tokens == 0, "empty history: no energy")
+    check(uh.joules_to_wh(3600) == 1.0 and uh.joules_to_wh(277) == 277 / 3600 and uh.joules_to_wh(0) == 0.0
+          and uh.joules_to_wh(-5) == 0.0 and uh.joules_to_wh(float("nan")) == 0.0 and uh.joules_to_wh(None) == 0.0
+          and uh.joules_to_wh(True) == 0.0, "joules_to_wh (bad values -> 0.0)")
+
+
+def test_energy_retention() -> None:
+    path = fresh()
+    days = {(dt.date(2026, 11, 13) - dt.timedelta(days=i)).isoformat():
+            {"m": {"requests": 1, "gpu_wh": 1.0, "gpu_busy_wh": 0.5, "gpu_tokens": 10}} for i in range(20)}
+    path.write_text(json.dumps({"version": 1, "days": days}))
+    h = UsageHistory(path, clock=clock, retention_days=10)
+    u = h.totals().total
+    check(len(h.days()) == 10 and _near(u.gpu_wh, 10.0) and u.gpu_tokens == 100,
+          "retention drops whole days, energy of the kept days intact")
+    h.add_energy("m", 1.0, 0.5, now=local(2026, 10, 1))         # older than retention: dropped at the next flush
+    h.flush()
+    doc = json.loads(path.read_text())
+    check(len(doc["days"]) == 10 and "2026-10-01" not in doc["days"]
+          and _near(UsageHistory(path, clock=clock, retention_days=10).totals().total.gpu_wh, 10.0),
+          "an add_energy for a day outside retention is pruned like add_served")
+
+
 def test_default_path() -> None:
     import config_store
     h = UsageHistory(clock=clock)
@@ -509,7 +764,8 @@ def main() -> int:
     for fn in (test_pure_helpers, test_totals_per_day_and_model, test_local_midnight, test_repeats_and_restart,
                test_speed, test_add_served, test_flush_only_when_dirty, test_atomic_write, test_corrupt_files,
                test_unreadable_file_not_clobbered, test_retention, test_bounded_seen, test_threads,
-               test_large_file_speed, test_default_path):
+               test_large_file_speed, test_energy_old_file, test_energy_round_trip_and_junk, test_add_energy,
+               test_record_metered, test_energy_meter, test_energy_read_model, test_energy_retention, test_default_path):
         print(f"-- {fn.__name__}")
         try:
             fn()

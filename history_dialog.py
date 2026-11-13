@@ -1,9 +1,11 @@
 """HistoryDialog: the "Usage history" window (opened from Settings) - totals, a per-day bar chart and a per-day /
 per-model table for the last 7 days, 30 days or everything kept, read from usage_history.UsageHistory.
 
-Layout (top to bottom, 520 logical px wide, fixed height): title + range switch; four total cards; generated tokens
-per day as bars with a small axis line; the table (Day | Requests | Prompt tok | Generated tok | Avg tok/s | Served,
-newest day first, its models indented under it); "Kept on this PC only" + Close.
+Layout (top to bottom, 620 logical px wide, fixed height): title + range switch; five total cards (the fifth: GPU
+energy while serving); generated tokens per day as bars with a small axis line; the table (Day | Requests | Prompt tok
+| Generated tok | Avg tok/s | Served | GPU Wh | tok/Wh, newest day first, its models indented under it; days without
+energy figures, e.g. from before energy metering, show a dash); a muted note that GPU energy is the whole card;
+"Kept on this PC only" + Close.
 
 The chart and the table are drawn on plain tk.Canvas widgets (like graphs.py): one canvas holds every table row, so
 even a year of history opens in a few ms and scrolls without hundreds of label widgets. tk.Canvas is not scaled by
@@ -38,18 +40,20 @@ RANGES: tuple[int | None, ...] = (7, 30, None)          # None = everything kept
 RANGE_LABELS = {7: "7 days", 30: "30 days", None: "All"}
 DEFAULT_RANGE = 30
 ALL_MAX_BARS = 90                                        # 'All': the newest 90 days of the chart at most
-CARD_KEYS = ("requests", "generated tokens", "avg tok/s", "served")
-COLUMNS = ("Day", "Requests", "Prompt tok", "Generated tok", "Avg tok/s", "Served")
+CARD_KEYS = ("requests", "generated tokens", "avg tok/s", "served", "GPU energy")
+COLUMNS = ("Day", "Requests", "Prompt tok", "Generated tok", "Avg tok/s", "Served", "GPU Wh", "tok/Wh")
 EMPTY_CHART = "No requests recorded yet"
 EMPTY_TABLE = "History starts with the first request after this version was installed."
 FOOTER = "Kept on this PC only"
 AXIS_CAPTION = "generated tokens per day"
+ENERGY_NOTE = ("GPU energy is the whole graphics card while the engine was serving, not only the engine. "
+               "tok/Wh counts the energy used while a reply was running.")
 
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")   # fixed English, not the locale's %a / %b
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 # ---- layout (logical px) --------------------------------------------------------------------------------------
-WIDTH = 520
+WIDTH = 620
 PAD = 12
 HEAD_H = 26          # title / range switch row
 CARD_H = 52
@@ -58,15 +62,18 @@ AXIS_H = 16
 TABLE_HEAD_H = 22
 TABLE_BODY_H = 236   # header + body = the ~260 px the table may take; longer tables scroll
 FOOTER_H = 30
+NOTE_H = 30          # ENERGY_NOTE: two wrapped lines of 11 px text
 HEIGHT = (10 + HEAD_H + 10 + CARD_H + 10 + CHART_H + 4 + AXIS_H + 10 + TABLE_HEAD_H + TABLE_BODY_H
-          + 12 + FOOTER_H + 12)
+          + 8 + NOTE_H + 12 + FOOTER_H + 12)
 SCROLLBAR_W = 10
 DAY_ROW_H = 24
 MODEL_ROW_H = 18
 GROUP_GAP = 3        # after a day's last model row
 MODEL_INDENT = 14
-# right edge of each numeric column, measured from the canvas' right edge (Requests .. Served)
-COL_RIGHT = (296, 226, 148, 80, 8)
+# right edge of each numeric column, measured from the canvas' right edge (Requests .. tok/Wh). Each step is the
+# column's widest text plus a gap: tok/Wh '123,456' (~45 px), GPU Wh header (~42), Served '61 h 05 m' (~55), Avg tok/s
+# header (~50), Generated tok header (~72), Prompt tok header (~56); Requests (~48) leaves ~106 px for model names.
+COL_RIGHT = (410, 340, 262, 194, 122, 66, 8)
 DAY_X = 8
 
 
@@ -121,6 +128,39 @@ def fmt_served(seconds: Any) -> str:
     return f"{h} h {mm:02d} m"
 
 
+def _sig3(x: float) -> str:
+    """Three significant digits: '0.42', '12.3', '842', '1,234'."""
+    return f"{x:,.0f}" if x >= 99.95 else f"{x:.1f}" if x >= 9.995 else f"{x:.2f}"
+
+
+def fmt_energy(wh: Any) -> str:
+    """The GPU energy card: '0.42 Wh', '12.3 Wh', '842 Wh', then '1.23 kWh', '12.3 kWh'; '–' for none."""
+    v = _finite(wh)
+    if v is None or v <= 0:
+        return DASH
+    if v < 0.005:
+        return "< 0.01 Wh"
+    if v < 999.5:
+        return f"{_sig3(v)} Wh"
+    return f"{_sig3(v / 1000.0)} kWh"
+
+
+def fmt_wh(wh: Any) -> str:
+    """A 'GPU Wh' table cell: '0.42', '12.3', '842', '1,234'; '< 0.01' for a trace; '–' for none."""
+    v = _finite(wh)
+    if v is None or v <= 0:
+        return DASH
+    return "< 0.01" if v < 0.005 else _sig3(v)
+
+
+def fmt_tok_per_wh(v: Any) -> str:
+    """A 'tok/Wh' table cell: a whole number with thousands separators ('8,412'); '–' when unknown."""
+    f = _finite(v)
+    if f is None or f <= 0:
+        return DASH
+    return f"{round(f):,}"
+
+
 def fmt_date(d: _dt.date) -> str:
     """'14 Oct' (the chart axis)."""
     return f"{d.day} {_MONTHS[d.month - 1]}"
@@ -135,25 +175,31 @@ def fmt_day(d: _dt.date, today: _dt.date) -> str:
     return f"{_WEEKDAYS[d.weekday()]} {d.day} {_MONTHS[d.month - 1]}"
 
 
-def usage_cells(u: Any) -> tuple[str, str, str, str, str]:
-    """(requests, prompt tok, generated tok, avg tok/s, served) for one Usage. A span with 0 requests (served time
-    only) shows '–' for its tokens instead of 0."""
+def usage_cells(u: Any) -> tuple[str, str, str, str, str, str, str]:
+    """(requests, prompt tok, generated tok, avg tok/s, served, GPU Wh, tok/Wh) for one Usage. A span with 0
+    requests (served time only) shows '–' for its tokens instead of 0; a span without energy figures (e.g. a day
+    from before energy metering) shows '–' for both energy cells."""
     req = int(_finite(getattr(u, "requests", 0)) or 0)
     if req <= 0:
         prompt = gen = DASH
     else:
         prompt = fmt_count(getattr(u, "prompt_tokens", 0))
         gen = fmt_count(getattr(u, "generated_tokens", 0))
+    if getattr(u, "has_energy", False):
+        wh, tpw = fmt_wh(getattr(u, "gpu_wh", 0)), fmt_tok_per_wh(getattr(u, "tokens_per_wh", None))
+    else:
+        wh = tpw = DASH
     return (f"{max(0, req):,}", prompt, gen, fmt_tps(getattr(u, "decode_tps", None)),
-            fmt_served(getattr(u, "served_s", 0)))
+            fmt_served(getattr(u, "served_s", 0)), wh, tpw)
 
 
 def card_values(total: Any) -> dict[str, str]:
-    """The four total cards for a range's Usage (empty: '0', '0', '–', '–')."""
+    """The five total cards for a range's Usage (empty: '0', '0', '–', '–', '–')."""
     return {"requests": fmt_count(getattr(total, "requests", 0)),
             "generated tokens": fmt_count(getattr(total, "generated_tokens", 0)),
             "avg tok/s": fmt_tps(getattr(total, "decode_tps", None)),
-            "served": fmt_served(getattr(total, "served_s", 0))}
+            "served": fmt_served(getattr(total, "served_s", 0)),
+            "GPU energy": fmt_energy(getattr(total, "gpu_wh", 0))}
 
 
 def range_start(today: _dt.date, range_days: int | None, first: _dt.date | None) -> _dt.date | None:
@@ -171,7 +217,7 @@ def range_start(today: _dt.date, range_days: int | None, first: _dt.date | None)
 class TableRow:
     kind: str                       # "day" | "model"
     label: str                      # 'Today' / 'Wed 11 Nov' / model id
-    cells: tuple[str, ...]          # requests, prompt tok, generated tok, avg tok/s, served
+    cells: tuple[str, ...]          # requests, prompt tok, generated tok, avg tok/s, served, GPU Wh, tok/Wh
 
 
 @dataclass(frozen=True)
@@ -345,9 +391,14 @@ class HistoryDialog(ctk.CTkToplevel):
         self._tbody.configure(yscrollcommand=self._scroll.set)
         self._scrollable = False
 
-        # ---- 5. footer
+        # ---- 5. what the energy figures are (always shown: the whole card, not only the engine)
+        self._note = ctk.CTkLabel(self, text=ENERGY_NOTE, anchor="nw", justify="left", height=NOTE_H,
+                                  wraplength=WIDTH - 2 * PAD, font=small, text_color=T.TEXT_3)
+        self._note.grid(row=5, column=0, sticky="ew", padx=PAD, pady=(8, 0))
+
+        # ---- 6. footer
         foot = ctk.CTkFrame(self, fg_color="transparent")
-        foot.grid(row=5, column=0, sticky="ew", padx=PAD, pady=(12, 12))
+        foot.grid(row=6, column=0, sticky="ew", padx=PAD, pady=(12, 12))
         foot.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(foot, text=FOOTER, anchor="w", height=FOOTER_H, font=small, text_color=T.TEXT_3).grid(
             row=0, column=0, sticky="w")
@@ -361,13 +412,17 @@ class HistoryDialog(ctk.CTkToplevel):
 
     # ------------------------------------------------------------------ public read-only helpers (tests)
     def card_texts(self) -> dict[str, str]:
-        """The four cards as shown: {'requests', 'generated tokens', 'avg tok/s', 'served'} -> text."""
+        """The five cards as shown: {'requests', 'generated tokens', 'avg tok/s', 'served', 'GPU energy'} -> text."""
         return {k: str(lbl.cget("text")) for k, lbl in self._card_labels.items()}
 
     def table_rows(self) -> list[tuple[str, ...]]:
-        """Table rows in display order: ('day' | 'model', label, requests, prompt, generated, tok/s, served).
-        The label is the full model id (the canvas may shorten a very long one with '…')."""
+        """Table rows in display order: ('day' | 'model', label, requests, prompt, generated, tok/s, served, GPU Wh,
+        tok/Wh). The label is the full model id (the canvas may shorten a very long one with '…')."""
         return [(r.kind, r.label, *r.cells) for r in self._view.rows]
+
+    def note_text(self) -> str:
+        """The muted energy note above the footer, as shown."""
+        return str(self._note.cget("text"))
 
     def table_note(self) -> str:
         """The muted line shown instead of rows ('' when there are rows)."""
