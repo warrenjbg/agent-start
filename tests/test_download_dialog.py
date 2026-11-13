@@ -227,6 +227,12 @@ def shot(win, name: str) -> Path:
     return path
 
 
+def placeholder_look(dlg) -> tuple[str, int, str]:
+    """How the empty list's line is drawn: colour, font size, alignment of wrapped lines."""
+    ph = dlg._placeholder
+    return str(ph.cget("text_color")), int(ph.cget("font").cget("size")), str(ph._label.cget("justify"))
+
+
 def fits(dlg) -> tuple[bool, str]:
     scale = ctk.ScalingTracker.get_window_scaling(dlg)
     dlg.update_idletasks()
@@ -261,12 +267,14 @@ def test_enter_and_bad_repo(root) -> Path | None:
         check(bool(dlg._entry._entry.bind("<Return>")), "Enter in the repo box is bound (it lists, like the button)")
         dlg.list_files()                                # the same call; no key event: no test depends on the focus
         pump(root, 0.1)
-        eq(dlg.message_text(), hf_download._DEFAULT_MSG["bad_repo"], "bad repo sentence")
-        eq(dlg.message_kind(), "error", "shown as an error")
-        eq(dlg.list_placeholder(), hf_download._DEFAULT_MSG["bad_repo"], "the list shows the failed listing's reason")
+        eq(dlg.list_placeholder(), hf_download._DEFAULT_MSG["bad_repo"], "bad repo: its sentence, in the list area")
+        eq(dlg.message_text(), "", "...and not a second time in the message line")
+        eq(placeholder_look(dlg), (dd._TONE_COLOR["error"], 12, "left"),
+           "the reason is drawn as a message: error colour, body size, left-aligned")
         path = shot(dlg, "bad_repo")
         dlg.set_repo(REPO)
-        eq(dlg.message_text(), "", "typing clears the error")
+        eq((dlg.list_placeholder(), placeholder_look(dlg)), (dd.HINT_ENTER, (dd.T.TEXT_3, 11, "left")),
+           "typing clears the reason: the hint is back, drawn as a hint")
     finally:
         close_dialog(root, dlg)
     return path
@@ -412,14 +420,24 @@ def test_errors(root) -> Path | None:
     try:
         hf.listings[REPO] = HfError("gated")
         listed(root, dlg)
-        eq(dlg.message_text(), hf_download._DEFAULT_MSG["gated"], "gated repo sentence")
-        eq(dlg.list_placeholder(), hf_download._DEFAULT_MSG["gated"], "the list shows the reason too")
+        eq((dlg.list_placeholder(), dlg.message_text()), (hf_download._DEFAULT_MSG["gated"], ""),
+           "gated repo: its sentence in the list area, the message line empty")
+        hf.listings[REPO] = HfError("rate_limited")
+        dlg.list_files()
+        pump(root, 0.05)
+        eq(placeholder_look(dlg)[0], dd._TONE_COLOR["warn"], "a 'try again later' reason keeps the warning colour")
         hf.listings[REPO] = HfError("no_gguf")
         dlg.list_files()
         pump(root, 0.05)
         ph = dlg.list_placeholder()
         check(ph.startswith(hf_download._DEFAULT_MSG["no_gguf"]) and dd.NO_GGUF_HINT in ph,
               f"the empty repo list names the reason and the -GGUF repos: {ph!r}")
+        scale = ctk.ScalingTracker.get_window_scaling(dlg)
+        ph_h = dlg._placeholder.winfo_height() / scale
+        ok, why = fits(dlg)
+        check(2 * 14 <= ph_h <= dd.LIST_H and ok,
+              f"the longest reason wraps onto several lines and fits the list area ({ph_h:.0f} px of {dd.LIST_H}; {why})")
+        shot(dlg, "no_gguf")
         hf.listings[REPO] = LISTING
         dlg.list_files()
         pump(root, 0.05)

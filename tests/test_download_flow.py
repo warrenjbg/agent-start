@@ -346,8 +346,9 @@ def test_bad_repo() -> None:
     eq("parse_repo got the stripped text as data", [c for c in e.hf.calls if c[0] == "parse_repo"],
        [("parse_repo", "not a repo!")])
     eq("phase error", f.phase, "error")
-    eq("bad_repo sentence", f.message, hf_download._DEFAULT_MSG["bad_repo"])
-    eq("error tone", f.message_kind, "error")
+    eq("bad_repo sentence, for the list area, in the error tone", (f.list_hint, f.list_hint_kind),
+       (hf_download._DEFAULT_MSG["bad_repo"], "error"))
+    eq("the message line stays empty", (f.message, f.message_kind), ("", "info"))
     check("usable again: can list", f.can_list)
     f.set_repo_text(REPO)
     eq("typing clears the error", (f.phase, f.message), ("enter", ""))
@@ -560,22 +561,27 @@ def test_errors_on_listing() -> None:
         err = HfError(kind)
         e.hf.listings[REPO] = err
         f = e.listed()
-        ok = (f.phase == "error" and f.message == err.message and f.listing is None and f.rows == ()
-              and f.can_list and f.message_kind in dd.MESSAGE_KINDS)
-        check(f"listing {kind}: its sentence, usable", ok, f"{f.phase} {f.message!r}")
+        want = f"{err.message} {dd.NO_GGUF_HINT}" if kind == "no_gguf" else err.message
+        ok = (f.phase == "error" and f.list_hint == want and f.message == "" and f.listing is None and f.rows == ()
+              and f.can_list and f.list_hint_kind == dd._KIND_TONE.get(kind, "error"))
+        check(f"listing {kind}: its sentence for the list area, usable", ok,
+              f"{f.phase} {f.list_hint!r} {f.list_hint_kind} {f.message!r}")
         e.hf.listings[REPO] = LISTING
         e.listed()
-        check(f"listing {kind}: listing again works", f.phase == "list" and len(f.rows) == 6)
+        check(f"listing {kind}: listing again works, the reason is gone",
+              f.phase == "list" and len(f.rows) == 6 and f.list_hint == "")
+    check("only a repo without .gguf files gets the -GGUF advice",
+          "-GGUF" in dd.NO_GGUF_HINT and not any("-GGUF" in m for m in hf_download._DEFAULT_MSG.values()))
     e = Env()
     e.hf.listings[REPO] = HfError("rate_limited", "Hugging Face is limiting requests from this connection. Try again "
                                                   "in 30 seconds.", retry_after_s=30)
     f = e.listed()
-    eq("rate limit with seconds", (f.message, f.message_kind),
+    eq("rate limit with seconds", (f.list_hint, f.list_hint_kind),
        ("Hugging Face is limiting requests from this connection. Try again in 30 seconds.", "warn"))
     e.hf.listings[REPO] = HfError("gated")
     e.listed()
-    check("gated: login not supported, no token field", "login" in f.message and "not support" in f.message,
-          f.message)
+    check("gated: login not supported, no token field", "login" in f.list_hint and "not support" in f.list_hint,
+          f.list_hint)
 
 
 def test_errors_on_download() -> None:
@@ -772,9 +778,20 @@ def test_unexpected() -> None:
     e.hf.listings[REPO] = ValueError("secret internal detail")
     LOG.records.clear()
     f = e.listed()
-    eq("listing: generic sentence", (f.phase, f.message, f.message_kind), ("error", dd.UNEXPECTED_LIST, "error"))
-    check("listing: no exception text shown", "secret" not in f.message)
+    eq("listing: generic sentence", (f.phase, f.list_hint, f.list_hint_kind, f.message),
+       ("error", dd.UNEXPECTED_LIST, "error", ""))
+    check("listing: no exception text shown", "secret" not in f.list_hint + f.message)
     check("listing: logged with the traceback", any(r.levelno == logging.ERROR and r.exc_info for r in LOG.records))
+    e3 = Env()
+
+    def no_worker(fn) -> None:
+        raise RuntimeError("can't start new thread")
+
+    e3.flow._run_worker = no_worker
+    e3.flow.set_repo_text(REPO)
+    e3.flow.list_now()
+    eq("a listing that cannot start: the generic sentence in the list area, and usable again",
+       (e3.flow.phase, e3.flow.list_hint, e3.flow.message, e3.flow.can_list), ("error", dd.UNEXPECTED_LIST, "", True))
     e.hf.listings[REPO] = LISTING
     e.listed()
     f.select(MODEL_B)

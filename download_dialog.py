@@ -263,6 +263,7 @@ class DownloadFlow:
         self.message = ""
         self.message_kind = "info"
         self.list_hint = ""               # shown in the empty list area when a listing failed ('' = no reason)
+        self.list_hint_kind = "error"     # its tone, one of MESSAGE_KINDS
         self.result_path: str | None = None
         self.closing = False               # close() was asked while a download ran: the window closes after it
         self.closed = False
@@ -526,10 +527,17 @@ class DownloadFlow:
 
         if not self._spawn(work):
             self._job = None
-            self.phase = "error"
-            self._say(UNEXPECTED_LIST, "error")
+            self._list_failed(UNEXPECTED_LIST, "error")
         self._changed()
         return True
+
+    def _list_failed(self, reason: str, kind: str) -> None:
+        """A listing that gave nothing. The reason goes to the empty list area, where the files would have been,
+        and the message line stays empty: the same sentence twice in one small window reads as two problems."""
+        self.phase = "error"
+        self._say("")
+        self.list_hint = reason
+        self.list_hint_kind = kind if kind in MESSAGE_KINDS else "error"
 
     def _list_answer(self, seq: int, text: str, dest: str, listing: RepoListing | None, pend: dict[str, int],
                      free: int | None, err: HfError | None, unexpected: bool) -> None:
@@ -538,13 +546,11 @@ class DownloadFlow:
             return
         self._job = None
         if listing is None:
-            self.phase = "error"
             if unexpected or err is None:
-                self._say(UNEXPECTED_LIST, "error")
-                self.list_hint = UNEXPECTED_LIST
+                self._list_failed(UNEXPECTED_LIST, "error")
             else:
-                self._say(err.message, _KIND_TONE.get(err.kind, "error"))
-                self.list_hint = f"{err.message} {NO_GGUF_HINT}" if err.kind == "no_gguf" else err.message
+                reason = f"{err.message} {NO_GGUF_HINT}" if err.kind == "no_gguf" else err.message
+                self._list_failed(reason, _KIND_TONE.get(err.kind, "error"))
             self._changed()
             return
         self.listing = listing
@@ -940,9 +946,9 @@ class DownloadDialog(ctk.CTkToplevel):
                                             scrollbar_button_hover_color=T.RAISED_HOVER)
         self._list.grid(row=2, column=0, sticky="ew", padx=PAD, pady=(8, 0))
         self._list.grid_columnconfigure(0, weight=1)
-        self._placeholder = ctk.CTkLabel(self._list, text=HINT_ENTER, anchor="w", font=self._small,
+        # no fixed height: a failed listing shows its reason here, and that wraps onto several lines
+        self._placeholder = ctk.CTkLabel(self._list, text=HINT_ENTER, anchor="w", justify="left", font=self._small,
                                          text_color=T.TEXT_3, wraplength=WIDTH - 2 * PAD - 48)
-        # (no fixed height: a listing failure shows its reason in the list area, which wraps onto several lines)
         self._row_widgets: list[tuple[Row, ctk.CTkFrame, ctk.CTkLabel, list[Any]]] = []
         self._rows_drawn: tuple[Row, ...] | None = None
         self._hover_row: int | None = None
@@ -1182,7 +1188,10 @@ class DownloadDialog(ctk.CTkToplevel):
         f = self.flow
         self._rows_drawn = f.rows
         if not f.rows:
-            self._placeholder.configure(text=self._hint_for(f))
+            reason = f.phase == "error" and bool(f.list_hint)       # something to act on, not a hint
+            self._placeholder.configure(
+                text=self._hint_for(f), font=self._body if reason else self._small,
+                text_color=_TONE_COLOR.get(f.list_hint_kind, T.RED_TEXT) if reason else T.TEXT_3)
             self._placeholder.grid(row=0, column=0, sticky="ew", padx=10)
             return
         self._placeholder.grid_remove()
