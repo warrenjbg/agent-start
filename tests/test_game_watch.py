@@ -3,10 +3,13 @@
 Safe by construction:
   * game_watch only observes; this test never kills anything except the dummy `fakegame.exe` processes it
     starts itself: TEMP COPIES of the venv's python.exe redirector placed under
-    <tmp>\\steamapps\\common\\<Game>\\, running a sleep script whose command line carries this run's unique
+    <tmp>\\agentstart-test-games\\common\\<Game>\\, running a sleep script whose command line carries this run's unique
     MARKER. Cleanup kills only processes with that marker. No windows, no GUI, no network.
-  * The watcher's game dir is the unique '<tmpname>\\steamapps' segment, so a real game the user starts
-    meanwhile cannot leak into the assertions.
+  * The watcher's game dir is the unique '<tmpname>\\agentstart-test-games' segment, so a real game the user
+    starts meanwhile cannot leak into the assertions.
+  * The dummies do NOT live in a folder named like a real game library (steamapps, Epic Games, ...): an installed
+    Agent Start that is serving watches those names, took the dummies for games and turned the user's real
+    engine off. A check in the real-thread test pins that.
 """
 from __future__ import annotations
 
@@ -35,7 +38,8 @@ CREATE_NO_WINDOW = 0x08000000
 MARKER = f"hc-gamewatch-test-{uuid.uuid4().hex[:12]}"
 TMP = Path(tempfile.mkdtemp(prefix=MARKER + "-"))
 VENV = ROOT / ".venv"
-TEST_DIR = TMP.name + "\\steamapps"            # unique game-dir segment for the real-thread tests
+GAME_FOLDER = "agentstart-test-games"          # where the dummy games live; never a real library folder name
+TEST_DIR = TMP.name + "\\" + GAME_FOLDER       # unique game-dir segment for the real-thread tests
 DIRS = ["steamapps", "Epic Games", "Riot Games", "XboxGames", "GOG Galaxy", "Battle.net"]
 
 
@@ -155,8 +159,8 @@ def test_pure() -> None:
 # ----------------------------------------------------------------------------------------- dummy processes
 
 def game_exe(game: str, exe_name: str) -> str:
-    """Copy of the venv redirector at <tmp>\\steamapps\\common\\<game>\\<exe_name> (+ pyvenv.cfg next to it)."""
-    d = TMP / "steamapps" / "common" / game
+    """Copy of the venv redirector at <tmp>\\<GAME_FOLDER>\\common\\<game>\\<exe_name> (+ pyvenv.cfg next to it)."""
+    d = TMP / GAME_FOLDER / "common" / game
     exe = d / exe_name
     if not exe.exists():
         d.mkdir(parents=True, exist_ok=True)
@@ -269,9 +273,14 @@ def test_real_thread() -> None:
     pre = spawn("PreGame", "pregame.exe")
     try:
         pre_ps = psutil.Process(pre.pid)
-        check("dummy game runs from the steamapps copy", MARKER in pre_ps.exe(), pre_ps.exe())
+        check("dummy game runs from the test game folder", MARKER in pre_ps.exe(), pre_ps.exe())
+        import config_store
+        real_names = sorted(set(DIRS) | set(config_store.DEFAULTS.get("game_dirs") or []))
+        check("the dummy is no game for the real library folder names (an installed, serving app ignores it)",
+              install_of(pre_ps.exe(), real_names) is None and install_of(pre_ps.exe(), [TEST_DIR]) is not None,
+              pre_ps.exe())
     except psutil.Error as exc:
-        check("dummy game runs from the steamapps copy", False, repr(exc))
+        check("dummy game runs from the test game folder", False, repr(exc))
     time.sleep(1.0)
     w = GameWatcher([TEST_DIR], game_exclude=["excluded.exe"], interval_s=0.4, on_game=on_game, min_age_s=1.5)
     w.start()
