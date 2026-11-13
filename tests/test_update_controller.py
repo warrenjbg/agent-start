@@ -74,6 +74,7 @@ class StubUpdater:
     RETRY_AFTER_ERROR_S = updater.RETRY_AFTER_ERROR_S
     UpdateInfo = updater.UpdateInfo
     UpdateError = updater.UpdateError
+    REPO = updater.REPO
 
     def __init__(self) -> None:
         self.due = updater.due                    # pure function: no I/O
@@ -596,6 +597,87 @@ def test_report_result() -> None:
 
 
 # ------------------------------------------------------------------------------------------------ Settings button (Tk)
+def test_unsigned() -> None:
+    """A newer release whose signature does not verify: never offered, never downloaded, said once. No Tk."""
+    import webbrowser
+    page = f"https://github.com/{updater.REPO}/releases/tag/v9.9.1"
+
+    def unsigned(v: str = "9.9.1", page_url: str = page):
+        i = info(v)
+        i.page_url = page_url
+        return i
+
+    fh, st, c = make()
+    st.result = ("unsigned", unsigned())
+    got: list = []
+    c.check_now(lambda s, v: got.append((s, v)) or True)
+    settle(fh, c)
+    check("unsigned -> ('unsigned', that version); nothing is offered", got == [("unsigned", "9.9.1")]
+          and c.offer is None and c.offer_version() is None and c.unsigned is not None, f"{got} {c.offer}")
+    check("unsigned shown in the dialog: no toast", not fh.toasts)
+    check("unsigned: the check counts as done (time recorded, next daily in 24 h)",
+          isinstance(fh.state_later.get("update_checked_at"), float)
+          and abs(c.next_at - time.monotonic() - updater.CHECK_INTERVAL_S) < 5)
+    c.install()
+    check("install with nothing offered: no question, no download", not fh.asked and not st.downloads and not c.updating)
+
+    fh, st, c = make()
+    st.result = ("unsigned", unsigned())
+    c.check_now(None)
+    settle(fh, c)
+    check("unsigned with no dialog to show it: one toast that says why", len(fh.toasts) == 1
+          and "9.9.1" in fh.toasts[0][1] and "signature" in fh.toasts[0][1], repr(fh.toasts))
+    c.check_now(None)
+    settle(fh, c)
+    check("the same unsigned release again: no second toast", len(fh.toasts) == 1)
+    st.result = ("unsigned", unsigned("9.9.2"))
+    c.check_now(None)
+    settle(fh, c)
+    check("another unsigned release: told once more", len(fh.toasts) == 2 and "9.9.2" in fh.toasts[1][1])
+
+    fh, st, c = make()
+    st.result = ("newer", info("9.9.1"))
+    c.check_now(lambda s, v: True)
+    settle(fh, c)
+    check("(a signed release is offered)", c.offer_version() == "9.9.1" and c.unsigned is None)
+    st.result = ("unsigned", unsigned("9.9.2"))
+    c.check_now(lambda s, v: True)
+    settle(fh, c)
+    check("then an unsigned one is the latest: the earlier offer is withdrawn", c.offer is None and c.offer_version() is None)
+    st.result = ("newer", info("9.9.3"))
+    c.check_now(lambda s, v: True)
+    settle(fh, c)
+    check("a signed release after it: offered again, the refused one forgotten",
+          c.offer_version() == "9.9.3" and c.unsigned is None)
+
+    # the release loses its valid signature between the offer and the click: the install-time re-check refuses
+    fh, st, c = make()
+    c.offer = info("9.9.1")
+    st.result = ("unsigned", unsigned())
+    fh.answer = True
+    c.install()
+    fh.pump(lambda: not c.updating, 3)
+    check("install-time re-check says unsigned: nothing downloaded, nothing started, the note says why",
+          not st.downloads and not st.launches and not c.updating and "signature" in (fh.notes[-1] if fh.notes else ""),
+          repr(fh.notes[-2:]))
+
+    opened: list = []
+    real_open = webbrowser.open
+    webbrowser.open = lambda url, *a, **k: opened.append(url) or True   # type: ignore[assignment]
+    try:
+        fh, st, c = make()
+        check("no refused release: nothing to open", c.open_unsigned_page() is False and not opened)
+        c.unsigned = unsigned()
+        check("the refused release's page opens", c.open_unsigned_page() is True and opened == [page])
+        for bad in ("https://example.com/x", f"http://github.com/{updater.REPO}/releases", "https://github.com/",
+                    f"https://github.com.evil.example/{updater.REPO}/", "file:///C:/x", "", None, 5):
+            c.unsigned = unsigned(page_url=bad)     # type: ignore[arg-type]
+            check(f"a page that is not this app's repository is never opened ({bad!r})",
+                  c.open_unsigned_page() is False and opened == [page])
+    finally:
+        webbrowser.open = real_open                 # type: ignore[assignment]
+
+
 def test_settings_button() -> None:
     import customtkinter as ctk
     import settings_dialog
@@ -697,10 +779,30 @@ def test_settings_button() -> None:
         ok, why = fits(d)
         check("update texts fit", ok, why)
         check("no toast for the version shown in the dialog", not fh.toasts)
-        for key in ("checking", "current", "busy"):
+        for key in ("checking", "current", "busy", "unsigned"):
             d._show_check(key, "10.10.10")
             ok, why = fits(d)
             check(f"'{settings_dialog.CHECK_TEXTS[key].format(version='10.10.10')}' fits", ok, why)
+        d.close()
+
+        # a newer release whose signature does not verify: said in amber, a link to the release page, no update link
+        fh, st, c = make()
+        st.result = ("unsigned", info("10.10.10"))
+        pages: list = []
+        d = dialog(on_check_updates=c.check_now, can_check_updates=True, on_update=lambda: None,
+                   on_open_release=lambda: pages.append(1))
+        d.check_updates()
+        pump(lambda: not c.checking and "Checking" not in d._check_msg.cget("text"), 3, fh)
+        check("unsigned: the message says so, no update link, no toast",
+              d._check_msg.cget("text") == settings_dialog.CHECK_TEXTS["unsigned"].format(version="10.10.10")
+              and d._update_link is None and not fh.toasts and c.offer is None, d._check_msg.cget("text"))
+        d._open_release()
+        check("unsigned: the message is the link to the release page", pages == [1] and d._check_link)
+        st.result = ("current", None)
+        d.check_updates()
+        pump(lambda: not c.checking and "Checking" not in d._check_msg.cget("text"), 3, fh)
+        d._open_release()
+        check("after another result the message is plain text again", pages == [1] and not d._check_link)
         d.close()
 
         # busy (an update is installing)
@@ -746,7 +848,7 @@ def test_settings_button() -> None:
 def main() -> int:
     try:
         for fn in (test_daily, test_manual, test_one_request, test_switch_off_install, test_install,
-                   test_report_result, test_settings_button):
+                   test_report_result, test_unsigned, test_settings_button):
             try:
                 fn()
             except Exception:

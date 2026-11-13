@@ -9,6 +9,8 @@ if not exist "%ISCC%" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
 
 if not exist "%PY%" (echo Project venv not found: %PY% & goto :fail)
 
+rem a release is never built without release keys (AGENTSTART_ALLOW_UNSIGNED_BUILD=1 for a test build)
+"%PY%" tools\check_release_keys.py || goto :fail
 echo [1/5] version (version.py is the single source)
 set VER=
 for /f "usebackq delims=" %%v in (`"%PY%" tools\sync_version.py --print`) do set VER=%%v

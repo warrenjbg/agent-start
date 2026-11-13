@@ -38,6 +38,7 @@ CHECK_TEXTS = {                                  # the manual check's result, ne
     "current": "Up to date · v{version}",
     "newer": "Version {version} is available",
     "error": "Could not reach GitHub",
+    "unsigned": "Version {version}: signature not valid · not installed · release page",
     "busy": "An update is being installed",
 }
 
@@ -133,6 +134,7 @@ class SettingsDialog(ctk.CTkToplevel):
                  on_update: Callable[[], None] | None = None,
                  switches: list[dict] | None = None,
                  on_check_updates: Callable[[Callable[[str, str | None], bool]], str] | None = None,
+                 on_open_release: Callable[[], Any] | None = None,
                  can_check_updates: bool = True, engine=None,
                  on_history: Callable[[], Any] | None = None,
                  launch_options: dict | None = None,
@@ -178,6 +180,8 @@ class SettingsDialog(ctk.CTkToplevel):
         self._on_reopen_changed = on_reopen_changed
         self._on_update = on_update
         self._on_check_updates = on_check_updates
+        self._on_open_release = on_open_release  # opens the page of a release that was refused (bad signature)
+        self._check_link = False                 # the check message is that link right now
         self._on_history = on_history
         self._on_engine_change = on_engine_change
         self._on_fit_preview = on_fit_preview
@@ -1373,6 +1377,24 @@ class SettingsDialog(ctk.CTkToplevel):
     def _show_check(self, key: str, version: str | None = None, color: str = T.TEXT_2) -> None:
         if self._check_msg is not None:
             self._check_msg.configure(text=CHECK_TEXTS[key].format(version=version or ""), text_color=color)
+            # "unsigned" is a link to the release page; every other result is plain text
+            link = key == "unsigned" and self._on_open_release is not None
+            if link != self._check_link:
+                self._check_link = link
+                self._check_msg.configure(cursor="hand2" if link else "")
+                if link:
+                    self._check_msg.bind("<Button-1>", lambda _e: self._open_release())
+                else:
+                    self._check_msg.unbind("<Button-1>")
+
+    def _open_release(self) -> None:
+        cb = self._on_open_release
+        if cb is None or not self._check_link:
+            return
+        try:
+            cb()
+        except Exception:  # noqa: BLE001
+            log.debug("release page not opened", exc_info=True)
 
     def check_updates(self) -> None:
         """The button: one check at a time (greyed until its result is in)."""
@@ -1415,6 +1437,8 @@ class SettingsDialog(ctk.CTkToplevel):
             elif status == "newer" and version:
                 self._show_check("newer", version, color=T.TEXT)
                 self._show_update_link(version)
+            elif status == "unsigned" and version:
+                self._show_check("unsigned", version, color=T.AMBER)
             else:
                 self._show_check("error", color=T.RED_TEXT)
         except Exception:  # noqa: BLE001 - closed between the check and the configure

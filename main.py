@@ -2790,6 +2790,7 @@ class AgentStartApp(ctk.CTk):
             update_version=self.updates.offer_version(),
             on_update=self.updates.install, switches=self._settings_switches(),
             on_check_updates=self.updates.check_now, can_check_updates=self.updates.available(),
+            on_open_release=self.updates.open_unsigned_page,
             engine=self.engine,
             on_history=self.open_history if self.usage is not None else None,
             engine_choices=engines.choices(), on_engine_change=self.set_backend, launch_options=options,
@@ -3528,6 +3529,7 @@ def _selftest() -> int:
         import tray
         import update_controller  # noqa: F401
         import updater  # noqa: F401
+        import update_sig  # noqa: F401
         import win32gui  # noqa: F401
         import detector  # noqa: F401
         import server_manager  # noqa: F401

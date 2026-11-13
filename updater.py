@@ -33,6 +33,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
+import update_sig
+
 log = logging.getLogger("agent_start")
 
 REPO = "warrenjbg/agent-start"
@@ -80,6 +82,7 @@ class UpdateInfo:
     size: int
     sha256: str          # lower-case hex; required (download/launch refuse anything else)
     page_url: str
+    signature: str = ""  # the release's .sig asset (OpenSSH SSHSIG text) when this build carries release keys
 
 
 # ------------------------------------------------------------------------------------------- versions
@@ -189,7 +192,11 @@ def _read_some(resp, n: int) -> bytes:
 
 def check(current: str, timeout: float = 8.0, api_url: str | None = None) -> tuple[str, UpdateInfo | None]:
     """One GitHub check. Returns (status, info):
-      ('newer', UpdateInfo)  a newer release with a valid, digest-carrying installer asset exists;
+      ('newer', UpdateInfo)  a newer release with a valid, digest-carrying installer asset exists - and, when
+                             this build carries release keys (update_sig.PUBLIC_KEYS), a valid signature of one
+                             of them over (repo, version, installer name, size, sha256);
+      ('unsigned', UpdateInfo)  such a release exists but its signature is missing or does not verify: it must
+                             not be installed from here (download() refuses it); the info names the release page;
       ('current', None)      the latest release is not newer than `current`;
       ('error', None)        anything else (network/HTTP/JSON trouble, odd release or asset, no digest...).
     Never raises."""
@@ -282,8 +289,68 @@ def _check(current: str, timeout: float, api_url: str | None) -> tuple[str, Upda
     page = data.get("html_url")
     if not (isinstance(page, str) and page.startswith(f"https://github.com/{REPO}/")):
         page = f"https://github.com/{REPO}/releases/tag/{urllib.parse.quote(tag)}"
-    return "newer", UpdateInfo(version=version, tag=tag, asset_name=want, asset_url=asset_url, size=size,
-                               sha256=sha, page_url=page)
+    info = UpdateInfo(version=version, tag=tag, asset_name=want, asset_url=asset_url, size=size, sha256=sha,
+                      page_url=page)
+    if not update_sig.enabled():
+        # a build without release keys (before the first signed release, or a test build): as before
+        log.info("update check: this build carries no release keys; %s is checked by SHA-256 only", version)
+        return "newer", info
+    # The digest above comes from the same GitHub answer as the download: it proves the file arrived whole, not
+    # who published it. The signature is made with a key that never touches GitHub and binds exactly this
+    # release (repo, version, file name, size, sha256), so an old or foreign signature cannot be reused.
+    sig = _fetch_signature(assets, expected, want, current, timeout, deadline)
+    if sig is None or not update_sig.verify_release(sig, repo=REPO, version=version, asset_name=want, size=size,
+                                                    sha256=sha):
+        log.warning("update %s refused: no valid signature of a trusted release key", version)
+        return "unsigned", info
+    info.signature = sig
+    return "newer", info
+
+
+def _fetch_signature(assets, expected: str, want: str, current: str, timeout: float, deadline: float) -> str | None:
+    """The text of the release's signature asset (<installer>.sig), or None with the reason logged. The asset
+    must be listed in the release with exactly the expected URL, state 'uploaded' and a plausible size; the body
+    must have exactly that size. Never raises."""
+    try:
+        name = want + update_sig.SIG_SUFFIX
+        asset = next((a for a in assets if isinstance(a, dict) and a.get("name") == name), None) \
+            if isinstance(assets, list) else None
+        if asset is None:
+            log.info("update signature: the release has no %s", name)
+            return None
+        url = asset.get("browser_download_url")
+        hosts = DEFAULT_ALLOWED_HOSTS | ({"127.0.0.1"} if _ALLOW_LOCAL_HTTP_FOR_TESTS else set())
+        if not isinstance(url, str) or url != expected + update_sig.SIG_SUFFIX or not _url_ok(url, hosts):
+            log.info("update signature: unexpected URL")
+            return None
+        size = asset.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or not 0 < size <= update_sig.MAX_SIG_BYTES \
+                or asset.get("state", "uploaded") != "uploaded":
+            log.info("update signature: bad size or state")
+            return None
+        req = urllib.request.Request(url, headers=_headers(current, "application/octet-stream"))
+        buf = bytearray()
+        with _opener(hosts).open(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                log.info("update signature: HTTP %s", resp.status)
+                return None
+            while len(buf) <= size:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    log.info("update signature: timed out")
+                    return None
+                _set_sock_timeout(resp, min(timeout, left))
+                chunk = _read_some(resp, size + 1 - len(buf))
+                if not chunk:
+                    break
+                buf += chunk
+        if len(buf) != size:
+            log.info("update signature: the file is not the listed size")
+            return None
+        return bytes(buf).decode("ascii")
+    except Exception as e:  # noqa: BLE001  network trouble, a refused redirect, non-ASCII bytes ...
+        log.info("update signature: could not be fetched (%s)", type(e).__name__)
+        return None
 
 
 # ------------------------------------------------------------------------------------------- download
@@ -341,6 +408,11 @@ def _download(info, dest_dir, progress, stop_evt, timeout, allowed_hosts, deadli
         raise UpdateError("refusing download without a published sha256")
     if not _SHA_RE.match(want_sha):
         raise UpdateError("malformed sha256")
+    if update_sig.enabled() and not update_sig.verify_release(
+            getattr(info, "signature", ""), repo=REPO, version=getattr(info, "version", ""), asset_name=name,
+            size=size, sha256=want_sha):
+        # checked again here, on the very values the download and the installer start will use
+        raise UpdateError("refusing an update without a valid signature")
     expected = _expected_asset_url(info.tag, name)
     if expected is None or info.asset_url != expected:
         raise UpdateError(f"refusing unexpected download URL: {info.asset_url!r}")

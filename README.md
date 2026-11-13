@@ -93,6 +93,17 @@ newer version exists, the idle line says *Update to x.y.z available · click to 
 downloads the installer from this repo's Releases, checks its size and SHA-256 against what GitHub lists, closes,
 upgrades silently and starts again. A running Strata keeps running. Nothing is downloaded without your click.
 
+**Signed releases:** the SHA-256 comes from the same GitHub answer as the download, so it shows the file arrived
+whole, not who published it. A build that carries release keys (`update_sig.PUBLIC_KEYS`) therefore also wants a
+signature: each release has an `AgentStart-Setup-x.y.z.exe.sig` made with a key that is never on GitHub, over the
+repository, version, file name, size and SHA-256 of that installer, so a signature cannot be reused for another
+file or an older version. The app checks it before it offers the update and again before the download starts. A
+release without a valid signature is not installed from the app: Settings > About says so and links to the release
+page. A build without keys (every version before the first signed one, and test builds) updates by SHA-256 as
+before. Releases are signed with `python tools\sign_release.py INSTALLER --key KEYFILE` (it runs `ssh-keygen -Y
+sign`; the key file must be outside the repository), and `build.bat` refuses to build without keys unless
+`AGENTSTART_ALLOW_UNSIGNED_BUILD=1` marks a test build.
+
 Settings and logs live in `%APPDATA%\AgentStart` (`config.json`, `logs\`, `state.json`, `usage.json`); the first launch copies
 the bundled default config there. Uninstalling keeps that folder. Upgrading from the earlier name *Hermes
 Controller* replaces it and moves its settings over.
@@ -406,6 +417,7 @@ notification area on a runner). *Local* suites open the real window and take scr
 | `tests\test_update_controller.py` | Local | The update flow as its own controller, with a stubbed updater and a fake app: daily check, the manual "Check for updates" (ignores the interval, one request at a time), offer, confirm, download, install hand-off; the Settings button states (one invisible window) |
 | `tests\test_mem_watch.py` | CI | Memory-pressure trigger: the decision function on fake process lists (both conditions, sustain, once per session, protected and system apps, games already reported), config fallbacks, the shared scan |
 | `tests\test_resume_watch.py` | CI | When that app closes: is the game/app still running (fake process lists), the confirm window, gaps and expiry, the watcher with a fake clock and on its own thread, one read-only real snapshot (starts no process) |
+| `tests\test_update_sig.py` | CI | Update signatures: Ed25519 against the RFC 8032 vectors, the OpenSSH signature format, the signed manifest, replay and downgrade refusals, signatures made at test time with a throwaway key when `ssh-keygen` exists |
 | `tests\test_idle_watch.py` | CI | Idle auto-off: the idle clock (activity, unknown polls, sleep gaps, short replies) and the app's glue on a stand-in object: when it turns off, everything that makes it wait, the busy answer |
 | `tests\test_kill_path.py` | CI | What a stop may kill and when it refuses, on fake processes: kill targets, the launcher cmd.exe, identity, foreign listeners, busy, force |
 | `tests\test_engines.py` | CI | The engine interface: registry and `backend`, the Strata engine's answers, and a fake llama-server-shaped engine driving the supervisor (no unload, no launcher; an engine cannot widen a kill; API key never sent with the identity probe) |

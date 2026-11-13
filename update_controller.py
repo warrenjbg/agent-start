@@ -34,6 +34,7 @@ EXIT_AFTER_LAUNCH_MS = 400
 STARTED, JOINED, BUSY, UNAVAILABLE = "started", "joined", "busy", "unavailable"
 # on_result(status, version) statuses (version: the current one for "current", the new one for "newer")
 CURRENT, NEWER, ERROR = "current", "newer", "error"
+UNSIGNED = "unsigned"                   # a newer release whose signature does not verify (version: that release)
 
 ResultCallback = Callable[[str, "str | None"], Any]
 
@@ -71,6 +72,9 @@ def _download_update_worker(upd: Any, current: str, post: Callable, progress: Ca
     new offer goes back (as info, with an error) and the user is asked again."""
     try:
         status, info = upd.check(current)
+        if status == "unsigned":
+            post(done, None, None, "The update's signature could not be verified - not installed")
+            return
         if status != "newer" or info is None:
             post(done, None, None, "GitHub did not confirm the update" if status == "error" else "no newer version")
             return
@@ -137,6 +141,8 @@ class UpdateController:
         self.daily = bool(daily)
         self.no_check = not host.available() or not self.daily   # = the old AgentStartApp._no_update_check
         self.offer: Any = None                   # updater.UpdateInfo of a newer release (idle line, Settings link)
+        self.unsigned: Any = None                # UpdateInfo of a newer release that was refused (no valid signature)
+        self._unsigned_told: str | None = None   # that release's version once the user was told (one toast each)
         self.updating = False                    # confirm said yes: downloading / about to launch the installer
         self.checking = False                    # a GitHub check runs (daily or manual)
         self.next_at = 0.0                       # monotonic: no daily GitHub check before this
@@ -229,6 +235,21 @@ class UpdateController:
         self.checked_at = time.time()
         self.next_at = time.monotonic() + upd.CHECK_INTERVAL_S
         new = upd.UpdateInfo(**info_dict) if info_dict else None
+        if status == UNSIGNED:
+            # a newer release without a valid signature: never offered, never downloaded; say so once
+            self.offer, self.unsigned = None, new
+            self.host.save_state_later("update_checked_at", self.checked_at)
+            ver = new.version if new is not None else None
+            shown = self._notify(listeners, UNSIGNED, ver)
+            if ver and ver != self._unsigned_told:
+                self._unsigned_told = ver
+                log.warning("update %s is not offered: its signature could not be verified", ver)
+                if not shown:
+                    self.host.toast(APP_TITLE, f"Version {ver} is on GitHub, but its signature could not be "
+                                               "verified, so it is not installed from here. See Settings > About.")
+            self.host.request_preview()
+            return
+        self.unsigned = None
         known = self.offer.version if self.offer is not None else None
         self.offer = new
         self.host.save_state_later("update_checked_at", self.checked_at)
@@ -250,6 +271,21 @@ class UpdateController:
             except Exception:  # noqa: BLE001
                 log.exception("update check result callback failed")
         return shown
+
+    def open_unsigned_page(self) -> bool:
+        """Settings: open the GitHub page of the release that was refused (its signature did not verify), so the
+        user can read what is there. Only a page of this app's own repository is ever opened."""
+        info = self.unsigned
+        page = getattr(info, "page_url", None)
+        repo = getattr(self.upd, "REPO", "")
+        if not repo or not (isinstance(page, str) and page.startswith(f"https://github.com/{repo}/")):
+            return False
+        import webbrowser
+        try:
+            return bool(webbrowser.open(page))
+        except Exception:  # noqa: BLE001
+            log.debug("could not open the release page", exc_info=True)
+            return False
 
     # ------------------------------------------------------------------ settings switch
     def set_daily(self, on: bool) -> bool:

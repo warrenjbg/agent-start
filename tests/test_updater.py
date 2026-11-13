@@ -650,6 +650,185 @@ def test_download(base: str):
     shutil.rmtree(dest, ignore_errors=True)
 
 
+# --------------------------------------------------------------------------- signed releases
+# A test-only Ed25519 SIGNER (RFC 8032) built on update_sig's own curve arithmetic, and the OpenSSH SSHSIG
+# wrapping, so the updater's signature path is tested without ssh-keygen. The keys are throwaway seeds written
+# here in the open; the verifier under test is checked independently in test_update_sig.py (RFC vectors and
+# signatures made by the real ssh-keygen).
+
+def _ed_compress(p) -> bytes:
+    import update_sig as S
+    x, y, z, _t = p
+    zi = pow(z, -1, S._P)
+    x, y = x * zi % S._P, y * zi % S._P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_key(seed: bytes) -> tuple[int, bytes, bytes]:
+    import update_sig as S
+    h = hashlib.sha512(seed).digest()
+    a = (int.from_bytes(h[:32], "little") & ((1 << 254) - 8)) | (1 << 254)
+    return a, h[32:], _ed_compress(S._mul(a, S._G))
+
+
+def _ed_sign(seed: bytes, msg: bytes) -> bytes:
+    import update_sig as S
+    a, prefix, pub = _ed_key(seed)
+    r = int.from_bytes(hashlib.sha512(prefix + msg).digest(), "little") % S._L
+    big_r = _ed_compress(S._mul(r, S._G))
+    k = int.from_bytes(hashlib.sha512(big_r + pub + msg).digest(), "little") % S._L
+    return big_r + ((r + k * a) % S._L).to_bytes(32, "little")
+
+
+def _sshsig(seed: bytes, message: bytes, namespace: str | None = None, alg: str = "sha512") -> str:
+    import base64
+
+    import update_sig as S
+    ns = S.NAMESPACE if namespace is None else namespace
+    pub = _ed_key(seed)[2]
+    st = S._string
+    sig = _ed_sign(seed, S.signed_blob(ns, alg, message))
+    blob = (b"SSHSIG" + (1).to_bytes(4, "big") + st(st(b"ssh-ed25519") + st(pub)) + st(ns.encode()) + st(b"")
+            + st(alg.encode()) + st(st(b"ssh-ed25519") + st(sig)))
+    b64 = base64.b64encode(blob).decode()
+    return ("-----BEGIN SSH SIGNATURE-----\n" + "\n".join(b64[i:i + 70] for i in range(0, len(b64), 70))
+            + "\n-----END SSH SIGNATURE-----\n")
+
+
+def test_signature(base: str):
+    section("signed releases (local server, throwaway keys)")
+    import update_sig as S
+    sys.path.insert(0, str(ROOT / "tools"))
+    import check_release_keys
+    updater._ALLOW_LOCAL_HTTP_FOR_TESTS = True
+    hosts = {"127.0.0.1"}
+    seed, stranger = bytes(range(32)), bytes(range(100, 132))
+    pub = _ed_key(seed)[2]
+    vec_seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    check("the test signer reproduces RFC 8032 test vector 1 (key and signature)",
+          _ed_key(vec_seed)[2].hex() == "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+          and _ed_sign(vec_seed, b"").hex() ==
+          "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46b"
+          "d25bf5f0595bbe24655141438e7a100b")
+    body = os.urandom(60_000)
+    sha = hashlib.sha256(body).hexdigest()
+    sig_route = CANON + S.SIG_SUFFIX
+    dest = TMP / "signed"
+
+    def sig_text(by=seed, repo=updater.REPO, version="9.9.0", name=NAME, size=None, sha256=sha, ns=None) -> str:
+        return _sshsig(by, S.manifest(repo, version, name, len(body) if size is None else size, sha256), ns)
+
+    def serve(sig, **asset) -> None:
+        """The release (installer of `body`) with an optional .sig asset; asset fields can be overridden."""
+        extra = []
+        ROUTES.pop(sig_route, None)
+        if sig is not None:
+            raw = sig if isinstance(sig, bytes) else sig.encode()
+            a = {"name": NAME + S.SIG_SUFFIX, "size": len(raw), "state": "uploaded",
+                 "browser_download_url": f"{base}{sig_route}"}
+            a.update(asset)
+            extra.append(a)
+            ROUTES[sig_route] = {"body": raw}
+        serve_json("/signed", release(base, size=len(body), digest=f"sha256:{sha}", extra_assets=extra))
+        ROUTES[CANON] = {"body": body}
+
+    def run():
+        ok, r = no_raise(updater.check, "1.6.0", api_url=f"{base}/signed")
+        return r if ok and isinstance(r, tuple) else ("raised", r)
+
+    saved_keys = S.PUBLIC_KEYS
+    try:
+        # ---- a build without keys: exactly as before the feature
+        S.PUBLIC_KEYS = ()
+        serve(None)
+        st, info = run()
+        check("no keys in the build, release without a signature: 'newer' as before", st == "newer"
+              and isinstance(info, UpdateInfo) and info.signature == "", repr((st, info)))
+        ok, p = no_raise(updater.download, info, str(dest), allowed_hosts=hosts)
+        check("...and it downloads by SHA-256 as before", ok and sha_of(p) == sha, repr(p))
+        Path(p).unlink()
+        serve("junk that is not a signature")
+        check("no keys: a junk .sig asset is not even looked at", run()[0] == "newer")
+        check("build guard: no keys -> the build fails", check_release_keys.main(env={}) == 1)
+        check("build guard: no keys but the test-build override -> goes on",
+              check_release_keys.main(env={check_release_keys.OVERRIDE: "1"}) == 0
+              and check_release_keys.main(env={check_release_keys.OVERRIDE: "yes"}) == 1)
+        check("build guard: with a key -> fine", check_release_keys.main(env={}, keys=(pub,)) == 0)
+
+        # ---- a build with keys: only a release signed by one of them is offered
+        S.PUBLIC_KEYS = (_ed_key(bytes(range(50, 82)))[2], pub)        # primary + backup; signed by the second
+        good = sig_text()
+        serve(good)
+        st, info = run()
+        check("valid signature: 'newer', the signature rides with the info", st == "newer"
+              and isinstance(info, UpdateInfo) and info.signature == good, repr(st))
+        ok, p = no_raise(updater.download, info, str(dest), allowed_hosts=hosts)
+        check("...and it downloads", ok and sha_of(p) == sha, repr(p))
+        if ok:
+            Path(p).unlink()
+        refused = [
+            ("no .sig asset in the release", lambda: serve(None)),
+            ("signed by a key the app does not trust", lambda: serve(sig_text(by=stranger))),
+            ("a signature of another version (replay / downgrade)", lambda: serve(sig_text(version="9.8.0",
+                                                                           name="AgentStart-Setup-9.8.0.exe"))),
+            ("a signature of another size", lambda: serve(sig_text(size=len(body) + 1))),
+            ("a signature of another sha256 (the installer was swapped)", lambda: serve(sig_text(sha256="cd" * 32))),
+            ("a signature made for another repository", lambda: serve(sig_text(repo="someone/else"))),
+            ("a signature in another namespace", lambda: serve(sig_text(ns="file"))),
+            ("a tampered signature", lambda: serve(good.replace(good[60], "A" if good[60] != "A" else "B", 1))),
+            ("junk instead of a signature", lambda: serve("hello")),
+            ("non-ASCII bytes", lambda: serve(b"\xff\xfe" * 40)),
+            (".sig URL on another path", lambda: serve(good, browser_download_url=f"{base}/elsewhere.sig")),
+            (".sig URL on another host", lambda: serve(good, browser_download_url=f"https://example.com{sig_route}")),
+            (".sig not uploaded yet", lambda: serve(good, state="new")),
+            (".sig listed larger than allowed", lambda: serve(good, size=S.MAX_SIG_BYTES + 1)),
+            (".sig listed with size 0", lambda: serve(good, size=0)),
+            (".sig listed with a size that is not a number", lambda: serve(good, size=True)),
+            (".sig body longer than listed", lambda: serve(good, size=len(good) - 5)),
+            (".sig body shorter than listed", lambda: serve(good, size=len(good) + 5)),
+        ]
+        ROUTES["/elsewhere.sig"] = {"body": good.encode()}       # a valid signature, but not where it must be
+        for why, arrange in refused:
+            arrange()
+            st, info = run()
+            check(f"{why}: 'unsigned', with the release page", st == "unsigned" and isinstance(info, UpdateInfo)
+                  and info.signature == "" and info.page_url.startswith(f"https://github.com/{updater.REPO}/"),
+                  repr(st))
+            if isinstance(info, UpdateInfo):
+                ROUTES.pop(CANON, None)          # the installer is not even asked for: a 404 would say so
+                ok, e = raises_update_error(updater.download, info, str(dest), allowed_hosts=hosts)
+                check(f"{why}: download refuses before any request", ok and "signature" in e, e)
+        serve(good)
+        ROUTES[sig_route] = {"status": 404, "body": b""}
+        check(".sig answers 404: 'unsigned'", run()[0] == "unsigned")
+        ROUTES[sig_route] = {"location": "https://example.com/x.sig"}
+        check(".sig redirects to a host that is not allowed: 'unsigned'", run()[0] == "unsigned")
+        check("check_latest() offers nothing for an unsigned release",
+              updater.check_latest("1.6.0", api_url=f"{base}/signed") is None)
+
+        # ---- the info is checked again at download time, on the values the download will use
+        serve(good)
+        st, info = run()
+        for field, value in (("size", len(body) + 1), ("sha256", "ef" * 32), ("version", "9.9.1"),
+                             ("signature", ""), ("signature", sig_text(by=stranger))):
+            bad = UpdateInfo(**{**info.__dict__, field: value})
+            ROUTES.pop(CANON, None)
+            ok, e = raises_update_error(updater.download, bad, str(dest), allowed_hosts=hosts)
+            check(f"info with another {field} than was signed: download refuses before any request",
+                  ok and "signature" in e, e)
+        serve(good)
+        serve_json("/signed-old", release(base, tag="v1.0.0"))
+        check("not newer: 'current' (no signature needed for that)",
+              updater.check("1.6.0", api_url=f"{base}/signed-old") == ("current", None))
+        check("nothing but finished files is left in the download folder",
+              not dest.exists() or not list(dest.iterdir()), repr(list(dest.iterdir()) if dest.exists() else []))
+    finally:
+        S.PUBLIC_KEYS = saved_keys
+        ROUTES.pop(sig_route, None)
+        ROUTES.pop("/elsewhere.sig", None)
+    check("the shipped key list is restored", S.PUBLIC_KEYS is saved_keys)
+
+
 def test_cleanup():
     section("cleanup_old")
     d = TMP / "cleanup"
@@ -1034,7 +1213,7 @@ def main() -> int:
     updater._DOWNLOAD_BASE = base
     try:
         for fn in (test_versions, test_due, test_url_ok, lambda: test_check(base), lambda: test_download(base),
-                   test_cleanup, test_default_dir, test_launch, test_real_inno):
+                   lambda: test_signature(base), test_cleanup, test_default_dir, test_launch, test_real_inno):
             try:
                 fn()
             except Exception:
