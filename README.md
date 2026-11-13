@@ -403,6 +403,7 @@ notification area on a runner). *Local* suites open the real window and take scr
 | `tests\test_llama_finder.py` | CI | The search for llama.cpp builds and model files, on made-up folders: what counts, what is skipped, ranking, limits |
 | `tests\test_engine_profiles.py` | CI | Per-engine launch settings: parked on a switch, restored on the way back, a 1.11.0 config sorted out |
 | `tests\test_engine_switch.py` | Local | Engine switch in the app window: the question, Turn off first, saved only then, restart (opens windows) |
+| `tests\test_review_fixes.py` | Local | Fixes from the v1.12 review: memory-watch arming, engine switch during a pending turn off, apps left by an interrupted reopen, sweep-dialog clicks (opens windows) |
 | `tests\test_engine_find.py` | Local | After a switch: automatic set-up with one clear choice, else Build / Model dropdowns (opens windows) |
 | `tests\test_llama_cpp.py` | CI | The llama.cpp engine on fakes only (nothing started or contacted): identity, launch checks and Save, `/health` and `/slots`, log parsing, load phases, the GPU-fit pre-check arguments, and stop/adopt through the real supervisor |
 | `tests\test_metrics_sample.py` | CI | Engine-neutral metrics samples: the Strata converter, old-vs-new store equivalence, a non-Strata sample, the Strata poller with fake fetchers |

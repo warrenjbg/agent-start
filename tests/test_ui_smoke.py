@@ -629,9 +629,10 @@ def test_error_and_cancel(app, det, ep) -> None:
 def test_sweep_dialog_close_x(app, det, ep) -> None:
     rec = []
     dlg = SweepDialog(app, [dict(c) for c in CANDS], lambda d, t: rec.append((d, t)))
-    pump(app, 0.3)
+    pump(app, 0.6)                               # past sweep_dialog.ARM_S: clicks before it are ignored
     cmd = dlg.protocol("WM_DELETE_WINDOW")
     dlg.tk.call(cmd)
+    pump(app, 0.1)                               # a click decides one event-loop turn later
     dlg._decide("start_only")
     dlg._decide("close_and_start")
     pump(app, 0.1)
@@ -648,6 +649,7 @@ def test_sweep_dialog_close_x(app, det, ep) -> None:
     n = len(ep.start_calls)
     app.on_toggle()
     check(pump_until(app, lambda: isinstance(app.dialog, SweepDialog)), "dialog for close-X flow")
+    pump(app, 0.6)                               # past sweep_dialog.ARM_S
     app.dialog.tk.call(app.dialog.protocol("WM_DELETE_WINDOW"))
     pump(app, 0.2)
     check(app.state_name == "IDLE" and len(ep.start_calls) == n and app.dialog is None, "close-X in flow -> IDLE")

@@ -56,13 +56,26 @@ def _check_update_worker(upd: Any, current: str, post: Callable, done: Callable)
     post(done, status, asdict(info) if info is not None else None)
 
 
+def _number(value: Any) -> float:
+    """A number from state.json, 0.0 for anything else (a hand-edited or damaged entry must not raise)."""
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _download_update_worker(upd: Any, current: str, post: Callable, progress: Callable, done: Callable,
-                            stop_evt: Any) -> None:
-    """Worker: re-check GitHub (the URL and digest used are this minute's, not a cached copy), download, verify."""
+                            stop_evt: Any, expected: str | None = None) -> None:
+    """Worker: re-check GitHub (the URL and digest used are this minute's, not a cached copy), download, verify.
+    expected: the version the user said yes to. If GitHub lists another one by now, nothing is downloaded: the
+    new offer goes back (as info, with an error) and the user is asked again."""
     try:
         status, info = upd.check(current)
         if status != "newer" or info is None:
             post(done, None, None, "GitHub did not confirm the update" if status == "error" else "no newer version")
+            return
+        if expected is not None and info.version != expected:
+            post(done, None, asdict(info), f"{info.version} is out now - click again")
             return
         last = [0.0]
 
@@ -110,6 +123,7 @@ class UpdateHost:
     frozen: Callable[[], bool]                   # installed build: the installer gets /DIR=<this exe's folder>
     engine_name: Callable[[], str] = lambda: "Strata"   # the inference engine's name, for the texts
     stop_evt: Any = None                         # threading.Event set on app exit (cancels a download)
+    acquire_singleton: Callable[[], None] = lambda: None   # undo release_singleton (the installer did not start)
 
 
 class UpdateController:
@@ -274,7 +288,7 @@ class UpdateController:
         self.updating = True
         h.set_note(f"Downloading update {info.version}…")
         h.run_worker("hc-update-download", _download_update_worker, self.upd, self.version, h.post,
-                     self._progress, self._downloaded, h.stop_evt)
+                     self._progress, self._downloaded, h.stop_evt, info.version)
 
     def _progress(self, done: int, total: int) -> None:
         if self.updating and total:
@@ -284,6 +298,12 @@ class UpdateController:
         h = self.host
         if err or not path or not info_dict:
             self.updating = False
+            if info_dict and not path:           # another version than the one confirmed: offer that one
+                try:
+                    self.offer = self.upd.UpdateInfo(**info_dict)
+                    h.request_preview()
+                except Exception:  # noqa: BLE001
+                    log.debug("could not refresh the offer", exc_info=True)
             log.warning("update download failed: %s", err)
             h.set_note(f"Update failed\n{_short(err or 'download failed', 40)}")
             return
@@ -303,6 +323,7 @@ class UpdateController:
                                  wait_pid=os.getpid())
         except Exception as exc:  # noqa: BLE001
             self.updating = False
+            h.acquire_singleton()                # we keep running: be the single instance again
             h.save_state({"update_pending": None})
             log.exception("could not start the installer")
             h.set_note(f"Update failed\n{_short(str(exc), 40)}")
@@ -321,6 +342,6 @@ class UpdateController:
         if pend.get("version") == self.version:
             log.info("updated from %s to %s", pend.get("from"), self.version)
             self.host.set_note(f"Updated to {self.version}")
-        elif time.time() - float(pend.get("at") or 0) < PENDING_REPORT_S:
+        elif time.time() - _number(pend.get("at")) < PENDING_REPORT_S:
             log.warning("the update to %s did not install (log: %s)", pend.get("version"), pend.get("log"))
             self.host.set_note(f"Update to {pend.get('version')} did not install\nDetails: updates\\install.log")

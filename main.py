@@ -153,6 +153,7 @@ NOTE_HOLD_S = 4.0                        # a one-off result line stays this long
 ERROR_HOLD_S = 15.0
 
 _SINGLETON_MUTEX = None  # kept referenced for process life (see main())
+_SINGLETON_RELEASED = False  # an update gave the mutex up (see _acquire_singleton)
 
 
 def _gb(mb: float | None, digits: int = 1) -> str:
@@ -436,14 +437,29 @@ def _refresh_autostart_worker(exe: str) -> None:
 
 
 def _release_singleton() -> None:
-    global _SINGLETON_MUTEX
+    global _SINGLETON_MUTEX, _SINGLETON_RELEASED
     m, _SINGLETON_MUTEX = _SINGLETON_MUTEX, None
     if m is not None:
+        _SINGLETON_RELEASED = True
         try:
             import win32api
             win32api.CloseHandle(m)
         except Exception:  # noqa: BLE001
             log.debug("mutex release failed", exc_info=True)
+
+
+def _acquire_singleton() -> None:
+    """Take the single-instance mutex back: an update released it for the installer, which then did not start.
+    Only after a real release - a process that never held it (tests, a run from source) does not create it."""
+    global _SINGLETON_MUTEX, _SINGLETON_RELEASED
+    if _SINGLETON_MUTEX is not None or not _SINGLETON_RELEASED:
+        return
+    _SINGLETON_RELEASED = False
+    try:
+        import win32event
+        _SINGLETON_MUTEX = win32event.CreateMutex(None, False, "AgentStart.Singleton")
+    except Exception:  # noqa: BLE001
+        log.debug("mutex re-acquire failed", exc_info=True)
 
 
 def _find_install_worker(engine, post: Callable, done: Callable, stop_evt) -> None:
@@ -658,6 +674,7 @@ class AgentStartApp(ctk.CTk):
                        toast=lambda title, msg: self._run_worker("hc-toast", _toast_worker, title, msg),
                        engine_state=lambda: self.state_name, dialog_open=self._dialog_open,
                        box_open=lambda: self._box_open, release_singleton=_release_singleton,
+                       acquire_singleton=_acquire_singleton,
                        finish_exit=self._finish_exit,
                        available=lambda: self._extras and config_store.FROZEN,
                        frozen=lambda: config_store.FROZEN, stop_evt=self._stop_evt,
@@ -684,6 +701,7 @@ class AgentStartApp(ctk.CTk):
 
         self._idle_streak = 0                   # consecutive "idle" status readings while ACTIVE
         self._state_seq = 0                     # bumped on every state change: stale monitor readings are dropped
+        self._switch_after_reopen = False       # engine switch: save + restart once the reopen worker is done
         self.report_callback_exception = (
             lambda exc, val, tb: log.error("Tk callback failed", exc_info=(exc, val, tb)))
         self.title(APP_TITLE)
@@ -1228,11 +1246,14 @@ class AgentStartApp(ctk.CTk):
                 return
             results = reopen.reopen(records, stagger_s=REOPEN_STAGGER_S, stop_evt=self._stop_evt,
                                     on_progress=lambda d, t, n: self.post(self._reopen_progress, d, t, n))
-            if manual:
-                reopen.save_pending(manual)
+            # interrupted (Quit, a restart): what was not started yet stays pending and is offered at the next
+            # start, instead of being dropped from the file
+            keep = reopen.not_started(auto, results) + list(manual)
+            if keep:
+                reopen.save_pending(keep)
             else:
                 reopen.clear_pending()
-            self.post(self._reopen_done, results, [r.to_dict() for r in manual])
+            self.post(self._reopen_done, results, [r.to_dict() for r in keep])
         except Exception:  # noqa: BLE001
             log.exception("reopen failed")
             self.post(self._reopen_done, [], [])
@@ -1243,6 +1264,9 @@ class AgentStartApp(ctk.CTk):
 
     def _reopen_done(self, results: list, manual: list) -> None:
         self._reopening = False
+        if self._switch_after_reopen:            # turned off for an engine switch: the apps are back, carry on
+            self._switch_after_reopen = False
+            self.after(300, self._engine_switch_save)
         started = [r["name"] for r in results if r.get("ok")]
         failed = [r for r in results if not r.get("ok") and r.get("status") != "cancelled"]
         for r in failed:
@@ -1916,9 +1940,15 @@ class AgentStartApp(ctk.CTk):
         if live != "idle":
             self._idle_streak = 0
         if live == "active":
-            changed = self.state_name != ACTIVE or self.loaded != status.get("loaded") \
+            loaded = status.get("loaded")
+            if loaded is None and self.state_name == ACTIVE and self.loaded is not None:
+                # The health check did not answer this time (a server pushed out of RAM answers late): unknown
+                # is not a change. Treating it as one disarmed the memory watch, and the re-arm took a new
+                # baseline AFTER the model had been evicted - silent exactly when it should speak.
+                loaded = self.loaded
+            changed = self.state_name != ACTIVE or self.loaded != loaded \
                 or (status.get("model_id") and status.get("model_id") != self.model_id)
-            self.loaded = status.get("loaded")
+            self.loaded = loaded
             if status.get("model_id"):
                 self.model_id = status.get("model_id")
             if changed:
@@ -1938,6 +1968,7 @@ class AgentStartApp(ctk.CTk):
     def _reconcile_now(self, note: str | None = None) -> None:
         """start/stop_endpoint returned False: show IDLE, then reconcile from a status() fetched on a worker."""
         self._start_phase = None
+        self.loaded = None                       # nothing is known until that status arrives
         self._set_state(IDLE)
         if note:
             self._set_note(note)
@@ -1982,7 +2013,9 @@ class AgentStartApp(ctk.CTk):
             self._update_telemetry()
             self._request_preview()
             self._sync_tray()
-            self.watch.arm_memory(self.loaded is True)   # the model finished loading after the state changed
+            # the model finished loading after the state changed. Only while serving: `loaded` can be left over
+            # from the last run, and a baseline taken mid-unload or before the next load fills RAM is wrong
+            self.watch.arm_memory(self.state_name == ACTIVE and self.loaded is True)
             self._engine_switch_check()
             self.watch.deliver_queued()          # a game that started while a dialog / box was open
             if self.tray is None and not self._no_tray and time.monotonic() < self._tray_retry_until:
@@ -1990,13 +2023,17 @@ class AgentStartApp(ctk.CTk):
             self.updates.maybe_check()
             if self.state_name == ACTIVE and not self._detail_forced():
                 self._show_serving()             # uptime / last reply speed
+        finally:
             # Collect garbage HERE, on the Tk thread: closed dialogs leave Tk objects (CTkFont, images) in reference
             # cycles, and if the collector happens to run on a worker instead, their __del__ makes a Tk call off the
             # main thread (blocks until the main loop services it; forever once it has stopped). Cheap: ~1 ms.
-            gc.collect()
-        finally:
-            if not self._destroyed:
-                self._tick_id = self.after(TICK_MS, self._tick)
+            # In the finally: automatic collection is off, so a step above that raises on every tick must not
+            # stop it for good.
+            try:
+                gc.collect()
+            finally:
+                if not self._destroyed:
+                    self._tick_id = self.after(TICK_MS, self._tick)
 
     def _request_preview(self) -> None:
         # ERROR keeps its message (and log link) until the user acts; only IDLE shows the sweep preview
@@ -2256,11 +2293,6 @@ class AgentStartApp(ctk.CTk):
         self.loaded = True
         self.model_id = None
         self._ready_mono = time.monotonic()
-        try:
-            if self.endpoint.status().get("adopted"):   # a server that was already running: the pre-check saw ITS
-                self._gpu_fit_pre = False                # memory as used, so its answer says nothing about it
-        except Exception:  # noqa: BLE001
-            log.debug("adopted check failed", exc_info=True)
         if elapsed > 15:                         # a real cold load (adopting a running server is ~instant)
             old = self._expected_s
             self._expected_s = elapsed if not old else max(elapsed, 0.5 * old + 0.5 * elapsed)
@@ -2278,9 +2310,19 @@ class AgentStartApp(ctk.CTk):
             except Exception:
                 log.exception("endpoint.status() failed")
                 return
-            self.post(self.on_status, st)
+            self.post(self._ready_status, st)
 
         self._run_worker("hc-ready-status", work)
+
+    def _ready_status(self, status: dict) -> None:
+        """The first status() after ready (fetched on a worker: it probes the server over HTTP)."""
+        if (status or {}).get("adopted") and self._gpu_fit_pre:
+            # a server that was already running: the pre-check saw ITS memory as used, so its answer says
+            # nothing about it
+            self._gpu_fit_pre = False
+            if self.state_name == ACTIVE:
+                self._apply_state()
+        self.on_status(status)
 
     def _on_start_error(self, token: int, msg: str) -> None:
         if not self._token_live(token):
@@ -2624,10 +2666,10 @@ class AgentStartApp(ctk.CTk):
                                                      if self._pending_launcher else self.cfg.get("model_name")))
                 self.after(300, self._switch_start)
             elif self._switch_to is not None and not self._exit_pending:
-                # turned off for an engine switch: reopen what the sweep closed (it cannot be offered after the
-                # restart), then save the choice and restart
+                # turned off for an engine switch: reopen what the sweep closed, and only once that has finished
+                # (_reopen_done) save the choice and restart - the restart would cut the reopening short
+                self._switch_after_reopen = True
                 self._run_worker("hc-reopen", self._reopen_worker, self._reopen_pref and not self._skip_reopen_once)
-                self.after(1200, self._engine_switch_save)
             elif not self._exit_pending:
                 self.watch.arm_resume(stop_game)      # stopped for a game / an app: offer the turn-on once it closes
                 self._reopening = True
@@ -2918,6 +2960,14 @@ class AgentStartApp(ctk.CTk):
             except Exception:  # noqa: BLE001
                 log.debug("closing Settings failed", exc_info=True)
         if self.state_name == ACTIVE:
+            if self._stop_pending is not None:
+                # Already "turns off after this reply": the switch waits with it. on_toggle() here would be the
+                # "Stop now" button and cut the reply off without a question.
+                if self._stop_pending[0] == "switch":      # a queued model switch: the other engine replaces it
+                    self._stop_pending = ("off", None)
+                    self._apply_state()
+                log.info("engine switch: waiting for the pending turn off")
+                return                            # _on_stopped carries on (or _tick drops it if cancelled)
             self.on_toggle()                      # the user's own Turn off, with its "a reply is running" question
             return                                # _on_stopped carries on (or _tick drops the switch if declined)
         self._engine_switch_save()

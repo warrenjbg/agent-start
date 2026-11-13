@@ -151,6 +151,7 @@ class FakeHost:
             dialog_open=lambda: self.dialog,
             box_open=lambda: self.box,
             release_singleton=lambda: self.events.append("release"),
+            acquire_singleton=lambda: self.events.append("acquire"),
             finish_exit=lambda: self.events.append("exit"),
             available=lambda: self.avail,
             frozen=lambda: self.is_frozen,
@@ -506,6 +507,25 @@ def test_install() -> None:
     fh.pump(lambda: not c.updating, 3)
     check("installer refused: pending cleared, note, app stays", fh.state.get("update_pending") is None
           and fh.notes[-1] == "Update failed\nhash mismatch" and "exit" not in fh.events and not c.installing)
+    check("installer refused: the single-instance mutex is taken back after it was released",
+          "release" in fh.events and "acquire" in fh.events
+          and fh.events.index("acquire") > fh.events.index("release"), str(fh.events))
+
+    # a newer release appeared between the question and the download: nothing is installed unasked
+    fh, st, c = make()
+    c.offer, st.result = info("9.9.0"), ("newer", info("9.9.1"))
+    c.install()
+    fh.pump(lambda: not c.updating, 3)
+    check("confirmed 9.9.0, GitHub now lists 9.9.1: no download, no installer",
+          "9.9.0" in fh.asked[-1] and not st.downloads and not st.launches and "release" not in fh.events
+          and "exit" not in fh.events, f"{st.downloads} {st.launches} {fh.events}")
+    check("...the offer now names 9.9.1 and the note says to click again",
+          c.offer is not None and c.offer.version == "9.9.1" and not c.updating
+          and fh.notes[-1] == "Update failed\n9.9.1 is out now - click again", f"{c.offer} {fh.notes[-1]!r}")
+    c.install()
+    fh.pump(lambda: bool(st.launches), 3)
+    check("asked again for 9.9.1, then that one installs", "9.9.1" in fh.asked[-1] and st.downloads == ["9.9.1"]
+          and len(st.launches) == 1, f"{fh.asked[-1]!r} {st.downloads}")
 
     # deferred while a dialog / box is open or Strata starts
     for what in ("dialog", "box", "STARTING"):
@@ -543,6 +563,16 @@ def test_report_result() -> None:
     fh.state["update_pending"] = {"version": "9.9.0", "from": CUR, "at": time.time() - 8 * 86400}
     c.report_result()
     check("older than a week: cleared silently", not fh.notes and fh.state["update_pending"] is None)
+    for bad in ("abc", {"x": 1}, [1], None):
+        fh, st, c = make()
+        fh.state["update_pending"] = {"version": "9.9.0", "from": CUR, "at": bad}
+        try:
+            c.report_result()
+            raised = False
+        except Exception:  # noqa: BLE001
+            raised = True
+        check(f"a damaged 'at' ({bad!r}) does not raise; cleared silently",
+              not raised and not fh.notes and fh.state["update_pending"] is None)
     fh, st, c = make()
     c.report_result()
     check("nothing pending: nothing", not fh.notes and "update_pending" not in fh.state)

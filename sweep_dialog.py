@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import time
 from typing import Callable
 
 import customtkinter as ctk
@@ -13,6 +14,7 @@ import theme as T
 log = logging.getLogger("agent_start")
 
 DECISIONS = ("close_and_start", "start_only", "cancel")
+ARM_S = 0.4          # clicks are ignored for this long after opening (tests set it to 0); see _click
 
 _BG = T.BG
 _ROW_BG = T.SURFACE
@@ -140,6 +142,7 @@ class SweepDialog(ctk.CTkToplevel):
         self._on_decision = on_decision
         self._engine_name = engine_name
         self._decided = False
+        self._armed_at = time.monotonic() + ARM_S
         self._rows: list[tuple[ctk.BooleanVar, dict]] = []
         self._ram = ram if ram is not None and getattr(ram, "need_mb", 0) > 0 else None
         # None = feature off (no checkbox). The choice is read by the caller after the decision.
@@ -151,8 +154,8 @@ class SweepDialog(ctk.CTkToplevel):
         self.resizable(False, False)
         center_over(self, master, self.WIDTH, self.HEIGHT + (self.RAM_LINE_H if self._ram else 0)
                     + (self.REOPEN_H if self._reopen_var is not None else 0))
-        self.protocol("WM_DELETE_WINDOW", lambda: self._decide("cancel"))
-        self.bind("<Escape>", lambda _e: self._decide("cancel"))
+        self.protocol("WM_DELETE_WINDOW", lambda: self._click("cancel"))
+        self.bind("<Escape>", lambda _e: self._click("cancel"))
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)       # rows: title, warning, RAM check (opt.), list, reopen (opt.), buttons
@@ -211,15 +214,15 @@ class SweepDialog(ctk.CTkToplevel):
         btns.grid_columnconfigure((0, 1), weight=1, uniform="b")
         self._close_btn = ctk.CTkButton(btns, text="Close selected & start", height=32,
                                         fg_color=_DANGER, hover_color=_DANGER_HOVER,
-                                        command=lambda: self._decide("close_and_start"))
+                                        command=lambda: self._click("close_and_start"))
         self._close_btn.grid(row=0, column=0, columnspan=2, sticky="ew")
         ctk.CTkButton(btns, text="Start without closing", height=28, fg_color=_NEUTRAL,
                       hover_color=_NEUTRAL_HOVER, font=ctk.CTkFont(family=T.ui_family(), size=12),
-                      command=lambda: self._decide("start_only")).grid(
+                      command=lambda: self._click("start_only")).grid(
             row=1, column=0, sticky="ew", padx=(0, 4), pady=(6, 0))
         ctk.CTkButton(btns, text="Cancel", height=28, fg_color="transparent", border_width=1,
                       border_color=_NEUTRAL_HOVER, hover_color=_NEUTRAL, font=ctk.CTkFont(family=T.ui_family(), size=12),
-                      command=lambda: self._decide("cancel")).grid(
+                      command=lambda: self._click("cancel")).grid(
             row=1, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
 
         self._update_buttons()
@@ -256,6 +259,18 @@ class SweepDialog(ctk.CTkToplevel):
             self._ram_live.configure(text=r.detail + " · will load slower", text_color=_WARN)
         else:
             self._ram_live.configure(text=f"Still ~{_gb(gap)} short → Low-RAM mode (slower)", text_color=_WARN)
+
+    def _click(self, decision: str) -> None:
+        """A button, Esc or the close box. Ignored while the window is still being set up (closing a CTkToplevel
+        that early crashed Tk, and a double-click on Turn on lands its second click here). The decision itself
+        runs one event-loop turn later: it destroys this window and re-lays out the main one, which is not safe
+        inside the clicked button's own command (see busy_dialog)."""
+        if self._decided or time.monotonic() < self._armed_at:
+            return
+        try:
+            self.after(1, lambda: self._decide(decision))
+        except Exception:  # noqa: BLE001 - the window is already going away
+            log.debug("SweepDialog: click %s dropped", decision, exc_info=True)
 
     def _decide(self, decision: str) -> None:
         if self._decided:
