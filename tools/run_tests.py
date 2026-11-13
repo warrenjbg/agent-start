@@ -31,7 +31,7 @@ CI_SUITES = [
     "test_ram_plan", "test_stats", "test_reopen", "test_game_watch", "test_strata_finder", "test_autostart",
     "test_toasts", "test_updater", "test_server_manager", "test_mem_watch", "test_resume_watch", "test_usage_history",
     "test_llama_cpp", "test_fit_check", "test_fit_watch", "test_llama_finder", "test_engine_profiles",
-    "test_strata_tuning", "test_llama_models", "test_update_sig",
+    "test_strata_tuning", "test_llama_models", "test_update_sig", "test_hf_download",
     "test_kill_path", "test_engines", "test_metrics_sample",
 ]
 # Run in CI as advisory (non-blocking): they depend on what the runner's desktop/hardware happens to provide.
