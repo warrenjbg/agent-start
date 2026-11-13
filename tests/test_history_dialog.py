@@ -213,14 +213,11 @@ def test_formatters() -> None:
     eq(hd.usage_cells(Usage(served_s=18 * 60)), ("0", "–", "–", "–", "18 m", "–", "–"),
        "0 requests: tokens are dashes")
     eq(hd.usage_cells(mu("m", 3, 0, 0, None, 0)), ("3", "0", "0", "–", "–", "–", "–"), "requests without tokens: zeros")
-    eq(hd.card_values(Usage()), {"requests": "0", "generated tokens": "0", "avg tok/s": "–", "served": "–",
-                                 "GPU energy": "–"}, "empty cards")
-    # GPU energy: the card, the two table cells
-    for v, want in ((None, "–"), (0, "–"), (-1, "–"), (float("nan"), "–"), (0.001, "< 0.01 Wh"), (0.42, "0.42 Wh"),
-                    (9.994, "9.99 Wh"), (12.34, "12.3 Wh"), (842.4, "842 Wh"), (999.4, "999 Wh"),
-                    (999.6, "1.00 kWh"), (1234.0, "1.23 kWh"), (12_345.0, "12.3 kWh"), (123_456.0, "123 kWh"),
-                    (1_234_567.0, "1,235 kWh")):
-        eq(hd.fmt_energy(v), want, f"fmt_energy({v!r})")
+    eq(hd.usage_cells(Usage()), ("0", "–", "–", "–", "–", "–", "–"), "nothing recorded: an empty row")
+    eq(hd.usage_cells(None), ("0", "–", "–", "–", "–", "–", "–"), "no totals at all (a failing store): an empty row")
+    eq([hd.total_label(r) for r in hd.RANGES], ["Last 7 days", "Last 30 days", "All days"],
+       "the totals row's name per range")
+    # GPU energy: the two table cells
     for v, want in ((None, "–"), (0, "–"), (0.001, "< 0.01"), (0.42, "0.42"), (62.4, "62.4"), (372.4, "372"),
                     (1234.4, "1,234")):
         eq(hd.fmt_wh(v), want, f"fmt_wh({v!r})")
@@ -232,14 +229,22 @@ def test_formatters() -> None:
        "energy without reply energy: Wh shown, tok/Wh a dash")
     eq(hd.usage_cells(mu("m", 2, 10, 300, 50.0, 60, 0.0, 0.0, 300))[-2:], ("–", "–"),
        "no energy (a day from before energy metering): dashes")
-    eq(hd.card_values(Usage(gpu_wh=1500.0))["GPU energy"], "1.50 kWh", "GPU energy card in kWh")
-    # layout constants: CARD_KEYS / COLUMNS are the source of truth
-    eq((hd.WIDTH, len(hd.CARD_KEYS), len(hd.COLUMNS), len(hd.COL_RIGHT)), (620, 5, 8, 7), "620 px, 5 cards, 8 columns")
-    eq(hd.COLUMNS[-2:], ("GPU Wh", "tok/Wh"), "the two new columns are on the right")
-    check(all(a > b for a, b in zip(hd.COL_RIGHT, hd.COL_RIGHT[1:])) and hd.COL_RIGHT[-1] > 0,
-          f"column right edges strictly ordered: {hd.COL_RIGHT}")
+    eq(hd.usage_cells(mu("m", 2, 10, 300, 50.0, 60, 4210.0, 0.25, 300))[-2], "4,210",
+       "a large total stays in Wh, like its column heading")
+    # layout constants: one margin, seven equal number columns, every distance on a 4 px grid
+    eq((hd.WIDTH, hd.HEIGHT, hd.PAD, hd.COL_W, len(hd.COLUMNS)), (744, 673, 24, 76, 8),
+       "744 x 673 px, 24 px margins, 8 columns")
+    eq(hd.COLUMNS, ("Day", "Requests", "Tokens in", "Tokens out", "Tok/s", "Served", "GPU Wh", "Tok/Wh"),
+       "column headings")
+    grid = (hd.PAD, hd.EDGE, hd.HEAD_H, hd.CHART_H, hd.AXIS_H, hd.TABLE_HEAD_H, hd.TOTAL_H, hd.TABLE_BODY_H,
+            hd.NOTE_H, hd.CLOSE_H, hd.GAP_CHART, hd.GAP_AXIS, hd.GAP_TABLE, hd.GAP_FOOT, hd.COL_W, hd.DAY_ROW_H,
+            hd.MODEL_ROW_H, hd.GROUP_PAD, hd.MODEL_INDENT)
+    check(all(v % 4 == 0 for v in grid), f"every distance is a multiple of 4 px: {grid}")
+    eq(hd.WIDTH - 2 * hd.PAD - 7 * hd.COL_W, 164, "the day / model column gets what the seven number columns leave")
+    eq(hd.PAD - hd.SCROLL_GAP - hd.SCROLLBAR_W, 10, "the scrollbar fits inside the right margin")
     check("whole graphics card" in hd.ENERGY_NOTE and "not only the engine" in hd.ENERGY_NOTE
-          and "tok/Wh" in hd.ENERGY_NOTE and hd.NOTE_H > 0, "the energy note says it is the whole card")
+          and "Tok/Wh" in hd.ENERGY_NOTE and hd.NOTE == hd.FOOTER + ". " + hd.ENERGY_NOTE and hd.NOTE_H > 0,
+          "the note says the history stays on this PC and that the energy is the whole card")
     eq(hd.range_start(TODAY, 30, None), TODAY - D(days=29), "range_start 30 days")
     eq(hd.range_start(TODAY, None, TODAY - D(days=10)), TODAY - D(days=10), "range_start All")
     eq(hd.range_start(TODAY, None, TODAY - D(days=300)), TODAY - D(days=89), "range_start All capped at 90")
@@ -254,13 +259,17 @@ def test_build_view() -> None:
     eq(v.bars[-3], 74_000, "30-day view: two days ago")
     eq(v.bars[-4], 0, "30-day view: served-only day is an empty slot")
     eq(v.axis, ("15 Oct", hd.AXIS_CAPTION, "Today"), "30-day axis")
+    eq((v.total_label, v.total), ("Last 30 days", ("322", "4.61 M", "262 K", "98.5", "8 h 20 m", "377", "1,240")),
+       "30-day totals: the same seven cells as a row")
     eq([r.label for r in v.rows if r.kind == "day"], ["Today", "Wed 11 Nov", "Tue 10 Nov", "Sat 24 Oct"],
        "30-day day rows newest first, the 40-day-old one left out")
     v7 = hd.build_view(h, 7, TODAY)
     eq(v7.axis[0], "7 Nov", "7-day axis starts 6 days back")
     va = hd.build_view(h, None, TODAY)
     eq(len(va.bars), 41, "All: first day with data .. today")
-    eq(hd.build_view(BrokenHistory(), 30, TODAY).table_note, hd.EMPTY_TABLE, "a failing store reads as empty")
+    broken = hd.build_view(BrokenHistory(), 30, TODAY)
+    eq(broken.table_note, hd.EMPTY_TABLE, "a failing store reads as empty")
+    eq(broken.total, ("0", "–", "–", "–", "–", "–", "–"), "...with an empty totals row")
     v1 = hd.build_view(FakeHistory({TODAY: [mu("m", 1, 10, 10, 10.0, 60)]}), None, TODAY)
     eq((len(v1.bars), v1.axis[0]), (1, ""), "All with today only: one bar, no left date")
 
@@ -273,8 +282,8 @@ def test_populated(root) -> Path | None:
     try:
         eq(dlg.range_days, 30, "default range")
         eq(dlg.range_buttons(), {"7 days": False, "30 days": True, "All": False}, "range switch state")
-        eq(dlg.card_texts(), {"requests": "322", "generated tokens": "262 K", "avg tok/s": "98.5",
-                              "served": "8 h 20 m", "GPU energy": "377 Wh"}, "30-day cards")
+        eq(dlg.total_row(), ("Last 30 days", "322", "4.61 M", "262 K", "98.5", "8 h 20 m", "377", "1,240"),
+           "30-day totals row")
         rows = dlg.table_rows()
         eq(rows[:4], [("day", "Today", "214", "3.42 M", "186 K", "97.8", "5 h 12 m", "372", "1,240"),
                       ("model", "swift-1.5-iq3_s", "171", "2.90 M", "151 K", "101.7", "4 h 02 m", "310", "1,258"),
@@ -284,20 +293,21 @@ def test_populated(root) -> Path | None:
         eq(rows[4][-2:], ("–", "–"), "a model row from before energy metering: dashes")
         eq(rows[5], ("day", "Tue 10 Nov", "0", "–", "–", "–", "18 m", "4.20", "–"), "served-only day row")
         eq(rows[6], ("model", "swift-1.5-iq3_s", "0", "–", "–", "–", "18 m", "4.20", "–"), "served-only model row")
-        eq(dlg.note_text(), hd.ENERGY_NOTE, "the energy note is shown")
-        check(dlg._note.winfo_ismapped(), "the energy note is mapped")
+        eq(dlg.note_text(), hd.NOTE, "the note is shown")
+        check(dlg._note.winfo_ismapped(), "the note is mapped")
         head = [dlg._thead.itemcget(i, "text") for i in dlg._thead.find_all() if dlg._thead.type(i) == "text"]
-        eq(head, list(hd.COLUMNS), "table header draws every column")
-        eq(dlg.logical_width, 620, "the window is 620 px wide")
+        eq(head[:8], list(hd.COLUMNS), "the fixed part of the table draws every column heading")
+        eq(head[8:], list(dlg.total_row()), "...and the totals row under them")
+        eq(dlg.logical_width, 744, "the window is 744 px wide")
         eq(len(rows), 9, "4 day rows + 5 model rows in 30 days (every day shows its models)")
         bars = dlg.bar_values()
         eq(len(bars), 30, "bar count 30")
         eq((bars[-1], bars[-3], bars[-4], bars[-21], sum(1 for b in bars if b)), (186_000, 74_000, 0, 1_902, 3),
            "bar values on the right days")
-        eq(dlg.axis_texts(), ("15 Oct", "generated tokens per day", "Today"), "axis line")
+        eq(dlg.axis_texts(), ("15 Oct", "Tokens out per day", "Today"), "axis line")
         eq(dlg.chart_message(), "", "no empty message with data")
         eq(dlg.table_note(), "", "no table note with rows")
-        eq(dlg.table_view(), (0.0, 1.0), "8 rows fit without scrolling")
+        eq(dlg.table_view()[0], 0.0, "the table starts at its top")
         ok, why = fits(dlg)
         check(ok, f"populated window content fits its fixed size: {why}")
         # hover a bar: the centre of the axis line names the day and its tokens
@@ -306,13 +316,28 @@ def test_populated(root) -> Path | None:
         chart.event_generate("<Enter>", x=w - 2, y=5)          # Tk delivers <Motion> only after an <Enter>
         chart.event_generate("<Motion>", x=w - 2, y=5)
         pump(root, 0.05)
-        eq(dlg.axis_texts()[1], "Today · 186 K tokens", "hovering the last bar")
+        eq(dlg.axis_texts()[1], "Today: 186 K tokens out", "hovering the last bar")
+        bars_now = [chart.itemcget(i, "fill") for i in chart.find_withtag("bar")]
+        eq((len(bars_now), bars_now.count(hd.T.ACCENT)), (3, 1), "the hovered bar keeps the accent, the others step back")
         chart.event_generate("<Motion>", x=int(w * 26.5 / 30), y=5)
         pump(root, 0.05)
-        eq(dlg.axis_texts()[1], "Tue 10 Nov · no tokens", "hovering an empty slot")
+        eq(dlg.axis_texts()[1], "Tue 10 Nov: no requests", "hovering an empty slot")
         chart.event_generate("<Leave>")
         pump(root, 0.05)
-        eq(dlg.axis_texts()[1], "generated tokens per day", "leaving the chart restores the caption")
+        eq(dlg.axis_texts()[1], "Tokens out per day", "leaving the chart restores the caption")
+        bars_now = [chart.itemcget(i, "fill") for i in chart.find_withtag("bar")]
+        eq(bars_now.count(hd.T.ACCENT), 3, "...and every bar its colour")
+        base = chart.find_withtag("base")
+        eq(len(base), 1, "the bars stand on one base line")
+        ch = chart.winfo_height()
+        by = chart.coords(base[0])[1] if base else -1
+        check(ch - 3 <= by <= ch - 1 and str(chart.itemcget(base[0], "fill")).upper() == hd.T.HAIRLINE.upper(),
+              f"the base line is drawn inside the chart, on its last rows (y {by} of {ch})")
+        tops = [chart.coords(i)[3] for i in chart.find_withtag("bar")]
+        check(all(abs(t - (by - 0.5)) <= 1.5 for t in tops), f"every bar stands on it ({tops} vs {by})")
+        check(dlg._rule.winfo_ismapped() and dlg._rule.winfo_height() >= 1
+              and str(dlg._rule.cget("bg_color")).upper() == hd.T.HAIRLINE.upper(),
+              "the hairline above the footer is there and has its colour")
         path = shot(dlg, "populated")
 
         reads = h.reads
@@ -322,8 +347,11 @@ def test_populated(root) -> Path | None:
         eq(dlg.range_days, 7, "7-day range set")
         eq(dlg.range_buttons(), {"7 days": True, "30 days": False, "All": False}, "range switch follows")
         eq(len(dlg.bar_values()), 7, "7 bars")
-        eq(dlg.card_texts()["requests"], "310", "7-day requests card")
+        eq(dlg.total_row()[:2], ("Last 7 days", "310"), "7-day totals row")
         eq([r[1] for r in dlg.table_rows() if r[0] == "day"], ["Today", "Wed 11 Nov", "Tue 10 Nov"], "7-day days")
+        eq(dlg.table_view(), (0.0, 1.0), "three days with their models fit without scrolling")
+        head = [dlg._thead.itemcget(i, "text") for i in dlg._thead.find_all() if dlg._thead.type(i) == "text"]
+        eq(head[8:10], ["Last 7 days", "310"], "the totals row is redrawn for the new range")
         dlg.set_range(7)
         eq(h.reads, reads + 1, "same range again: no re-read")
 
@@ -331,8 +359,8 @@ def test_populated(root) -> Path | None:
         pump(root, 0.1)
         eq(dlg.range_days, None, "All via its button")
         eq(len(dlg.bar_values()), 41, "All: 41 bars (first day with data .. today)")
-        eq(dlg.card_texts()["requests"], "327", "All: requests card counts everything")
-        eq(dlg.card_texts()["GPU energy"], "377 Wh", "All: GPU energy card")
+        eq(dlg.total_row()[:2], ("All days", "327"), "All: the totals row counts everything")
+        eq(dlg.total_row()[-2], "377", "All: GPU Wh total")
         eq(dlg.table_rows()[-2:], [("day", "Sun 4 Oct", "5", "4,000", "800", "90.0", "5 m", "–", "–"),
                                    ("model", "swift-1.5-iq3_s", "5", "4,000", "800", "90.0", "5 m", "–", "–")],
            "All: the oldest day is in the table")
@@ -355,9 +383,8 @@ def test_empty(root) -> Path | None:
     dlg, closed = open_dialog(root, FakeHistory({}), hidden=False)
     path = None
     try:
-        eq(dlg.card_texts(), {"requests": "0", "generated tokens": "0", "avg tok/s": "–", "served": "–",
-                              "GPU energy": "–"}, "empty cards")
-        eq(dlg.note_text(), hd.ENERGY_NOTE, "empty: the energy note is still shown")
+        eq(dlg.total_row(), ("Last 30 days", "0", "–", "–", "–", "–", "–", "–"), "empty totals row")
+        eq(dlg.note_text(), hd.NOTE, "empty: the note is still shown")
         eq(dlg.chart_message(), hd.EMPTY_CHART, "empty chart message")
         eq(dlg.table_rows(), [], "no table rows")
         eq(dlg.table_note(), hd.EMPTY_TABLE, "empty table line")
@@ -386,7 +413,7 @@ def test_range_without_data(root) -> None:
     try:
         eq(dlg.chart_message(), "", "data exists: no 'no requests yet' message")
         eq(dlg.table_note(), "No requests in the last 30 days", "range without data says so")
-        eq(dlg.card_texts()["requests"], "0", "range without data: 0 requests")
+        eq(dlg.total_row()[1], "0", "range without data: 0 requests")
     finally:
         close_dialog(root, dlg)
 
@@ -444,24 +471,116 @@ def test_columns_fit(root) -> Path | None:
         s = dlg._scale()
         w = dlg._tbody.winfo_width()
         rights = dlg._col_rights(w, s)
-        ui = hd.T.ui_family()
-        head_font, cell_font = hd._font(ui, 11, s), hd._font(ui, 12, s)
+        f = dlg._fonts(s)
+        total = dlg.total_row()
+        eq(total[1:], ("10,000", "999 K", "999 K", "1,233.0", "61 h 06 m", "1,234", "123,319"), "widest totals")
         widths = []
         for k, name in enumerate(hd.COLUMNS[1:]):
             cells = [r[2 + k] for r in rows]
-            widths.append(max([dlg._measure(head_font, name)] + [dlg._measure(cell_font, c) for c in cells]))
-        gap = 4 * s
+            widths.append(max([dlg._measure(f["head"], name), dlg._measure(f["strong"], total[1 + k])]
+                              + [dlg._measure(f["cell"], c) for c in cells]))
+        gap = 8 * s
         bad = [f"{hd.COLUMNS[k + 1]} ({rights[k] - widths[k]:.0f}) hits {hd.COLUMNS[k]} ({rights[k - 1]:.0f})"
                for k in range(1, len(rights)) if rights[k] - widths[k] < rights[k - 1] + gap]
-        day_right = max(hd.DAY_X * s + dlg._measure(cell_font, "Wed 30 Sep"), dlg._measure(head_font, "Day"))
+        day_right = max(dlg._measure(f["strong"], "Wed 30 Sep"), dlg._measure(f["strong"], "Last 30 days"),
+                        dlg._measure(f["head"], "Day"))
         if rights[0] - widths[0] < day_right + gap:
             bad.append(f"Requests ({rights[0] - widths[0]:.0f}) hits the day labels ({day_right:.0f})")
-        check(not bad and rights[-1] <= w, f"columns fit at {w} px without overlapping: {bad or rights}")
+        check(not bad and rights[-1] <= w, f"the widest cells keep {gap:.0f} px between columns at {w} px: {bad or rights}")
+        eq([round(b - a) for a, b in zip(rights, rights[1:])], [round(hd.COL_W * s)] * 6, "seven equal columns")
+        eq(round(rights[-1]), w, "the last column ends on the table's right edge")
         note_h = dlg._note._label.winfo_reqheight()
         check(note_h <= round(hd.NOTE_H * s) + 1, f"the energy note fits its {hd.NOTE_H} px row ({note_h} at {s})")
         ok, why = fits(dlg)
         check(ok, f"wide-number window content fits: {why}")
         path = shot(dlg, "wide_numbers")
+    finally:
+        close_dialog(root, dlg)
+    return path
+
+
+def test_alignment(root) -> Path | None:
+    """What the layout promises, measured on the real window: one left and one right margin for every part, each
+    number column ending on one line in the headings, the totals and every row, and room between the columns."""
+    dlg, _closed = open_dialog(root, populated(), hidden=False)
+    path = None
+    try:
+        dlg.update_idletasks()
+        ws = ctk.ScalingTracker.get_window_scaling(dlg)
+        x0, wd = dlg.winfo_rootx(), dlg.winfo_width()
+        pad = hd.PAD * ws
+        lefts = {name: w.winfo_rootx() - x0 for name, w in (
+            ("title", dlg._title), ("chart", dlg._chart), ("first date", dlg._axis[0]), ("headings", dlg._thead),
+            ("rows", dlg._tbody), ("note", dlg._note))}
+        check(all(abs(v - pad) <= 1 for v in lefts.values()), f"every part starts {pad:.0f} px from the left: {lefts}")
+        rights = {name: x0 + wd - (w.winfo_rootx() + w.winfo_width()) for name, w in (
+            ("range switch", dlg._seg), ("chart", dlg._chart), ("Today", dlg._axis[2]), ("headings", dlg._thead),
+            ("rows", dlg._tbody), ("Close", dlg._close_btn))}
+        check(all(abs(v - pad) <= 1 for v in rights.values()), f"every part ends {pad:.0f} px from the right: {rights}")
+        bar = x0 + wd - (dlg._scroll.winfo_rootx() + dlg._scroll.winfo_width())
+        check(0 < bar < pad and dlg._scroll.winfo_rootx() >= dlg._tbody.winfo_rootx() + dlg._tbody.winfo_width(),
+              f"the scrollbar sits in the right margin, beside the numbers ({bar:.0f} px from the edge)")
+        s = dlg._scale()
+        cols = dlg._col_rights(dlg._tbody.winfo_width(), s)
+        starts: set[int] = set()
+        off: list[str] = []
+        gaps: list[tuple[int, str, str]] = []
+        for cv in (dlg._thead, dlg._tbody):
+            items = []
+            for i in cv.find_all():
+                if cv.type(i) == "text":
+                    x1, y1, x2, y2 = cv.bbox(i)
+                    items.append(((y1 + y2) / 2, x1, x2, str(cv.itemcget(i, "anchor")), str(cv.itemcget(i, "text"))))
+            items.sort()
+            line: list = []
+            for it in items + [None]:
+                if it is not None and (not line or abs(it[0] - line[0][0]) <= 3):
+                    line.append(it)
+                    continue
+                line.sort(key=lambda t: t[1])
+                gaps += [(b[1] - a[2], a[4], b[4]) for a, b in zip(line, line[1:])]
+                line = [it] if it is not None else []
+            for _cy, x1, x2, anchor, text in items:
+                if anchor == "w":
+                    starts.add(x1)
+                elif min(abs(x2 - c) for c in cols) > 1.5:
+                    off.append(f"{text!r} ends at {x2}")
+        indent = round(hd.MODEL_INDENT * s)
+        check(all(min(abs(x), abs(x - indent)) <= 1 for x in starts) and len(starts) <= 4,
+              f"table text starts at the margin, models {indent} px in, nowhere else: {sorted(starts)}")
+        check(not off, f"every number ends on its column's line in the headings, the totals and the rows: {off[:4]}")
+        tight = min(gaps)
+        check(tight[0] >= 12 * s, f"at least 12 px between neighbours in every row (tightest: {tight})")
+        fills = {str(dlg._thead.itemcget(i, "fill")).upper() for i in dlg._thead.find_all() if dlg._thead.type(i) == "text"}
+        body = {str(dlg._tbody.itemcget(i, "fill")).upper() for i in dlg._tbody.find_all() if dlg._tbody.type(i) == "text"}
+        check(hd.T.TEXT_3.upper() not in fills | body and (fills | body) <= {hd.T.TEXT.upper(), hd.T.TEXT_2.upper(),
+                                                                           hd.T.TEXT_MUTED.upper()},
+              f"three text colours, none of them the low-contrast grey: {sorted(fills | body)}")
+        # the vertical rhythm: 32 px day rows, 24 px model rows, 8 px either side of the line between two days
+        want, y = [], hd.GROUP_PAD / 2
+        for n, row in enumerate(dlg.table_rows()):
+            if row[0] == "day":
+                y += 2 * hd.GROUP_PAD if n else 0
+                want.append((y + hd.DAY_ROW_H / 2) * s)
+                y += hd.DAY_ROW_H
+            else:
+                want.append((y + hd.MODEL_ROW_H / 2) * s)
+                y += hd.MODEL_ROW_H
+        tb = dlg._tbody
+        got = sorted((tb.bbox(i)[1] + tb.bbox(i)[3]) / 2 for i in tb.find_all()
+                     if tb.type(i) == "text" and str(tb.itemcget(i, "anchor")) == "w")
+        check(len(got) == len(want) and all(abs(a - b) <= 1.5 for a, b in zip(got, want)),
+              f"rows sit on the 32 / 24 / 8 px rhythm: {[round(v) for v in got]} vs {[round(v) for v in want]}")
+        lines = sorted(tb.coords(i)[1] for i in tb.find_all() if tb.type(i) == "line")
+        days = [w for w, row in zip(want, dlg.table_rows()) if row[0] == "day"]
+        check(len(lines) == len(days) - 1
+              and all(abs(d - (hd.DAY_ROW_H / 2 + hd.GROUP_PAD) * s - ln) <= 1.5 for d, ln in zip(days[1:], lines)),
+              f"one line between two days, 8 px above the next day's row: {lines}")
+        ok, why = fits(dlg)
+        check(ok, f"the window's content fits its fixed size: {why}")
+        dlg.set_range(None)
+        pump(root, 0.1)
+        path = shot(dlg, "all_days")
     finally:
         close_dialog(root, dlg)
     return path
@@ -591,7 +710,7 @@ def run() -> int:
     shots: list[Path] = []
     try:
         for fn in (test_populated, test_empty, test_range_without_data, test_long_history_scrolls,
-                   test_columns_fit, test_close_paths, test_destroy_master):
+                   test_columns_fit, test_alignment, test_close_paths, test_destroy_master):
             gc.collect()
             print(f"-- {fn.__name__}", flush=True)
             try:

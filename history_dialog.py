@@ -1,11 +1,14 @@
-"""HistoryDialog: the "Usage history" window (opened from Settings) - totals, a per-day bar chart and a per-day /
-per-model table for the last 7 days, 30 days or everything kept, read from usage_history.UsageHistory.
+"""HistoryDialog: the "Usage history" window (opened from Settings) - a per-day bar chart and one table for the last
+7 days, 30 days or everything kept, read from usage_history.UsageHistory.
 
-Layout (top to bottom, 620 logical px wide, fixed height): title + range switch; five total cards (the fifth: GPU
-energy while serving); generated tokens per day as bars with a small axis line; the table (Day | Requests | Prompt tok
-| Generated tok | Avg tok/s | Served | GPU Wh | tok/Wh, newest day first, its models indented under it; days without
-energy figures, e.g. from before energy metering, show a dash); a muted note that GPU energy is the whole card;
-"Kept on this PC only" + Close.
+Layout (top to bottom, 744 logical px wide, fixed height). Everything in the window shares ONE left and ONE right
+margin (PAD), and the table's seven number columns are equally wide (COL_W), so the headings, the totals and every
+row end on the same seven lines:
+  title + range switch; tokens written per day as bars on a base line, with the first date, a caption (the hovered
+  day's figure) and "Today" under it; the table: column headings, the range's totals as its first row ("Last 30
+  days"), then newest day first with its models indented under it (days without energy figures, e.g. from before
+  energy metering, show a dash); a hairline; one muted note (kept on this PC, what GPU energy is) beside Close.
+Every vertical distance is a multiple of 4 px.
 
 The chart and the table are drawn on plain tk.Canvas widgets (like graphs.py): one canvas holds every table row, so
 even a year of history opens in a few ms and scrolls without hundreds of label widgets. tk.Canvas is not scaled by
@@ -38,43 +41,47 @@ ARM_S = 0.4
 DASH = "–"
 RANGES: tuple[int | None, ...] = (7, 30, None)          # None = everything kept
 RANGE_LABELS = {7: "7 days", 30: "30 days", None: "All"}
+TOTAL_LABELS = {7: "Last 7 days", 30: "Last 30 days", None: "All days"}     # the totals row of each range
 DEFAULT_RANGE = 30
 ALL_MAX_BARS = 90                                        # 'All': the newest 90 days of the chart at most
-CARD_KEYS = ("requests", "generated tokens", "avg tok/s", "served", "GPU energy")
-COLUMNS = ("Day", "Requests", "Prompt tok", "Generated tok", "Avg tok/s", "Served", "GPU Wh", "tok/Wh")
+COLUMNS = ("Day", "Requests", "Tokens in", "Tokens out", "Tok/s", "Served", "GPU Wh", "Tok/Wh")
 EMPTY_CHART = "No requests recorded yet"
 EMPTY_TABLE = "History starts with the first request after this version was installed."
 FOOTER = "Kept on this PC only"
-AXIS_CAPTION = "generated tokens per day"
+AXIS_CAPTION = "Tokens out per day"
 ENERGY_NOTE = ("GPU energy is the whole graphics card while the engine was serving, not only the engine. "
-               "tok/Wh counts the energy used while a reply was running.")
+               "Tok/Wh counts the energy used while a reply was running.")
+NOTE = f"{FOOTER}. {ENERGY_NOTE}"                         # the one muted paragraph beside Close
 
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")   # fixed English, not the locale's %a / %b
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
-# ---- layout (logical px) --------------------------------------------------------------------------------------
-WIDTH = 620
-PAD = 12
-HEAD_H = 26          # title / range switch row
-CARD_H = 52
-CHART_H = 72
-AXIS_H = 16
-TABLE_HEAD_H = 22
-TABLE_BODY_H = 236   # header + body = the ~260 px the table may take; longer tables scroll
-FOOTER_H = 30
-NOTE_H = 30          # ENERGY_NOTE: two wrapped lines of 11 px text
-HEIGHT = (10 + HEAD_H + 10 + CARD_H + 10 + CHART_H + 4 + AXIS_H + 10 + TABLE_HEAD_H + TABLE_BODY_H
-          + 8 + NOTE_H + 12 + FOOTER_H + 12)
-SCROLLBAR_W = 10
-DAY_ROW_H = 24
-MODEL_ROW_H = 18
-GROUP_GAP = 3        # after a day's last model row
-MODEL_INDENT = 14
-# right edge of each numeric column, measured from the canvas' right edge (Requests .. tok/Wh). Each step is the
-# column's widest text plus a gap: tok/Wh '123,456' (~45 px), GPU Wh header (~42), Served '61 h 05 m' (~55), Avg tok/s
-# header (~50), Generated tok header (~72), Prompt tok header (~56); Requests (~48) leaves ~106 px for model names.
-COL_RIGHT = (410, 340, 262, 194, 122, 66, 8)
-DAY_X = 8
+# ---- layout (logical px; every distance on a 4 px grid) -------------------------------------------------------
+WIDTH = 744
+PAD = 24             # the one left and right margin of everything in the window
+EDGE = 20            # above the title and under the footer
+HEAD_H = 32          # title / range switch row
+CHART_H = 88         # bars on a base line
+AXIS_H = 20
+TABLE_HEAD_H = 32    # column headings
+TOTAL_H = 40         # the range's totals, between two hairlines
+TABLE_BODY_H = 300   # longer tables scroll
+NOTE_H = 36          # NOTE: two wrapped lines of 12 px text
+NOTE_W = 520
+CLOSE_H = 32
+GAP_CHART = 20       # title -> chart
+GAP_AXIS = 8         # chart -> its dates
+GAP_TABLE = 24       # chart block -> table
+GAP_FOOT = 16        # table -> hairline -> footer
+HEIGHT = (EDGE + HEAD_H + GAP_CHART + CHART_H + GAP_AXIS + AXIS_H + GAP_TABLE + TABLE_HEAD_H + TOTAL_H
+          + TABLE_BODY_H + GAP_FOOT + 1 + GAP_FOOT + NOTE_H + EDGE)
+SCROLLBAR_W = 6      # the scrollbar lives in the right margin (PAD = SCROLL_GAP + SCROLLBAR_W + 10), so the
+SCROLL_GAP = 8       # numbers still end on the window's right margin
+COL_W = 76           # every number column; the day / model column takes the rest (164 px)
+DAY_ROW_H = 32
+MODEL_ROW_H = 24
+GROUP_PAD = 8        # above a day row and under its last row (half of it above the first day)
+MODEL_INDENT = 12
 
 
 # ================================================================================================ pure formatters
@@ -133,18 +140,6 @@ def _sig3(x: float) -> str:
     return f"{x:,.0f}" if x >= 99.95 else f"{x:.1f}" if x >= 9.995 else f"{x:.2f}"
 
 
-def fmt_energy(wh: Any) -> str:
-    """The GPU energy card: '0.42 Wh', '12.3 Wh', '842 Wh', then '1.23 kWh', '12.3 kWh'; '–' for none."""
-    v = _finite(wh)
-    if v is None or v <= 0:
-        return DASH
-    if v < 0.005:
-        return "< 0.01 Wh"
-    if v < 999.5:
-        return f"{_sig3(v)} Wh"
-    return f"{_sig3(v / 1000.0)} kWh"
-
-
 def fmt_wh(wh: Any) -> str:
     """A 'GPU Wh' table cell: '0.42', '12.3', '842', '1,234'; '< 0.01' for a trace; '–' for none."""
     v = _finite(wh)
@@ -154,7 +149,7 @@ def fmt_wh(wh: Any) -> str:
 
 
 def fmt_tok_per_wh(v: Any) -> str:
-    """A 'tok/Wh' table cell: a whole number with thousands separators ('8,412'); '–' when unknown."""
+    """A 'Tok/Wh' table cell: a whole number with thousands separators ('8,412'); '–' when unknown."""
     f = _finite(v)
     if f is None or f <= 0:
         return DASH
@@ -176,9 +171,9 @@ def fmt_day(d: _dt.date, today: _dt.date) -> str:
 
 
 def usage_cells(u: Any) -> tuple[str, str, str, str, str, str, str]:
-    """(requests, prompt tok, generated tok, avg tok/s, served, GPU Wh, tok/Wh) for one Usage. A span with 0
-    requests (served time only) shows '–' for its tokens instead of 0; a span without energy figures (e.g. a day
-    from before energy metering) shows '–' for both energy cells."""
+    """(requests, tokens in, tokens out, tok/s, served, GPU Wh, Tok/Wh) for one Usage. A span with 0 requests
+    (served time only) shows '–' for its tokens instead of 0; a span without energy figures (e.g. a day from before
+    energy metering) shows '–' for both energy cells."""
     req = int(_finite(getattr(u, "requests", 0)) or 0)
     if req <= 0:
         prompt = gen = DASH
@@ -193,13 +188,9 @@ def usage_cells(u: Any) -> tuple[str, str, str, str, str, str, str]:
             fmt_served(getattr(u, "served_s", 0)), wh, tpw)
 
 
-def card_values(total: Any) -> dict[str, str]:
-    """The five total cards for a range's Usage (empty: '0', '0', '–', '–', '–')."""
-    return {"requests": fmt_count(getattr(total, "requests", 0)),
-            "generated tokens": fmt_count(getattr(total, "generated_tokens", 0)),
-            "avg tok/s": fmt_tps(getattr(total, "decode_tps", None)),
-            "served": fmt_served(getattr(total, "served_s", 0)),
-            "GPU energy": fmt_energy(getattr(total, "gpu_wh", 0))}
+def total_label(range_days: int | None) -> str:
+    """The name of the totals row: 'Last 7 days', 'Last 30 days', 'All days'."""
+    return TOTAL_LABELS.get(range_days) or f"Last {range_days} days"
 
 
 def range_start(today: _dt.date, range_days: int | None, first: _dt.date | None) -> _dt.date | None:
@@ -217,14 +208,15 @@ def range_start(today: _dt.date, range_days: int | None, first: _dt.date | None)
 class TableRow:
     kind: str                       # "day" | "model"
     label: str                      # 'Today' / 'Wed 11 Nov' / model id
-    cells: tuple[str, ...]          # requests, prompt tok, generated tok, avg tok/s, served, GPU Wh, tok/Wh
+    cells: tuple[str, ...]          # requests, tokens in, tokens out, tok/s, served, GPU Wh, Tok/Wh
 
 
 @dataclass(frozen=True)
 class View:
     """Everything one range shows."""
     range_days: int | None
-    cards: dict[str, str]
+    total_label: str                # 'Last 30 days'
+    total: tuple[str, ...]          # the range's totals, the same seven cells as a row
     bar_days: tuple[_dt.date, ...]
     bars: tuple[int, ...]
     rows: tuple[TableRow, ...]
@@ -242,8 +234,7 @@ def build_view(history: Any, range_days: int | None, today: _dt.date) -> View:
         log.exception("usage history could not be read")
         day_rows, summary = [], None
     has_data = bool(day_rows)
-    total = getattr(summary, "total", None)
-    cards = card_values(total) if total is not None else card_values(None)
+    total = usage_cells(getattr(summary, "total", None))
 
     first = min((r.date for r in day_rows), default=None)
     start = range_start(today, range_days, first)
@@ -273,13 +264,14 @@ def build_view(history: Any, range_days: int | None, today: _dt.date) -> View:
         left = "Today" if bar_days[0] == today else fmt_date(bar_days[0])
         if len(bar_days) == 1:
             left = ""                                 # one bar: 'Today' on the right says it all
-    return View(range_days=range_days, cards=cards, bar_days=bar_days, bars=bars, rows=tuple(rows),
-                has_data=has_data, table_note=note, axis=(left, AXIS_CAPTION, "Today"))
+    return View(range_days=range_days, total_label=total_label(range_days), total=total, bar_days=bar_days,
+                bars=bars, rows=tuple(rows), has_data=has_data, table_note=note, axis=(left, AXIS_CAPTION, "Today"))
 
 
 # ================================================================================================ the window
-def _font(family: str, px: float, s: float) -> tuple[str, int]:
-    return (family, -max(7, round(px * s)))           # negative = pixels, so it tracks the scaling
+def _font(family: str, px: float, s: float, weight: str = "normal") -> tuple:
+    size = -max(7, round(px * s))                     # negative = pixels, so it tracks the scaling
+    return (family, size) if weight == "normal" else (family, size, weight)
 
 
 class HistoryDialog(ctk.CTkToplevel):
@@ -314,70 +306,60 @@ class HistoryDialog(ctk.CTkToplevel):
         self.grid_columnconfigure(0, weight=1)
 
         ui = T.ui_family()
-        small = ctk.CTkFont(family=ui, size=11)
-        body = ctk.CTkFont(family=ui, size=12)
+        strong, strong_weight = T.semibold()
+        small = ctk.CTkFont(family=ui, size=12)
+        body = ctk.CTkFont(family=ui, size=13)
 
         # ---- 1. title + range switch
         head = ctk.CTkFrame(self, fg_color="transparent", height=HEAD_H)
-        head.grid(row=0, column=0, sticky="ew", padx=PAD, pady=(10, 0))
+        head.grid(row=0, column=0, sticky="ew", padx=PAD, pady=(EDGE, 0))
+        head.grid_propagate(False)
         head.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(head, text="Usage history", anchor="w", height=HEAD_H,
-                     font=ctk.CTkFont(family=ui, size=14, weight="bold")).grid(row=0, column=0, sticky="w")
+        head.grid_rowconfigure(0, weight=1)
+        self._head = head
+        self._title = ctk.CTkLabel(head, text="Usage history", anchor="w", height=24,
+                                   font=ctk.CTkFont(family=strong, size=16, weight=strong_weight))
+        self._title.grid(row=0, column=0, sticky="w")
         seg = ctk.CTkFrame(head, fg_color=T.SURFACE, corner_radius=8)
         seg.grid(row=0, column=1, sticky="e")
+        self._seg = seg
         self._range_btns: dict[int | None, ctk.CTkButton] = {}
         for i, days in enumerate(RANGES):
-            b = ctk.CTkButton(seg, text=RANGE_LABELS[days], width=56 if days is not None else 40, height=22,
+            b = ctk.CTkButton(seg, text=RANGE_LABELS[days], width=48 if days is None else 68, height=24,
                               corner_radius=6, font=body, border_width=0,
                               command=lambda d=days: self.set_range(d))
             b.grid(row=0, column=i, padx=(2 if i == 0 else 0, 2), pady=2)
             self._range_btns[days] = b
 
-        # ---- 2. total cards
-        cards = ctk.CTkFrame(self, fg_color="transparent")
-        cards.grid(row=1, column=0, sticky="ew", padx=PAD, pady=(10, 0))
-        cards.grid_columnconfigure(tuple(range(len(CARD_KEYS))), weight=1, uniform="card")
-        self._card_labels: dict[str, ctk.CTkLabel] = {}
-        value_font = ctk.CTkFont(family=ui, size=17, weight="bold")
-        for i, key in enumerate(CARD_KEYS):
-            card = ctk.CTkFrame(cards, fg_color=T.SURFACE, corner_radius=8, width=1, height=CARD_H)
-            card.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0 if i == len(CARD_KEYS) - 1 else 4))
-            card.grid_propagate(False)
-            card.grid_columnconfigure(0, weight=1)
-            v = ctk.CTkLabel(card, text="", anchor="w", height=22, font=value_font, text_color=T.TEXT)
-            v.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 0))
-            ctk.CTkLabel(card, text=key, anchor="w", height=14, font=small, text_color=T.TEXT_3).grid(
-                row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
-            self._card_labels[key] = v
-
-        # ---- 3. chart on a SURFACE panel (the canvas is inset so the panel's rounded corners stay visible)
-        self._chart_box = ctk.CTkFrame(self, fg_color=T.SURFACE, corner_radius=8, height=CHART_H)
-        self._chart_box.grid(row=2, column=0, sticky="ew", padx=PAD, pady=(10, 0))
-        self._chart = tk.Canvas(self._chart_box, bg=T.SURFACE, highlightthickness=0, bd=0, takefocus=0,
-                                width=1, height=1)
+        # ---- 2. chart: bars on a base line, straight on the window (no panel: the same margins as the table)
+        self._chart_box = ctk.CTkFrame(self, fg_color="transparent", height=CHART_H, corner_radius=0)
+        self._chart_box.grid(row=1, column=0, sticky="ew", padx=PAD, pady=(GAP_CHART, 0))
+        self._chart = tk.Canvas(self._chart_box, bg=T.BG, highlightthickness=0, bd=0, takefocus=0, width=1, height=1)
+        self._chart.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._chart.bind("<Configure>", lambda _e: self._draw_chart())
         self._chart.bind("<Motion>", self._chart_motion)
         self._chart.bind("<Leave>", lambda _e: self._set_hover(None))
-        self._place_chart()
 
         axis = ctk.CTkFrame(self, fg_color="transparent", height=AXIS_H)
-        axis.grid(row=3, column=0, sticky="ew", padx=PAD + 10, pady=(4, 0))
+        axis.grid(row=2, column=0, sticky="ew", padx=PAD, pady=(GAP_AXIS, 0))
         axis.grid_columnconfigure((0, 2), weight=1, uniform="axis")
         axis.grid_columnconfigure(1, weight=0)
-        self._axis = (ctk.CTkLabel(axis, text="", anchor="w", height=AXIS_H, font=small, text_color=T.TEXT_3),
-                      ctk.CTkLabel(axis, text="", anchor="center", height=AXIS_H, font=small, text_color=T.TEXT_3),
-                      ctk.CTkLabel(axis, text="", anchor="e", height=AXIS_H, font=small, text_color=T.TEXT_3))
+        self._axis_box = axis
+        self._axis = (ctk.CTkLabel(axis, text="", anchor="w", height=AXIS_H, font=small, text_color=T.TEXT_MUTED),
+                      ctk.CTkLabel(axis, text="", anchor="center", height=AXIS_H, font=small, text_color=T.TEXT_2),
+                      ctk.CTkLabel(axis, text="", anchor="e", height=AXIS_H, font=small, text_color=T.TEXT_MUTED))
         self._axis[0].grid(row=0, column=0, sticky="w")
         self._axis[1].grid(row=0, column=1)
         self._axis[2].grid(row=0, column=2, sticky="e")
 
-        # ---- 4. table: fixed header canvas + scrolling body canvas (one canvas for all rows)
-        table = ctk.CTkFrame(self, fg_color="transparent", height=TABLE_HEAD_H + TABLE_BODY_H)
-        table.grid(row=4, column=0, sticky="ew", padx=PAD, pady=(10, 0))
+        # ---- 3. table: a fixed canvas (headings + the totals row) over a scrolling one (one canvas for all rows).
+        # The scrollbar sits in the right margin, so both canvases are exactly as wide as the chart.
+        table = ctk.CTkFrame(self, fg_color="transparent", height=TABLE_HEAD_H + TOTAL_H + TABLE_BODY_H)
+        table.grid(row=3, column=0, sticky="ew", padx=(PAD, PAD - SCROLL_GAP - SCROLLBAR_W), pady=(GAP_TABLE, 0))
         table.grid_propagate(False)
         table.grid_columnconfigure(0, weight=1)
         table.grid_rowconfigure(1, weight=1)
-        head_box = ctk.CTkFrame(table, fg_color="transparent", height=TABLE_HEAD_H, corner_radius=0)
+        head_box = ctk.CTkFrame(table, fg_color="transparent", height=TABLE_HEAD_H + TOTAL_H, corner_radius=0)
         head_box.grid(row=0, column=0, sticky="ew")
         self._thead = tk.Canvas(head_box, bg=T.BG, highlightthickness=0, bd=0, takefocus=0, width=1, height=1)
         self._thead.place(relx=0, rely=0, relwidth=1, relheight=1)
@@ -385,43 +367,43 @@ class HistoryDialog(ctk.CTkToplevel):
         self._tbody = tk.Canvas(table, bg=T.BG, highlightthickness=0, bd=0, takefocus=0, width=1, height=1)
         self._tbody.grid(row=1, column=0, sticky="nsew")
         self._tbody.bind("<Configure>", lambda _e: self._draw_table())
-        self._scroll = ctk.CTkScrollbar(table, width=SCROLLBAR_W, fg_color=T.BG, button_color=T.BG,
-                                        button_hover_color=T.BG, command=self._tbody.yview)
-        self._scroll.grid(row=1, column=1, sticky="ns", padx=(2, 0))
+        self._scroll = ctk.CTkScrollbar(table, width=SCROLLBAR_W, border_spacing=0, fg_color=T.BG,
+                                        button_color=T.BG, button_hover_color=T.BG, command=self._tbody.yview)
+        self._scroll.grid(row=1, column=1, sticky="ns", padx=(SCROLL_GAP, 0))
         self._tbody.configure(yscrollcommand=self._scroll.set)
         self._scrollable = False
 
-        # ---- 5. what the energy figures are (always shown: the whole card, not only the engine)
-        self._note = ctk.CTkLabel(self, text=ENERGY_NOTE, anchor="nw", justify="left", height=NOTE_H,
-                                  wraplength=WIDTH - 2 * PAD, font=small, text_color=T.TEXT_3)
-        self._note.grid(row=5, column=0, sticky="ew", padx=PAD, pady=(8, 0))
-
-        # ---- 6. footer
+        # ---- 4. footer: a hairline, then the one muted note beside Close
+        # (bg_color too: a 1 px CTkFrame has no room to draw its own fill, only its canvas background shows)
+        self._rule = ctk.CTkFrame(self, fg_color=T.HAIRLINE, bg_color=T.HAIRLINE, height=1, corner_radius=0)
+        self._rule.grid(row=4, column=0, sticky="ew", padx=PAD, pady=(GAP_FOOT, 0))
         foot = ctk.CTkFrame(self, fg_color="transparent")
-        foot.grid(row=6, column=0, sticky="ew", padx=PAD, pady=(12, 12))
+        foot.grid(row=5, column=0, sticky="ew", padx=PAD, pady=(GAP_FOOT, EDGE))
         foot.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(foot, text=FOOTER, anchor="w", height=FOOTER_H, font=small, text_color=T.TEXT_3).grid(
-            row=0, column=0, sticky="w")
-        self._close_btn = ctk.CTkButton(foot, text="Close", width=90, height=FOOTER_H, corner_radius=8, font=body,
-                                        fg_color="transparent", border_width=1, border_color=T.RAISED_HOVER,
-                                        hover_color=T.RAISED, text_color=T.TEXT, command=self.close)
+        self._note = ctk.CTkLabel(foot, text=NOTE, anchor="w", justify="left", height=NOTE_H, wraplength=NOTE_W,
+                                  font=small, text_color=T.TEXT_MUTED)
+        self._note.grid(row=0, column=0, sticky="w")
+        self._close_btn = ctk.CTkButton(foot, text="Close", width=84, height=CLOSE_H, corner_radius=8, font=body,
+                                        fg_color=T.RAISED, hover_color=T.RAISED_HOVER, text_color=T.TEXT,
+                                        command=self.close)
         self._close_btn.grid(row=0, column=1, sticky="e")
 
         self._apply_view()
         apply_modal(self, master)
 
     # ------------------------------------------------------------------ public read-only helpers (tests)
-    def card_texts(self) -> dict[str, str]:
-        """The five cards as shown: {'requests', 'generated tokens', 'avg tok/s', 'served', 'GPU energy'} -> text."""
-        return {k: str(lbl.cget("text")) for k, lbl in self._card_labels.items()}
+    def total_row(self) -> tuple[str, ...]:
+        """The totals row as shown: ('Last 30 days', requests, tokens in, tokens out, tok/s, served, GPU Wh,
+        Tok/Wh)."""
+        return (self._view.total_label, *self._view.total)
 
     def table_rows(self) -> list[tuple[str, ...]]:
-        """Table rows in display order: ('day' | 'model', label, requests, prompt, generated, tok/s, served, GPU Wh,
-        tok/Wh). The label is the full model id (the canvas may shorten a very long one with '…')."""
+        """Table rows in display order: ('day' | 'model', label, requests, tokens in, tokens out, tok/s, served,
+        GPU Wh, Tok/Wh). The label is the full model id (the canvas may shorten a very long one with '…')."""
         return [(r.kind, r.label, *r.cells) for r in self._view.rows]
 
     def note_text(self) -> str:
-        """The muted energy note above the footer, as shown."""
+        """The muted note beside Close, as shown."""
         return str(self._note.cget("text"))
 
     def table_note(self) -> str:
@@ -436,7 +418,7 @@ class HistoryDialog(ctk.CTkToplevel):
         return list(self._view.bar_days)
 
     def chart_message(self) -> str:
-        """The centred text on the chart panel ('' when it shows bars)."""
+        """The centred text on the chart ('' when it shows bars)."""
         return "" if self._view.has_data else EMPTY_CHART
 
     def axis_texts(self) -> tuple[str, str, str]:
@@ -473,9 +455,6 @@ class HistoryDialog(ctk.CTkToplevel):
         self._apply_view()
 
     def _apply_view(self) -> None:
-        v = self._view
-        for key, lbl in self._card_labels.items():
-            lbl.configure(text=v.cards.get(key, DASH))
         for days, b in self._range_btns.items():
             on = days == self.range_days
             b.configure(fg_color=T.RAISED if on else T.SURFACE, hover_color=T.RAISED_HOVER if on else T.RAISED,
@@ -501,13 +480,20 @@ class HistoryDialog(ctk.CTkToplevel):
             return None
         return (w, h) if w >= 8 and h >= 8 else None
 
-    def _measure(self, font: tuple[str, int], text: str) -> int:
+    def _fonts(self, s: float) -> dict[str, tuple]:
+        """The table's three fonts at this scaling: headings (12 px), cells (13 px) and the semibold of the totals
+        row and the day names (13 px)."""
+        ui = T.ui_family()
+        strong, weight = T.semibold()
+        return {"head": _font(ui, 12, s), "cell": _font(ui, 13, s), "strong": _font(strong, 13, s, weight)}
+
+    def _measure(self, font: tuple, text: str) -> int:
         try:
             return int(self.tk.call("font", "measure", font, text))   # no tkinter.font.Font object (see theme)
         except tk.TclError:
             return len(text) * abs(font[1]) // 2
 
-    def _fit(self, font: tuple[str, int], text: str, width: int) -> str:
+    def _fit(self, font: tuple, text: str, width: int) -> str:
         if width <= 0 or self._measure(font, text) <= width:
             return text
         lo, hi = 0, len(text)
@@ -520,14 +506,9 @@ class HistoryDialog(ctk.CTkToplevel):
         return text[:lo] + "…"
 
     # ------------------------------------------------------------------ chart
-    def _place_chart(self) -> None:
-        s = self._scale()
-        ix, iy = round(10 * s), round(8 * s)
-        self._chart.place(x=ix, y=iy, relwidth=1, relheight=1, width=-2 * ix, height=-2 * iy)
-
     def _slot_geometry(self, w: int, n: int, s: float) -> tuple[float, float]:
         slot = w / max(1, n)
-        bar_w = max(1.0, min(slot * 0.7, slot - max(1.0, round(2 * s)), 32 * s))
+        bar_w = max(1.0, min(slot * 0.6, slot - max(1.0, round(2 * s)), 32 * s))
         return slot, bar_w
 
     def _draw_chart(self) -> None:
@@ -541,23 +522,26 @@ class HistoryDialog(ctk.CTkToplevel):
         c = self._chart
         c.delete("all")
         v = self._view
+        base = max(1, round(s))                          # the base line the bars stand on: the canvas' last rows
+        y_base = h - (base + 1) // 2                     # (a line centred on h - 0.5 lands outside the canvas)
+        c.create_line(0, y_base, w, y_base, fill=T.HAIRLINE, width=base, tags=("base",))
         if not v.has_data:
-            c.create_text(w / 2, h / 2, text=EMPTY_CHART, fill=T.TEXT_3, font=_font(T.ui_family(), 11, s))
+            c.create_text(w / 2, (h - base) / 2, text=EMPTY_CHART, fill=T.TEXT_MUTED, font=_font(T.ui_family(), 12, s))
             return
         n = len(v.bars)
         if n == 0:
             return
         slot, bar_w = self._slot_geometry(w, n, s)
         peak = max(v.bars) or 1
-        y_bot = h
-        tick = max(1, round(1 * s))
+        y_bot = h - base
+        room = y_bot - 4 * s                             # the tallest bar stops 4 px under the top
+        dim = T.mix(T.ACCENT, T.BG, 0.4)
         for i, val in enumerate(v.bars):
-            x = i * slot + (slot - bar_w) / 2
-            if val <= 0:                                 # empty day: a quiet tick, so the row reads as a scale
-                c.create_line(x, y_bot - tick, x + bar_w, y_bot - tick, fill=T.HAIRLINE)
+            if val <= 0:                                 # an empty day is a gap on the base line
                 continue
-            top = y_bot - max(2.0 * s, val / peak * h)
-            color = T.mix(T.ACCENT, T.SURFACE, 0.55) if self._hover is not None and self._hover != i else T.ACCENT
+            x = i * slot + (slot - bar_w) / 2
+            top = y_bot - max(3.0 * s, val / peak * room)
+            color = dim if self._hover is not None and self._hover != i else T.ACCENT
             c.create_rectangle(x, top, x + bar_w, y_bot, fill=color, outline="", tags=("bar",))
 
     def _chart_motion(self, event) -> None:
@@ -581,14 +565,16 @@ class HistoryDialog(ctk.CTkToplevel):
         if self._hover is not None and 0 <= self._hover < len(self._view.bars):
             d = self._view.bar_days[self._hover]
             val = self._view.bars[self._hover]
-            centre = f"{fmt_day(d, self._today)} · {fmt_count(val) if val else 'no'} tokens"
+            centre = f"{fmt_day(d, self._today)}: " + (f"{fmt_count(val)} tokens out" if val else "no requests")
         for lbl, text in zip(self._axis, (left, centre, right)):
             if lbl.cget("text") != text:
                 lbl.configure(text=text)
 
     # ------------------------------------------------------------------ table
     def _col_rights(self, w: int, s: float) -> list[float]:
-        return [w - off * s for off in COL_RIGHT]
+        """The right edge of each number column: seven equal columns ending at the canvas' right edge."""
+        n = len(COLUMNS) - 1
+        return [w - (n - 1 - i) * COL_W * s for i in range(n)]
 
     def _draw_head(self) -> None:
         if self._destroyed:
@@ -600,11 +586,20 @@ class HistoryDialog(ctk.CTkToplevel):
         s = self._scale()
         c = self._thead
         c.delete("all")
-        font = _font(T.ui_family(), 11, s)
-        y = (h - 1) / 2
-        c.create_text(DAY_X * s, y, text=COLUMNS[0], anchor="w", fill=T.TEXT_3, font=font)
-        for x, name in zip(self._col_rights(w, s), COLUMNS[1:]):
-            c.create_text(x, y, text=name, anchor="e", fill=T.TEXT_3, font=font)
+        f = self._fonts(s)
+        v = self._view
+        rights = self._col_rights(w, s)
+        top = round(TABLE_HEAD_H * s)                    # headings above this line, the totals row under it
+        y = top / 2
+        c.create_text(0, y, text=COLUMNS[0], anchor="w", fill=T.TEXT_2, font=f["head"])
+        for x, name in zip(rights, COLUMNS[1:]):
+            c.create_text(x, y, text=name, anchor="e", fill=T.TEXT_2, font=f["head"])
+        cy = top + (h - top) / 2
+        c.create_text(0, cy, text=v.total_label, anchor="w", fill=T.TEXT, font=f["strong"], tags=("total",))
+        for x, cell in zip(rights, v.total):
+            c.create_text(x, cy, text=cell, anchor="e", fill=T.TEXT_MUTED if cell == DASH else T.TEXT,
+                          font=f["strong"], tags=("total",))
+        c.create_line(0, top, w, top, fill=T.HAIRLINE)
         c.create_line(0, h - 1, w, h - 1, fill=T.HAIRLINE)
 
     def _draw_table(self) -> None:
@@ -618,48 +613,52 @@ class HistoryDialog(ctk.CTkToplevel):
         c = self._tbody
         c.delete("all")
         v = self._view
-        ui, mono = T.ui_family(), T.mono_family()
+        f = self._fonts(s)
         if not v.rows:
-            c.create_text(DAY_X * s, round(DAY_ROW_H * s) / 2, text=v.table_note, anchor="w", fill=T.TEXT_3,
-                          font=_font(ui, 11, s))
+            c.create_text(0, (GROUP_PAD / 2 + DAY_ROW_H / 2) * s, text=v.table_note, anchor="w", fill=T.TEXT_MUTED,
+                          font=f["cell"])
             self._set_scrollable(False, w, h)
             return
-        day_font, num_font = _font(ui, 12, s), _font(ui, 12, s)
-        model_font, model_num_font = _font(mono, 11, s), _font(ui, 11, s)
         rights = self._col_rights(w, s)
-        name_w = int(rights[0] - 46 * s - (DAY_X + MODEL_INDENT) * s)     # stop short of the 'Requests' numbers
+        name_w = int(rights[0] - COL_W * s - MODEL_INDENT * s)             # the first column, less the indent
+        soft = T.mix(T.HAIRLINE, T.BG, 0.6)              # between days: quieter than the lines around the totals
         y = 0.0
-        prev_kind = ""
-        for i, row in enumerate(v.rows):
+        first = True
+        for row in v.rows:
+            quiet = row.cells[0] == "0"                  # served, but no requests: the whole row steps back
             if row.kind == "day":
-                if prev_kind == "model":
-                    y += GROUP_GAP * s
+                if first:
+                    y += GROUP_PAD / 2 * s
+                    first = False
+                else:
+                    y += GROUP_PAD * s
+                    c.create_line(0, round(y), w, round(y), fill=soft)
+                    y += GROUP_PAD * s
                 rh = DAY_ROW_H * s
-                if i > 0:
-                    c.create_line(0, round(y), w, round(y), fill=T.HAIRLINE)
-                cy = y + rh / 2 + 1
-                c.create_text(DAY_X * s, cy, text=row.label, anchor="w", fill=T.TEXT, font=day_font)
+                cy = y + rh / 2
+                c.create_text(0, cy, text=row.label, anchor="w", fill=T.TEXT_2 if quiet else T.TEXT,
+                              font=f["cell"] if quiet else f["strong"])
                 for x, cell in zip(rights, row.cells):
-                    c.create_text(x, cy, text=cell, anchor="e", fill=T.TEXT, font=num_font)
+                    c.create_text(x, cy, text=cell, anchor="e",
+                                  fill=T.TEXT_MUTED if quiet or cell == DASH else T.TEXT, font=f["cell"])
             else:
                 rh = MODEL_ROW_H * s
                 cy = y + rh / 2
-                label = self._fit(model_font, row.label, name_w)
-                c.create_text((DAY_X + MODEL_INDENT) * s, cy, text=label, anchor="w", fill=T.TEXT_2,
-                              font=model_font)
+                c.create_text(MODEL_INDENT * s, cy, text=self._fit(f["cell"], row.label, name_w), anchor="w",
+                              fill=T.TEXT_2, font=f["cell"])
                 for x, cell in zip(rights, row.cells):
-                    c.create_text(x, cy, text=cell, anchor="e", fill=T.TEXT_2, font=model_num_font)
+                    c.create_text(x, cy, text=cell, anchor="e",
+                                  fill=T.TEXT_MUTED if quiet or cell == DASH else T.TEXT_2, font=f["cell"])
             y += rh
-            prev_kind = row.kind
-        total_h = math.ceil(y + GROUP_GAP * s)
+        total_h = math.ceil(y + GROUP_PAD * s)
         self._set_scrollable(total_h > h, w, max(total_h, h))
 
     def _set_scrollable(self, on: bool, w: int, h: int) -> None:
         self._tbody.configure(scrollregion=(0, 0, w, h), yscrollincrement=max(1, round(MODEL_ROW_H * self._scale())))
         if on != self._scrollable:
             self._scrollable = on
-            color = T.RAISED if on else T.BG
-            self._scroll.configure(button_color=color, button_hover_color=T.RAISED_HOVER if on else T.BG)
+            color = T.RAISED_HOVER if on else T.BG
+            self._scroll.configure(button_color=color, button_hover_color=T.TEXT_3 if on else T.BG)
         if not on:
             self._tbody.yview_moveto(0.0)
 

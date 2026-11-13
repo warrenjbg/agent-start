@@ -969,7 +969,7 @@ class DownloadDialog(ctk.CTkToplevel):
         self._download_btn.grid(row=0, column=2, sticky="e")
 
         # ---- 6. progress: hairline, file name, bar, figures, Cancel download / Discard partial download
-        ctk.CTkFrame(self, fg_color=T.HAIRLINE, height=1, corner_radius=0).grid(
+        ctk.CTkFrame(self, fg_color=T.HAIRLINE, bg_color=T.HAIRLINE, height=1, corner_radius=0).grid(
             row=5, column=0, sticky="ew", padx=PAD, pady=(12, 0))
         self._prog_title = ctk.CTkLabel(self, text="", anchor="w", height=16, font=self._body, text_color=T.TEXT)
         self._prog_title.grid(row=6, column=0, sticky="ew", padx=PAD, pady=(12, 0))

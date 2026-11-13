@@ -16,7 +16,9 @@ RAISED = "#26262A"      # secondary buttons, hover rows
 HAIRLINE = "#2C2C30"    # 1 px separators / borders
 TEXT = "#EDEDEB"        # primary text, primary button fill
 TEXT_2 = "#A1A1A6"      # secondary text
-TEXT_3 = "#6E6E73"      # muted text, idle LED
+TEXT_3 = "#6E6E73"      # muted marks: idle LED, placeholders, disabled text (3.6:1 on BG: not for small text
+                        # that has to be read)
+TEXT_MUTED = "#8E8E93"  # muted text that is read: captions, notes, dashes in tables (5.6:1 on BG)
 ON_PRIMARY = "#141415"  # text on the off-white primary button
 PRIMARY_HOVER = "#D9D9D6"  # hover of the off-white primary button / ticked checkbox
 RAISED_HOVER = "#303035"   # hover of RAISED controls, outline of ghost buttons
@@ -60,6 +62,13 @@ def _pick(*candidates: str) -> str:
 
 def ui_family() -> str:
     return _pick("Segoe UI Variable Text", "Segoe UI")
+
+
+def semibold() -> tuple[str, str]:
+    """(family, weight) for the 600 weight: Windows' own Semibold family when it is installed (Tk only knows
+    normal and bold, so the weight comes from the family), else the UI family in bold."""
+    family = _pick("Segoe UI Variable Text Semibold", "Segoe UI Semibold", "")
+    return (family, "normal") if family else (ui_family(), "bold")
 
 
 def mono_family() -> str:

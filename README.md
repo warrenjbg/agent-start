@@ -169,15 +169,16 @@ the endpoint. Everything on Behaviour and About applies at once.
   its settings) in your browser; greyed out with *not running* while Strata is off. Below it the API address
   (`…/v1`) with **Copy**, for pasting into Hermes or other clients.
 - **Protected apps…** — the whitelist: apps that are never offered for closing.
-- **Usage history…** — a window with totals for 7 days, 30 days or all (requests, generated tokens, average tok/s,
-  time served), a bar per day of generated tokens, and a table per day and per model (requests, prompt tokens,
-  generated tokens, average speed, time served). It is kept in `usage.json` in the data folder, on this PC only;
+- **Usage history…** — a window for the last 7 days, 30 days or all of it: a bar per day of generated tokens,
+  and one table with the totals as its first row, then each day and its models (*Requests*, *Tokens in* = prompt
+  tokens, *Tokens out* = generated tokens, *Tok/s* = average speed, *Served* = time served). It is kept in
+  `usage.json` in the data folder, on this PC only;
   nothing is sent anywhere. History starts with the first request after 1.10 is installed, and days older than 400
   days are dropped. The average speed is weighted by tokens and leaves out very short answers. Prompt tokens are
   the tokens Strata actually read: the part of a prompt it still had cached (an agent re-sends its whole context
   every turn) is not counted again. On an NVIDIA card it also shows **GPU energy**: watt-hours per day and model
-  (*GPU Wh*) and generated tokens per watt-hour (*tok/Wh*). The energy is that of the whole graphics card while
-  the engine was serving, so other apps using the card are included; *tok/Wh* counts only the energy used while a
+  (*GPU Wh*) and generated tokens per watt-hour (*Tok/Wh*). The energy is that of the whole graphics card while
+  the engine was serving, so other apps using the card are included; *Tok/Wh* counts only the energy used while a
   reply was running. It is read from the card's own energy counter (from power readings when the card has none)
   and only between two checks at most 5 seconds apart, so time the PC was asleep is never counted. Days from
   before 1.13 show a dash. Not yet compared with a real serving run.
