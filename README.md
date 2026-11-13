@@ -177,8 +177,9 @@ the endpoint. Everything on Behaviour and About applies at once.
   the tokens Strata actually read: the part of a prompt it still had cached (an agent re-sends its whole context
   every turn) is not counted again.
 - **Switches** (apply at once): *Reopen closed apps after Turn off* (same as the start dialog's checkbox; off = the
-  closed apps are offered as one click instead), *Keep running in the tray*, *Start with Windows*, *When a game
-  starts*, *When memory runs low*, *When that app closes*, *Idle with no requests*, *Check for updates daily*.
+  closed apps are offered as one click instead), *Keep running in the tray*, *Start with Windows*, *Keep Hermes'
+  "llama" alias in step* (llama.cpp only), *When a game starts*, *When memory runs low*, *When that app closes*,
+  *Idle with no requests*, *Check for updates daily*.
 - **Check for updates** (About tab) — asks GitHub now, whatever the daily switch says, and
   shows the answer next to the button: up to date, a new version (the version label becomes the install link),
   or that GitHub could not be reached. It only checks; installing still asks first. Greyed out when the app
@@ -262,6 +263,17 @@ card, so treat them as a starting point. Strata is not checked: it manages its o
 has the other engine's command is sorted out at the next start. An engine that was never set up looks for its
 install after the switch: Strata sets itself up when it finds one install with one `run-*.bat`, otherwise it
 offers what it found as before.
+
+**Hermes alias (llama.cpp):** *Keep Hermes' "llama" alias in step* is a switch on Settings → Behaviour, off by
+default and greyed out when `hermes.exe` is not found. When it is on, each time llama.cpp serves a loaded model
+Agent Start reads Hermes' `model_aliases.llama` entry (`hermes config get`). If the model name or the address
+differs from what is being served, it rewrites the entry with one `hermes config set` (the model name the server
+reports, `provider: custom`, `base_url: http://127.0.0.1:<port>/v1`) and reads it back, so `/model llama` in Hermes
+follows the model and the port chosen here. A missing entry is created. Agent Start never edits Hermes' files
+itself, and it leaves the entry alone when it already matches, when it cannot be read, or when it holds any other
+key (an `api_key` you added by hand: the rewrite would remove it); the window then says why. There is one attempt
+per model and port per app run; turning the switch off and on tries again. Not yet run against a real Hermes: the
+tests use a stand-in for the command.
 
 How the engines plug in: `docs/engines.md`; the llama.cpp module: `docs/llama_server_design.md`.
 

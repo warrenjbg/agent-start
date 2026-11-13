@@ -23,8 +23,10 @@ Rules, checked again here at run time whatever the caller passed:
     started when the time runs out), check=False;
   * the environment is the app's own minus LLAMA_* and AGENTSTART_* variables; nothing is added, so HERMES_HOME and
     profile settings stay whatever the user has (the user's own Hermes home is the one changed).
-Every refusal is logged with its reason. set_alias, read_alias and find_hermes never raise. Each hermes run takes about
-1.4 s: they are BLOCKING, call them from a worker thread. No Tk, no import of main, library code never prints.
+Every refusal is logged with its reason. set_alias, sync_alias, read_alias and find_hermes never raise. Each hermes
+run takes about 1.4 s: they are BLOCKING, call them from a worker thread. No Tk, no import of main, library code never
+prints. The app calls sync_alias, which reads the entry first and leaves it alone when it is already right or holds a
+key the app did not write.
 """
 from __future__ import annotations
 
@@ -49,6 +51,9 @@ MAX_MODEL_LEN = 200
 MAX_OUTPUT_BYTES = 8192
 MAX_STDERR_NOTE = 200
 CHECK_COMMAND = "hermes config get " + KEY        # what a "may be wrong" note tells the user to run
+ENTRY_KEYS = frozenset(("model", "provider", "base_url"))      # the keys the app writes; any other is the user's
+NOT_SET_MARK = "config key not set"               # `hermes config get` on an absent key: this on stderr, exit code 1
+_SHOWN_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,40}")
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 _ENV_DROP_PREFIXES = ("LLAMA_", "AGENTSTART_")
 _BASE_URL_RE = re.compile(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})/v1")   # ASCII digits only, no leading zero
@@ -310,6 +315,62 @@ def _set_alias(model: Any, base_url: Any, exe: Any, run: Callable[..., Any], exi
     return AliasResult(True, True, f"Hermes alias {ALIAS} now points at {model}")
 
 
+def sync_alias(model: str, base_url: str, *, exe: str | None = None, run: Callable[..., Any] = subprocess.run,
+               exists: Callable[[str], bool] = os.path.isfile, timeout_s: float = TIMEOUT_S) -> AliasResult:
+    """Bring the alias in step with `model` on `base_url`, changing as little as possible. One GET first:
+
+      * the entry already holds exactly these values: nothing more is run (ok, not changed, empty note);
+      * the entry holds a key other than model / provider / base_url (an api_key added by hand): NOT written -
+        the whole-entry write would remove that key;
+      * Hermes says the key is not set: the entry is created (set_alias);
+      * the GET fails in any other way, or its answer cannot be read: NOT written (what is there is unknown);
+      * otherwise: set_alias (one SET and its read-back).
+
+    Never raises. BLOCKING (one to three hermes runs, up to about 5 s): call from a worker thread."""
+    try:
+        return _sync_alias(model, base_url, exe, run, exists, timeout_s)
+    except Exception as exc:  # noqa: BLE001 - contract: never raises (set_alias, the only writer, catches its own)
+        log.warning("hermes alias: unexpected %s", type(exc).__name__)
+        return AliasResult(False, False, f"Hermes alias not updated: an unexpected error occurred "
+                                         f"({type(exc).__name__})")
+
+
+def _sync_alias(model: Any, base_url: Any, exe: Any, run: Callable[..., Any], exists: Callable[[str], bool],
+                timeout_s: Any) -> AliasResult:
+    why = validate_model(model) or validate_base_url(base_url)
+    if why:
+        return _refused(why, model)
+    timeout = _timeout(timeout_s)
+    if timeout is None:
+        return _refused(f"bad time limit {timeout_s!r}", model)
+    path, why = _resolve(exe, exists)
+    if path is None:
+        return _refused(why, model)
+    try:
+        res = _run(run, path, ["config", "get", KEY], timeout)
+    except subprocess.TimeoutExpired:
+        return _refused(f"hermes did not answer within {timeout:.0f} s", model)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return _refused(f"hermes could not be started ({type(exc).__name__})", model)
+    code = getattr(res, "returncode", None)
+    if code == 0:
+        full = _parse_full(_text(getattr(res, "stdout", None)))
+        if full is None:
+            return _refused("the current entry could not be read", model)
+        current, keys = full
+        extra = sorted(keys - ENTRY_KEYS)
+        if extra:
+            shown = ", ".join(k for k in extra[:4] if _SHOWN_KEY_RE.fullmatch(k)) or "another key"
+            return _refused(f"its entry has other settings ({shown}) that an update would remove", model)
+        if not needs_update(current, model, base_url):
+            log.debug("hermes alias: %s is already in step", KEY)
+            return AliasResult(True, False, "")
+    elif not (code == 1 and NOT_SET_MARK in _text(getattr(res, "stderr", None)).casefold()):
+        line = _first_line(_text(getattr(res, "stderr", None)))
+        return _refused(f"reading the current entry gave exit code {code}" + (f" ({line})" if line else ""), model)
+    return _set_alias(model, base_url, path, run, exists, timeout_s)
+
+
 def read_alias(*, exe: str | None = None, run: Callable[..., Any] = subprocess.run,
                exists: Callable[[str], bool] = os.path.isfile, timeout_s: float = TIMEOUT_S) -> dict[str, str] | None:
     """The current `llama` entry as parsed by parse_get_output (GET only), or None when it is not set, cannot be read
@@ -494,6 +555,12 @@ def parse_get_output(text: Any) -> dict[str, str] | None:
 
 
 def _parse(text: Any) -> dict[str, str] | None:
+    full = _parse_full(text)
+    return None if full is None else full[0]
+
+
+def _parse_full(text: Any) -> tuple[dict[str, str], frozenset[str]] | None:
+    """(the string-valued entries, EVERY key of the mapping - also those whose value is not a string), or None."""
     if isinstance(text, (bytes, bytearray)):
         text = bytes(text).decode("utf-8", errors="replace")
     if not isinstance(text, str):
@@ -508,7 +575,8 @@ def _parse(text: Any) -> dict[str, str] | None:
             return None
         if not isinstance(obj, dict):
             return None
-        return {k: v for k, v in obj.items() if isinstance(k, str) and isinstance(v, str)}
+        return ({k: v for k, v in obj.items() if isinstance(k, str) and isinstance(v, str)},
+                frozenset(str(k) for k in obj))
     entries: list[tuple[str, list[str]]] = []
     for line in text.split("\n"):
         if not line.strip():
@@ -538,4 +606,4 @@ def _parse(text: Any) -> dict[str, str] | None:
         value = _scalar(lines)
         if value is not None:
             result[key] = value
-    return result if seen else None
+    return (result, frozenset(seen)) if seen else None

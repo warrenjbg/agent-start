@@ -23,6 +23,7 @@ import psutil
 import config_store
 import engine_profiles
 import engines
+import hermes_alias
 import idle_watch
 import load_progress
 import ram_plan
@@ -496,6 +497,28 @@ def _acquire_singleton() -> None:
         log.debug("mutex re-acquire failed", exc_info=True)
 
 
+ALIAS_LABEL = "Keep Hermes' \u201cllama\u201d alias in step"
+ALIAS_LABEL_MISSING = "Hermes \u201cllama\u201d alias (Hermes not found)"    # short: the row has room for ~40 characters
+
+
+def _alias_worker(exe: str, model: str, url: str, post: Callable, done: Callable) -> None:
+    """Worker: bring Hermes' alias in step (one to three `hermes config` runs, about 1.4 s each)."""
+    try:
+        res = hermes_alias.sync_alias(model, url, exe=exe)
+    except Exception:  # noqa: BLE001
+        log.exception("hermes alias: the update failed")
+        res = hermes_alias.AliasResult(False, False, "Hermes alias not updated: an unexpected error occurred")
+    post(done, (model, url), res)
+
+
+def _alias_note(res: Any) -> str:
+    """The module's sentence as the two short lines of a result note."""
+    head, _, why = str(getattr(res, "note", "") or "").partition(": ")
+    why = why.split("; check it with", 1)[0].strip()
+    head = head.strip() or "Hermes alias not updated"
+    return f"{head}\n{_short(why, 40)}" if why else head
+
+
 def _find_install_worker(engine, post: Callable, done: Callable, stop_evt) -> None:
     """Worker: the engine's bounded, read-only search for an install on this PC."""
     found = []
@@ -694,6 +717,12 @@ class AgentStartApp(ctk.CTk):
         self._last_stop_reason = "game"          # "game" | "memory": why that stop was asked for (toast wording)
         self._skip_reopen_once = False           # Turn off from the game alert: offer the closed apps, don't relaunch
         self._download_win: Any = None           # download_dialog.DownloadDialog while it is open
+        # Hermes alias (Settings switch, off unless state.json says true): see _alias_check
+        self._alias_pref = saved.get("hermes_alias") is True
+        self._can_alias = bool(extras)           # a stub-built app (the test suites) never runs hermes
+        self._alias_done: tuple[str, str] | None = None      # (model, address) already handled in this app run
+        self._alias_busy = False                 # a hermes run is in flight
+        self._hermes_exe: Any = False if extras else None    # False: not looked for yet; else the path or None
         self._idle = idle_watch.IdleWatch()      # idle auto-off: idle time of this serving run (Tk thread)
         self._idle_epoch = -1
         self._idle_stop = False                  # the running stop is the idle auto-off (no box if it gets busy)
@@ -2021,6 +2050,7 @@ class AgentStartApp(ctk.CTk):
                 if self.state_name != ACTIVE:
                     self._metrics_fails = 0     # failed polls of the previous server say nothing about this one
                 self._set_state(ACTIVE)
+            self._alias_check()
         elif self.state_name == ACTIVE and live == "idle":
             self._idle_streak += 1
             if self._idle_streak < 2:           # one stray reading (probe race) must not flip the UI
@@ -3020,6 +3050,68 @@ class AgentStartApp(ctk.CTk):
     def _game_blocked(self) -> bool:
         return self._box_open or self.updates.updating or self._dialog_open()
 
+    # ------------------------------------------------------------------ Hermes alias
+    def _alias_supported(self) -> bool:
+        return bool(getattr(self.engine, "syncs_hermes_alias", False))
+
+    def _hermes_path(self) -> str | None:
+        """hermes.exe, looked for once per app run (file checks only; nothing is started)."""
+        if self._hermes_exe is False:
+            self._hermes_exe = hermes_alias.find_hermes()
+        return self._hermes_exe or None
+
+    def set_alias_pref(self, on: bool) -> None:
+        """Settings switch. On: the alias is brought in step now if the engine serves a model, and from then on
+        whenever the served model or the port changes. Off: the alias is left as it is."""
+        self._alias_pref = bool(on)
+        self._save_state_later("hermes_alias", self._alias_pref)
+        log.info("keep the Hermes alias in step: %s", "on" if on else "off")
+        self._alias_done = None
+        self._alias_check()
+
+    def _alias_target(self) -> tuple[str, str] | None:
+        """(the model name the server reports, its loopback address) while this app's engine serves a loaded
+        model; None at any other time - the alias is never pointed at a server that is not up."""
+        if self.state_name != ACTIVE or self.loaded is not True or not self.model_id:
+            return None
+        port = self.cfg.get("port")
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            return None
+        return str(self.model_id), f"http://127.0.0.1:{port}/v1"
+
+    def _alias_check(self) -> None:
+        """Every status poll while serving, and when the switch changes (Tk thread): start one update when the
+        served model or address is one this app run has not handled yet. One attempt per (model, address): a
+        failure shows a note and is not retried until the model changes or the switch is turned on again. An
+        extra: it must never break the status path, so every error ends here."""
+        try:
+            if not (self._alias_pref and self._can_alias and self._alias_supported()) or self._alias_busy \
+                    or self._destroyed:
+                return
+            target = self._alias_target()
+            if target is None or target == self._alias_done:
+                return
+            self._alias_done = target
+            exe = self._hermes_path()
+            if exe is None:
+                log.info("hermes alias: %s not found, nothing updated", hermes_alias.EXE_NAME)
+                return
+            self._alias_busy = True
+            self._run_worker("hc-alias", _alias_worker, exe, target[0], target[1], self.post, self._alias_result)
+        except Exception:  # noqa: BLE001
+            self._alias_busy = False
+            log.debug("hermes alias check failed", exc_info=True)
+
+    def _alias_result(self, target: tuple[str, str], res: Any) -> None:
+        self._alias_busy = False
+        if self._destroyed:
+            return
+        if getattr(res, "changed", False):
+            self._set_note(f"Hermes alias {hermes_alias.ALIAS} updated\n{_short(target[0], 40)}")
+        elif not getattr(res, "ok", False):
+            self._set_note(_alias_note(res))
+        self._alias_check()                      # the model may have changed while hermes ran
+
     # ------------------------------------------------------------------ model download
     def _download_dir(self) -> str:
         """Where a downloaded model goes: the folder of the model in use (the finder lists what is there), else
@@ -3271,12 +3363,18 @@ class AgentStartApp(ctk.CTk):
                 auto_on = autostart.is_enabled()
             except Exception:  # noqa: BLE001
                 auto_on = False
+        alias: list[dict] = []
+        if self._alias_supported():              # only for an engine Hermes has an alias for (llama.cpp)
+            found = self._hermes_path() is not None
+            alias = [{"key": "hermes_alias", "label": ALIAS_LABEL if found else ALIAS_LABEL_MISSING,
+                      "value": self._alias_pref, "on_change": self.set_alias_pref, "enabled": found}]
         return [
             {"key": "tray", "label": "Keep running in the tray", "value": self._tray_pref,
              "on_change": self.set_tray_pref, "enabled": self._extras},
             {"key": "autostart", "label": "Start with Windows (in the tray)" if frozen
              else "Start with Windows (installed app only)", "value": auto_on,
              "on_change": self.set_autostart_pref, "enabled": frozen and self._extras},
+            *alias,
             *self.watch.settings_rows(self._extras),
             {"key": "updates", "label": "Check for updates daily" if frozen
              else "Check for updates daily (installed app only)", "value": self.updates.daily,

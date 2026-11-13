@@ -565,6 +565,7 @@ class Engine:
     gpu_fit_serving: str = "Running partly on the CPU (slower) · a smaller context or model would fit the GPU"
     watch_gpu_fit: bool = False                               # run the live check (fit_watch) for this engine
     model_downloads: bool = False                             # its models are .gguf files: offer "Download a model"
+    syncs_hermes_alias: bool = False                          # Settings offers to keep Hermes' alias for it in step
 
     # ---- load progress (CAP_LOAD_PROGRESS)
     def load_progress(self, log_text: str, elapsed_s: float, expected_s: float | None) -> tuple[str, float, str | None]:

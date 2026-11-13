@@ -279,6 +279,69 @@ def _open_llama(app, fit: FakeFit | None = None):
     return d
 
 
+def test_alias_switch() -> None:
+    """Keep Hermes' "llama" alias in step: a row for llama.cpp only, greyed when hermes.exe was not found; the
+    switch saves the choice. A stub-built app never runs hermes (no worker is started)."""
+    app, det, ep = U.new_app()
+    try:
+        d = H.open_settings(app)
+        check(d is not None and "hermes_alias" not in d.switches and app._alias_pref is False,
+              "Strata: no alias row; the setting is off by default")
+        if d is not None:
+            H.close_settings(d)
+    finally:
+        app.destroy()
+    app, det, ep = _llama_app([EXE, "-m", MODEL_A, "--port", "9931"], _found())
+    ran: list[str] = []
+    orig = app._run_worker
+    app._run_worker = lambda name, fn, *a: ran.append(name) if name == "hc-alias" else orig(name, fn, *a)  # type: ignore[method-assign]
+    try:
+        check(app._alias_pref is False and app._can_alias is False and app._hermes_exe is None,
+              "a stub-built app: off, never runs hermes, does not look for it")
+        d = _open_llama(app)
+        if d is not None:
+            sw = H.settings_switch(d, main.ALIAS_LABEL_MISSING)
+            check(sw["caption"] == main.ALIAS_LABEL_MISSING and not sw["enabled"] and not sw["value"],
+                  f"hermes.exe not found: the row is greyed and says so ({sw})")
+            keys = list(d.switches)
+            check("hermes_alias" in keys and keys.index("hermes_alias") == keys.index("autostart") + 1
+                  and H.settings_tab_of(d, d.switches["hermes_alias"][1]) == "Behaviour",
+                  f"the row sits on Behaviour, after Start with Windows ({keys})")
+            with Saves() as s:
+                H.toggle_settings_switch(d, main.ALIAS_LABEL_MISSING)
+                pump(app, 0.5)
+                check(app._alias_pref is False and not s.state, "a greyed switch cannot be turned on")
+            ok, info = _heights_fixed(app, d)
+            check(ok, f"llama.cpp with the alias row: one height, nothing clipped ({info})")
+            H.show_settings_tab(d, "Behaviour")
+            pump(app, 0.2)
+            U.shot(d, "settings_tabs_llama_alias_missing")
+            H.close_settings(d)
+        app._hermes_exe = os.path.join(str(TMP), "hermes", "bin", "hermes.exe")      # found (never run: gated)
+        d = _open_llama(app)
+        if d is not None:
+            sw = H.settings_switch(d, main.ALIAS_LABEL)
+            check(sw["caption"] == main.ALIAS_LABEL and sw["enabled"] and not sw["value"],
+                  f"hermes.exe found: the row is live and off ({sw})")
+            with Saves() as s:
+                H.toggle_settings_switch(d, main.ALIAS_LABEL)
+                check(app._alias_pref is True, "the switch -> set_alias_pref")
+                pump_until(app, lambda: any("hermes_alias" in st for st in s.state), 3)
+                check(any(st.get("hermes_alias") is True for st in s.state) and not s.config,
+                      f"saved as hermes_alias in state.json, config.json untouched ({s.state})")
+                H.toggle_settings_switch(d, main.ALIAS_LABEL)
+                pump_until(app, lambda: any(st.get("hermes_alias") is False for st in s.state), 3)
+                check(app._alias_pref is False and any(st.get("hermes_alias") is False for st in s.state),
+                      "and off again")
+            H.show_settings_tab(d, "Behaviour")
+            pump(app, 0.2)
+            U.shot(d, "settings_tabs_llama_alias")
+            H.close_settings(d)
+        check(not ran, f"no hermes worker was started ({ran})")
+    finally:
+        app.destroy()
+
+
 def test_download_link() -> None:
     """Download a model…: only for an engine with .gguf models; the link closes Settings and opens the app's
     download window (here a recorder: no window, no network)."""
@@ -584,7 +647,8 @@ def test_advanced_fold() -> None:
 
 
 def run() -> int:
-    for t in (test_strata_tabs, test_download_link, test_llama_tabs_and_controls, test_advanced_fold):
+    for t in (test_strata_tabs, test_alias_switch, test_download_link, test_llama_tabs_and_controls,
+              test_advanced_fold):
         print(f"-- {t.__name__}")
         try:
             t()

@@ -32,7 +32,8 @@ CI_SUITES = [
     "test_toasts", "test_updater", "test_server_manager", "test_mem_watch", "test_resume_watch", "test_usage_history",
     "test_llama_cpp", "test_fit_check", "test_fit_watch", "test_llama_finder", "test_engine_profiles",
     "test_strata_tuning", "test_llama_models", "test_update_sig", "test_hf_download", "test_hermes_alias",
-    "test_download_flow", "test_idle_watch", "test_kill_path", "test_engines", "test_metrics_sample",
+    "test_alias_wiring", "test_download_flow", "test_idle_watch", "test_kill_path", "test_engines",
+    "test_metrics_sample",
 ]
 # Run in CI as advisory (non-blocking): they depend on what the runner's desktop/hardware happens to provide.
 CI_ADVISORY = ["test_detector", "test_tray"]

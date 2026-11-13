@@ -544,6 +544,122 @@ def t_read_alias() -> None:
           "read_alias + needs_update: an up-to-date entry is not rewritten")
 
 
+class SyncHermes(FakeHermes):
+    """GETs before any SET answer `before` (exit code, stdout, stderr) or raise it; after a SET it is FakeHermes."""
+
+    def __init__(self, before, **kw):
+        super().__init__(**kw)
+        self.before = before
+
+    def __call__(self, argv, **kw):
+        if argv[1:3] != ["config", "set"] and self.sent is None:
+            self.calls.append((list(argv), dict(kw)))
+            if isinstance(self.before, BaseException):
+                raise self.before
+            code, out, err = self.before
+            return SimpleNamespace(returncode=code, stdout=out, stderr=err)
+        return super().__call__(argv, **kw)
+
+
+NOT_SET = (1, b"", b"Config key not set: model_aliases.llama\r\n")
+M1 = "Qwen3.8-27B-UD-IQ4_XS"
+GET_ARGV = [EXE, "config", "get", "model_aliases.llama"]
+
+
+def sync(model, before, url=URL, exe: str | None = EXE, exists=YES, timeout_s=ha.TIMEOUT_S, **kw):
+    fake = SyncHermes(before, **kw)
+    return ha.sync_alias(model, url, exe=exe, run=fake, exists=exists, timeout_s=timeout_s), fake
+
+
+def kinds(fake) -> list[str]:
+    return [c[0][2] for c in fake.calls]
+
+
+def t_sync() -> None:
+    """sync_alias: one GET first; the entry is only written when that GET shows it is safe and needed."""
+    res, fk = sync(M1, (0, REAL_GET, b""))
+    check(res == ha.AliasResult(True, False, "") and kinds(fk) == ["get"] and fk.calls[0][0] == GET_ARGV,
+          f"already in step: one GET, no SET, no note ({res}, {kinds(fk)})")
+    kw = fk.calls[0][1]
+    check(kw.get("shell") is False and kw.get("stdin") is subprocess.DEVNULL and kw.get("timeout") == 20.0
+          and kw.get("creationflags") == 0x08000000 and kw.get("check") is False, "the first GET: same safe options")
+
+    # (the fixture table has no YAML for this name: the read-back is given explicitly)
+    back = b"model: Qwen3.8-27B-UD-Q3_K_XL\r\nprovider: custom\r\nbase_url: " + URL.encode() + b"\r\n"
+    res, fk = sync("Qwen3.8-27B-UD-Q3_K_XL", (0, REAL_GET, b""), get_out=back)
+    check(kinds(fk) == ["get", "set", "get"] and res.ok and res.changed
+          and fk.sent == {"model": "Qwen3.8-27B-UD-Q3_K_XL", "provider": "custom", "base_url": URL},
+          f"another model: GET, SET, read-back ({res}, {kinds(fk)})")
+    set_argv = fk.calls[1][0]
+    check(set_argv[:5] == [EXE, "config", "set", "--", "model_aliases.llama"] and len(set_argv) == 6,
+          "the SET is set_alias' own: whole entry as one argument after --")
+
+    url8080 = "http://127.0.0.1:8080/v1"
+    res, fk = sync(M1, (0, REAL_GET, b""), url=url8080)
+    check(kinds(fk) == ["get", "set", "get"] and res.ok and res.changed and fk.sent is not None
+          and fk.sent["base_url"] == url8080, f"same model on another port: written ({res})")
+
+    res, fk = sync(M1, (0, get_text(M1, provider="openai"), b""))
+    check(kinds(fk) == ["get", "set", "get"] and res.ok and res.changed, "another provider in the entry: written")
+
+    res, fk = sync(M1, NOT_SET)
+    check(kinds(fk) == ["get", "set", "get"] and res.ok and res.changed, f"Hermes says the key is not set: created ({res})")
+    res, fk = sync(M1, (1, b"", b"CONFIG KEY NOT SET: model_aliases.llama"))
+    check(kinds(fk) == ["get", "set", "get"] and res.ok, "...whatever the case of that sentence")
+
+    # a key the app did not write: nothing is written
+    for extra, shown in ((b"api_key: sk-secret-value\r\n", "api_key"), (b"key_env: MY_KEY\r\n", "key_env"),
+                         (b"api_key: 12345\r\n", "api_key"), (b"headers:\r\n  x: y\r\n", "headers"),
+                         (b"api_key:\r\n", "api_key")):
+        n = len(LOG.records)
+        res, fk = sync("Qwen3.8-27B-UD-Q3_K_XL", (0, REAL_GET + extra, b""))
+        check(kinds(fk) == ["get"] and not res.ok and not res.changed and shown in res.note
+              and res.note.startswith("Hermes alias not updated: its entry has other settings"),
+              f"an entry with {shown} (value kind: {extra[:14]!r}): one GET, NO SET ({res.note})")
+        check("secret" not in res.note and "12345" not in res.note and "MY_KEY" not in res.note
+              and not any("secret" in r.getMessage() or "MY_KEY" in r.getMessage() for r in LOG.records[n:]),
+              "...and the other key's VALUE is neither shown nor logged")
+    res, fk = sync(M1, (0, REAL_GET + b"api_key: sk-x\r\n", b""))
+    check(kinds(fk) == ["get"] and not res.ok, "...also when model and address are already right (not reported as in step)")
+    res, fk = sync(M1, (0, b'{"model": "x", "provider": "custom", "base_url": "u", "we ird\\n": 1}', b""))
+    check(kinds(fk) == ["get"] and not res.ok and "another key" in res.note and "we ird" not in res.note,
+          f"a key name that is not a plain word is not echoed ({res.note})")
+
+    # the GET did not give a usable answer: what is there is unknown, so nothing is written
+    for before, why in (((1, b"", b"Traceback (most recent call last):"), "exit 1 without the not-set sentence"),
+                        ((2, b"", b"Config key not set: model_aliases.llama"), "the not-set sentence with exit 2"),
+                        ((1, b"Config key not set: model_aliases.llama", b""), "the not-set sentence on stdout"),
+                        ((0, b"", b""), "exit 0, empty"), ((0, b"garbage", b""), "exit 0, unreadable"),
+                        ((0, b"- a\r\n- b\r\n", b""), "exit 0, a list"),
+                        ((None, REAL_GET, b""), "no exit code"),
+                        (subprocess.TimeoutExpired(["x"], 20), "timeout"), (OSError(2, "gone"), "cannot start"),
+                        (RuntimeError("boom"), "any error")):
+        try:
+            res, fk = sync("Qwen3.8-27B-UD-Q3_K_XL", before)
+            check(kinds(fk) == ["get"] and not res.ok and not res.changed
+                  and res.note.startswith("Hermes alias not updated: "), f"GET {why}: NO SET ({res.note})")
+        except Exception as exc:  # noqa: BLE001
+            check(False, f"sync_alias (GET {why}) raised {exc!r}")
+
+    # refusals before anything runs
+    for model, url, exe, exists, ts, why in (
+            ("", URL, EXE, YES, 20.0, "empty model"), ("a\nb", URL, EXE, YES, 20.0, "control character"),
+            (M1, "http://example.com:80/v1", EXE, YES, 20.0, "not loopback"),
+            (M1, "http://127.0.0.1:9931/v1/", EXE, YES, 20.0, "trailing slash"),
+            (M1, URL, r"C:\x\hermes.cmd", YES, 20.0, ".cmd"), (M1, URL, "hermes.exe", YES, 20.0, "relative"),
+            (M1, URL, EXE, lambda p: False, 20.0, "missing program"), (M1, URL, EXE, YES, 0, "bad time limit")):
+        res, fk = sync(model, NOT_SET, url=url, exe=exe, exists=exists, timeout_s=ts)
+        check(not fk.calls and not res.ok and not res.changed, f"{why}: nothing runs ({res.note})")
+
+    # the write itself fails or cannot be confirmed: set_alias' own answers come through unchanged
+    res, fk = sync(M1, NOT_SET, set_code=1, set_stderr=b"Cannot set: locked")
+    check(kinds(fk) == ["get", "set"] and not res.ok and res.note.startswith("Hermes alias not updated: hermes exited"),
+          f"SET exit 1: not updated ({res.note})")
+    res, fk = sync(M1, NOT_SET, get_out=get_text(M1, url="http://127.0.0.1:1/v1"))
+    check(kinds(fk) == ["get", "set", "get"] and not res.ok and "may be wrong" in res.note,
+          f"read-back shows other values: may be wrong ({res.note})")
+
+
 def t_module_rules() -> None:
     src = (ROOT / "hermes_alias.py").read_text(encoding="utf-8")
     check("shell=True" not in src, "tripwire: no shell=True in hermes_alias.py")
@@ -570,7 +686,7 @@ def t_module_rules() -> None:
     check(not mods & {"main", "tkinter", "customtkinter", "psutil", "socket", "urllib", "yaml", "shutil"},
           f"stdlib only, no Tk / main / network ({sorted(mods)})")
     check(ha.ALIAS == "llama" and ha.TIMEOUT_S == 20.0 and ha.EXE_NAME == "hermes.exe", "contract constants")
-    for fn in (ha.set_alias, ha.read_alias):
+    for fn in (ha.set_alias, ha.sync_alias, ha.read_alias):
         p = inspect.signature(fn).parameters
         check(p["run"].default is _forbidden and p["exists"].default is os.path.isfile and p["exe"].default is None,
               f"{fn.__name__}: defaults are subprocess.run (guarded here), os.path.isfile, exe None")
@@ -584,7 +700,7 @@ def t_module_rules() -> None:
 
 def main() -> int:
     for t in (t_find_hermes, t_validators, t_entry_json, t_set_happy, t_refusals, t_set_failures, t_readback,
-              t_parse, t_needs_update, t_read_alias, t_module_rules):
+              t_parse, t_needs_update, t_read_alias, t_sync, t_module_rules):
         try:
             t()
         except Exception as exc:  # noqa: BLE001
