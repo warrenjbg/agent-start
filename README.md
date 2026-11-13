@@ -118,6 +118,10 @@ script); the Settings dialog and the log show the same number.
 
 ## Settings (⚙)
 
+Settings has three tabs. **Model**: the engine and what it starts (Cancel / Save). **Behaviour**: what happens when
+other apps need the PC, after Turn off, tray and Start with Windows. **About**: version and updates, usage history,
+the endpoint. Everything on Behaviour and About applies at once.
+
 - **Engine** — *Strata* or *llama.cpp* (see [Engines](#engines)). Choosing another engine asks once, then
   Agent Start restarts into it. If the current engine is running it is turned off first (the normal Turn off,
   which asks while a reply runs); say no there and nothing changes.
@@ -132,6 +136,13 @@ script); the Settings dialog and the log show the same number.
   in the dialog.
   **Save** writes the choice to `config.json`. If Strata is running, nothing is restarted: the main window shows
   *"run-….bat applies next start"* and the new launcher is used the next time you turn it on.
+- **Context length** and **Vision** (Strata) — under the launcher, when its run config (`strata-<model>.json`) has
+  them: 32K / 64K / 128K / 256K tokens (plus the launcher's own value), and On / Off for reading pictures. Vision
+  is only offered for a model Strata set up with vision. Strata's own files are never edited: the choice is kept in
+  Agent Start's `config.json` (`strata_tuning`), and at each Turn on a copy of the run config with only those two
+  options changed is written to `%APPDATA%\AgentStart\strata\` and handed to Strata. Pick the launcher's own
+  values again and Strata gets its own file. Tested with Strata 0.2.10 on one PC. The RAM check before Turn on
+  still assumes the launcher's own context.
 - **Endpoint** — **Open Strata dashboard** opens Strata's own web app (`http://127.0.0.1:<port>/`: chat, Monitor,
   its settings) in your browser; greyed out with *not running* while Strata is off. Below it the API address
   (`…/v1`) with **Copy**, for pasting into Hermes or other clients.
@@ -146,7 +157,7 @@ script); the Settings dialog and the log show the same number.
 - **Switches** (apply at once): *Reopen closed apps after Turn off* (same as the start dialog's checkbox; off = the
   closed apps are offered as one click instead), *Keep running in the tray*, *Start with Windows*, *When a game
   starts*, *When memory runs low*, *When that app closes*, *Check for updates daily*.
-- **Check for updates** (top right, under the version) — asks GitHub now, whatever the daily switch says, and
+- **Check for updates** (About tab) — asks GitHub now, whatever the daily switch says, and
   shows the answer next to the button: up to date, a new version (the version label becomes the install link),
   or that GitHub could not be reached. It only checks; installing still asks first. Greyed out when the app
   runs from source.
@@ -171,10 +182,17 @@ To use llama.cpp:
    **Choose model**: it lists the models, and picking one finishes the set-up. After that the ⇄ button next to
    the gear switches between the found models (only the model in the arguments changes; a running model is
    turned off first, the same way as a Strata model switch).
-3. Settings shows **Build** and **Model** dropdowns with what was found, above a program box and an arguments box.
-   On an NVIDIA card the CUDA build comes first. Picking a model writes it into the arguments and keeps the rest;
-   you can also *Browse…* for `llama-server.exe` and type the arguments yourself, e.g.
-   `-m C:\models\model.gguf --port 9931`.
+3. Settings (Model tab) shows **Build**, **Model**, **Context length**, **Vision** and **Port**. On an NVIDIA
+   card the CUDA build comes first. Each control rewrites one option in the arguments and keeps the rest:
+   - *Context length*: Auto (the model's own), 8K to 128K; a value typed by hand shows as custom. While nothing is
+     serving, a note under it says whether that choice fully fits the GPU (the same check as at Turn on).
+   - *Vision*: Off, or a vision file (`mmproj-*.gguf`) found in the model's folder. Not yet tried with a real
+     model start.
+   - *Port*: the `--port` value.
+
+   The program box and the arguments box are under **Advanced · program and arguments**, which opens by itself
+   when the arguments cannot be shown by the controls. You can *Browse…* for `llama-server.exe` and type the
+   arguments yourself, e.g. `-m C:\models\model.gguf --port 9931`.
    - An explicit `--port N` is required (with a space; `--port=N` is refused). llama-server's own default port is
      9931; Agent Start does not rely on it.
    - A model is required: `-m <file.gguf>` or `-hf <user>/<model>`. Router mode (no model) is not supported, and
@@ -311,6 +329,7 @@ started*, then *Reopened 3 apps*.
 | `backend` | The inference engine: `strata` (default; a missing or unknown value means `strata`) or `llama_cpp`. Set by the Engine row in Settings. See [Engines](#engines) and `docs/engines.md` |
 | `fit_watch_vram_pct`, `fit_watch_cpu_pct`, `fit_watch_sustain_s`, `fit_watch_clear_s` | llama.cpp only, the live GPU-fit check: video memory at least this full (90) and the server at least this share of all CPU cores (25) for this many seconds of generating (8) shows the warning; this many seconds without it (20) clears it |
 | `engine_profiles` | Written by the app: the launch settings of the engine that is not in use (`launch_cmd`, `launch_cwd`, `launcher_bat`, `strata_dir`, `model_name`, `endpoint_url`, `port`, `api_key`), restored when you switch back |
+| `strata_tuning` | Written by Settings: your Context length / Vision choice per Strata run config. Remove it and Strata gets its own file |
 | `api_key` | llama.cpp only: the first `--api-key` from the arguments, saved by Settings; sent as a Bearer header only after the port identified itself as llama-server |
 | `mem_watch_app_mb`, `mem_watch_sustain_s` | Memory-pressure check: an app's memory that counts as large (4096), and how long both conditions must hold (15) |
 | `mem_watch_evict_pct`, `mem_watch_evict_sustain_s`, `mem_watch_evict_app_mb` | Pushed-out check: Strata's memory in RAM below this share of its peak (50) for this long (6), and the smallest new app that is named as the cause, in MB (512) |
