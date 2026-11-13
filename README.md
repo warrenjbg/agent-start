@@ -501,6 +501,7 @@ notification area on a runner). *Local* suites open the real window and take scr
 | `tests\test_alias_wiring.py` | CI | The app's side of the Hermes alias on a stand-in object: when an update starts, everything that keeps it from starting, one attempt per model and port |
 | `tests\test_metrics_worker.py` | CI | The metrics worker (the poll while serving) on a stand-in object, one turn at a time with a stand-in clock: what it polls and hands on, everything that keeps it from polling, serving time and GPU energy for the usage history, a failing line never ending the loop |
 | `tests\test_protected_changes.py` | CI | `tools\protected_changes.py`: which changed files need a stronger reviewer, and that `AGENTS.md` shows the same list |
+| `tests\test_split_layout.py` | CI | The layout of the app's own modules: `main.py` re-exports are the home modules' objects, no test patches a moved name on `main`, no split module imports `main`, the app class takes its drawing and tray methods from the mixins, the frozen build lists every module |
 | `tests\test_settings_tabs.py` | Local | The Settings tabs for both engines (opens windows): rows per tab, per-model arguments, Largest that fits the GPU, the Port choice, the download link, the alias switch |
 | `tests\test_strata_tuning.py` | CI | Strata's Context length / Vision choice: the app-owned copy of the run config, on made-up Strata folders |
 | `tests\test_strata_tune_ui.py` | Local | Those two rows in the Settings window (opens one window) |

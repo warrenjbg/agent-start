@@ -88,8 +88,29 @@ Run everything from the project folder with the project's own interpreter.
 - **One thing per commit,** with a message that says what changed for the user.
 - **Find the module first.** Most features live in their own file with their own suite (`idle_watch.py` and
   `tests\test_idle_watch.py`, `hf_download.py` and `tests\test_hf_download.py`, …). Open that pair, not `main.py`.
-- **`main.py` is the hub.** It holds the window, the on/off state machine and the wiring between modules. Change it
-  only for wiring, read the methods around your change, and run the window suites afterwards.
+- **The app window is one class in several files.** Open the one your change belongs to:
+
+  | File | What it holds |
+  |---|---|
+  | `main.py` | `AgentStartApp`: start-up, the on/off state machine, safe stop, model and engine switch, reopen, Settings wiring, exit. The hub: change it only for that logic or for wiring, read the methods around your change, and run the window suites afterwards |
+  | `main_view.py` | `AppView`, a mixin of the app class: building and redrawing the window (layout, status and detail line, stats panels, pins) and the drawing constants |
+  | `main_tray.py` | `AppTray`, a mixin of the app class: the app's side of the tray icon (`tray.py` is the icon itself) |
+  | `app_workers.py` | functions the app runs on worker threads, and small pure helpers; no Tk |
+  | `metrics_worker.py` | `MetricsWorker`: the polling thread (status, usage history, GPU energy, live GPU-fit check) |
+  | `alias_controller.py` | `AliasController`: keeping Hermes' alias in step |
+  | `watch_controller.py`, `update_controller.py` | what the watchers decide; the in-app update |
+  | `app_consts.py`, `text_util.py` | constants and text helpers the files above share; no app imports |
+
+  The mixins use the app's attributes freely: an attribute they read is created in `AgentStartApp.__init__` or
+  in `_build_ui`. A controller (`XxxController` + `XxxHost`) reads the app only through its host, and `main.py`
+  wires each host callable to look the app's method up when it is called, because tests swap app methods for
+  recorders after the app is built.
+- **A constant lives in the module whose code reads it.** `main.py` still offers the moved names
+  (`main.LIVE_POLL_S`, `main.STATUS`, …) for reading, but they are copies there: to change one in a test, set it on
+  its home module (`metrics_worker.LIVE_POLL_S = 0.2`). `tests\test_split_layout.py` fails when a test sets one on
+  `main`.
+- **None of these modules may import `main`.** Run as a script, `main.py` is `__main__`; `import main` would load a
+  second copy of the app. Shared values go to `app_consts.py`.
 - **A test that fails is information.** Fix the code, or, when the behaviour was changed on purpose, change the
   expectation and say so. Never loosen a check to make it pass, and never delete one.
 - **A new suite that passes on its first run proves little.** Break the code in one line and watch a check fail.
