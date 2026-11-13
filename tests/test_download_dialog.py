@@ -140,6 +140,8 @@ class FakeHf:
                     while not step[1].wait(0.05):
                         if stop_evt is not None and stop_evt.is_set():
                             break
+                elif op == "hold":                 # block until the test releases it, whatever stop_evt says:
+                    step[1].wait(10)               # the test looks at the 'cancelling' state without a race
                 elif op == "stop":
                     if stop_evt is not None and stop_evt.is_set():
                         raise HfError("cancelled")
@@ -341,7 +343,7 @@ def test_progress_and_cancel(root) -> Path | None:
     hf = FakeHf()
     gate = threading.Event()
     # samples over ~1.2 s, so the smoothed rate (RATE_MIN_SPAN_S = 1 s) and the ETA are known while it waits
-    hf.script = [("p", 0, 0.6), ("p", int(1.5 * GIB), 0.6), ("p", int(4.6 * GIB), 0.1), ("wait", gate), ("stop",)]
+    hf.script = [("p", 0, 0.6), ("p", int(1.5 * GIB), 0.6), ("p", int(4.6 * GIB), 0.1), ("hold", gate), ("stop",)]
     dlg, done = open_dialog(root, hf, hidden=False, threaded=True)
     path = None
     try:
@@ -366,6 +368,7 @@ def test_progress_and_cancel(root) -> Path | None:
         pump(root, 0.05)
         eq(dlg.message_text(), dd.CANCELLING, "cancelling")
         eq(dlg.button_states().get("Cancel download"), False, "Cancel greyed while stopping")
+        gate.set()                                   # now the (fake) download notices the stop
         check(pump_until(root, lambda: dlg.flow.phase == "list"), "the download stopped")
         eq(dlg.message_text(), hf_download._DEFAULT_MSG["cancelled"], "cancel says the part is kept")
         eq(dlg.button_states().get("Resume"), True, "Resume offered")
