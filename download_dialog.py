@@ -40,7 +40,7 @@ import customtkinter as ctk
 import hf_download
 import theme as T
 from hf_download import HfError, HfFile, RepoListing
-from sweep_dialog import apply_modal, center_over, later, release_modal, style_dialog
+from sweep_dialog import center_over, later, release_modal, style_dialog
 
 log = logging.getLogger("agent_start")
 
@@ -836,7 +836,7 @@ class DownloadFlow:
 
 # ================================================================================================ the window
 WIDTH = 420
-HEIGHT = 480
+HEIGHT = 528            # the content's own height (the message line under the progress bar was cut off at 480)
 PAD = 12
 LIST_H = 150             # about five rows; longer lists scroll
 ROW_H = 28
@@ -1003,7 +1003,18 @@ class DownloadDialog(ctk.CTkToplevel):
         if self._q is not None:
             self._pump_id = self.after(PUMP_MS, self._pump)
         self._render()
-        apply_modal(self, master)
+        # NOT modal: a download can take a long time, and the app (Turn on / off, Settings) stays usable
+        # meanwhile. The window stays above the main window and is brought to the front once.
+        self.transient(master)
+        later(self, 200, self._raise_once)
+
+    def _raise_once(self) -> None:
+        try:
+            if self.winfo_exists():
+                self.lift()
+                self.focus_force()
+        except Exception:  # noqa: BLE001
+            log.debug("download dialog: could not be raised", exc_info=True)
 
     # ------------------------------------------------------------------ own answer queue (bare masters only)
     def _queue_post(self, fn: Callable[..., None], *args: Any) -> None:

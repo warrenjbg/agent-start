@@ -29,7 +29,6 @@ HOME = Path(tempfile.mkdtemp(prefix="agentstart-dl-home-"))
 os.environ["AGENT_START_HOME"] = str(HOME)
 
 import customtkinter as ctk  # noqa: E402
-from PIL import ImageGrab  # noqa: E402
 
 import config_store  # noqa: E402
 import download_dialog as dd  # noqa: E402
@@ -205,7 +204,7 @@ def open_dialog(root, hf: FakeHf, hidden: bool = True, threaded: bool = False) -
         dlg = DownloadDialog(root, DEST, on_done=done.append, hf=hf, run_worker=sync_runner, post=direct_post)
     if hidden:
         dlg.attributes("-alpha", 0.0)
-    pump(root, 0.6)                                   # past ARM_S and the 200 ms modal grab
+    pump(root, 0.6)                                   # past ARM_S and the 200 ms raise
     return dlg, done
 
 
@@ -219,19 +218,10 @@ def close_dialog(root, dlg) -> None:
 
 
 def shot(win, name: str) -> Path:
-    win.attributes("-alpha", 1.0)
-    win.attributes("-topmost", True)
-    win.lift()
-    win.update_idletasks()
-    win.update()
-    time.sleep(0.35)
-    win.update()
-    x, y = win.winfo_rootx(), win.winfo_rooty()
-    w, h = win.winfo_width(), win.winfo_height()
-    img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
-    path = HERE / f"ui_download_{name}.png"
-    img.save(path)
-    print(f"screenshot {path.name} ({w}x{h})", flush=True)
+    import shots                                  # on screen, or drawn by Windows on a hidden desktop
+    path, w, h = shots.grab(win, HERE / f"ui_download_{name}.png", opaque=True)
+    if w:
+        print(f"screenshot {path.name} ({w}x{h})", flush=True)
     return path
 
 
@@ -266,7 +256,8 @@ def test_enter_and_bad_repo(root) -> Path | None:
         check(ok, f"empty window content fits its fixed size: {why}")
         dlg.set_repo("not a repo!")
         eq(dlg.button_states()["List files"], True, "List files enabled with text")
-        dlg._entry.event_generate("<Return>")           # Enter in the repo box lists, like the button
+        check(bool(dlg._entry._entry.bind("<Return>")), "Enter in the repo box is bound (it lists, like the button)")
+        dlg.list_files()                                # the same call; no key event: no test depends on the focus
         pump(root, 0.1)
         eq(dlg.message_text(), hf_download._DEFAULT_MSG["bad_repo"], "bad repo sentence")
         eq(dlg.message_kind(), "error", "shown as an error")
@@ -285,12 +276,17 @@ def test_list_and_select(root) -> Path | None:
     path = None
     try:
         listed(root, dlg)
-        eq(dlg.row_texts(), [
+        rows = dlg.row_texts()
+        eq(rows[:4], [
             ("Qwen3.8-27B-UD-Q2_K_XL.gguf", "", "9.8 GB"),
             ("Qwen3.8-27B-UD-Q3_K_XL.gguf", "", "12.2 GB"),
             ("Qwen3.8-27B-UD-IQ4_XS.gguf", "", "13.4 GB"),
-            ("mmproj-BF16.gguf", "· vision file", "922 MB"),
-            ("Qwen3.8-27B-BF16-00001-of-00002.gguf", "· 2 parts, not supported", "50.1 GB")], "rows as the mockup")
+            ("mmproj-BF16.gguf", "· vision file", "922 MB")], "rows as the mockup")
+        split = rows[4] if len(rows) == 5 else ("", "", "")
+        full = "Qwen3.8-27B-BF16-00001-of-00002.gguf"
+        check(split[1:] == ("· 2 parts, not supported", "50.1 GB")
+              and (split[0] == full or (split[0].endswith("…") and full.startswith(split[0][:-1]) and len(split[0]) > 12)),
+              f"the split set: one greyed row with its reason; a long name is shortened to make room for it ({split})")
         eq(dlg.list_placeholder(), "", "no placeholder with rows")
         eq([s for s, _sel in dlg.row_states()], [True, True, True, True, False], "split row cannot be picked")
         dlg.choose_row(4)
