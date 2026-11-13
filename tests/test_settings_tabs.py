@@ -279,6 +279,143 @@ def _open_llama(app, fit: FakeFit | None = None):
     return d
 
 
+def test_fit_largest_entry() -> None:
+    """Context length > 'Largest that fits the GPU' in the window: where the entry sits, one check at a time, the
+    measured size written as -c N, the answers that change nothing, and the greyed entry with its reason. The
+    app's two calls are recorders here: nothing is measured and no tool runs."""
+    base = [EXE, "-m", MODEL_A, "--port", "9931", "-c", "65536", "-np", "1"]
+    app, det, ep = _llama_app(base, _found())
+    why: list[str | None] = [None]
+    asks: list[tuple] = []
+    real_reason, real_largest = app.fit_largest_reason, app.fit_largest
+    app.fit_largest_reason = lambda info: why[0]                                    # type: ignore[method-assign]
+    app.fit_largest = lambda info, done: bool(asks.append((tuple(info.args), done)) or True)   # type: ignore[method-assign]
+    label = "Largest that fits the GPU"
+    try:
+        d = _open_llama(app, FakeFit())
+        if d is None:
+            check(False, "Settings did not open")
+            return
+        menu = d._context_menu
+        opt = H.settings_option(d, "Context length")
+        check(opt["choices"][0].startswith("Auto") and opt["choices"][1] == label and opt["choices"].count(label) == 1,
+              f"the entry is second in the Context list, after Auto ({opt['choices'][:3]})")
+        check(str(menu._dropdown_menu.entrycget(1, "state")) == "normal" and not asks and d.fit_largest_calls == 0,
+              "it can be picked; opening Settings measures nothing")
+        note = d._fit_note
+        with Saves() as s:
+            H.choose_settings_option(d, "Context length", label)
+            pump(app, 0.1)
+            check(len(asks) == 1 and d.fit_largest_calls == 1 and asks[0][0] == tuple(base[1:]),
+                  f"picking it asks the app once, for the arguments in the box ({asks and asks[0][0]})")
+            check(d.fit_state == "checking" and _shown(note) and note.cget("text") == SD.FIT_CHECKING
+                  and _args(d) == base[1:], "while it runs: 'Checking…' under the row, the arguments untouched")
+            H.choose_settings_option(d, "Context length", label)
+            pump(app, 0.1)
+            check(len(asks) == 1, "picking it again while the check runs starts no second one")
+            long = main.fit_largest_text(26112, "ok", 2.7)       # the app's own, longest result line
+            check(long == "Fits the GPU at 26,112 tokens · measured with 2.7 GB of video memory in use by other apps",
+                  f"the result line's wording ({long})")
+            asks[0][1](26112, "ok", long)
+            pump(app, 0.3)
+            args = _args(d)
+            check(args.count("-c") == 1 and args[args.index("-c") + 1] == "26112"
+                  and [a for a in args if a not in ("26112",)] == [a for a in base[1:] if a != "65536"],
+                  f"the answer is written as -c 26112, everything else kept ({args})")
+            shown = H.settings_option(d, "Context length")["value"]
+            check("26" in shown and shown != label, f"the row shows the size, not the entry's name ({shown!r})")
+            check(d.fit_state == "largest" and _shown(note) and note.cget("text") == long
+                  and str(note.cget("text_color")) != str(T.AMBER), "the result line under the row, not amber")
+            path = U.shot(d, "settings_tabs_llama_largest")
+            ok, info = _heights_fixed(app, d)
+            check(ok, f"with the longest result line shown nothing is clipped ({info})")
+            for tokens, state, text in ((None, "nofit", "Does not fit the GPU even at the smallest context llama.cpp tries"),
+                                        (None, "unconfirmed", "Two checks disagreed (video memory in use changed?) · try again"),
+                                        (None, "error", "The check gave no answer"), (4096, "weird", "x")):
+                n = len(asks)
+                before = _args(d)
+                H.choose_settings_option(d, "Context length", label)
+                pump(app, 0.1)
+                check(len(asks) == n + 1, f"{state}: asked")
+                asks[-1][1](tokens, state, text)
+                pump(app, 0.3)
+                check(_args(d) == before and d.fit_state == "warn" and note.cget("text") == text
+                      and str(note.cget("text_color")) == str(T.AMBER)
+                      and H.settings_option(d, "Context length")["value"] == shown,
+                      f"{state}: nothing is written, the row shows what the arguments say, amber line")
+            # the whole context fits: back to Auto
+            H.choose_settings_option(d, "Context length", label)
+            pump(app, 0.1)
+            asks[-1][1](0, "full", "The model's whole context fits the GPU · left on Auto")
+            pump(app, 0.3)
+            check("-c" not in _args(d) and H.settings_option(d, "Context length")["value"].startswith("Auto")
+                  and d.fit_state == "largest", f"'the whole context fits': -c removed, the row on Auto ({_args(d)})")
+            # an answer belongs to the model, context and vision it was asked for: another edit made meanwhile is kept
+            H.choose_settings_option(d, "Context length", label)
+            pump(app, 0.1)
+            d._args.set(d._args.get() + " --threads 4")
+            pump(app, 0.4)
+            asks[-1][1](8192, "ok", "Fits the GPU at 8,192 tokens")
+            pump(app, 0.3)
+            args = _args(d)
+            check(args.count("-c") == 1 and args[args.index("-c") + 1] == "8192" and args[-4:-2] == ["--threads", "4"],
+                  f"typing another option while the check runs: the answer is written and the typed option kept ({args})")
+            check(not s.config and not s.state, "none of it is saved before Save")
+            # ...and it is dropped when the model was changed meanwhile (the size was measured for the other model)
+            H.choose_settings_option(d, "Context length", label)
+            pump(app, 0.1)
+            late = asks[-1][1]
+            check(H.choose_settings_option(d, "Model", _label_of(d, MODEL_B)), "another model picked while the check runs")
+            pump(app, 0.5)
+            before = _args(d)
+            late(4096, "ok", "Fits the GPU at 4,096 tokens")
+            pump(app, 0.3)
+            check(MODEL_B in before and _args(d) == before and "4096" not in before and d._fit_busy is False
+                  and note.cget("text") != "Fits the GPU at 4,096 tokens",
+                  f"an answer for the model that was replaced changes nothing ({_args(d)})")
+            if "-c" in _args(d):                         # the greyed-entry checks below start from Auto
+                H.choose_settings_option(d, "Context length", H.settings_option(d, "Context length")["choices"][0])
+                pump(app, 0.4)
+        # greyed out with the reason in its own text
+        why[0] = "turn llama.cpp off first"
+        d._resync()
+        pump(app, 0.2)
+        opt = H.settings_option(d, "Context length")
+        blocked = SD.CONTEXT_FIT_BLOCKED.format(reason=why[0])
+        check(opt["choices"][1] == blocked and label not in opt["choices"]
+              and str(menu._dropdown_menu.entrycget(1, "state")) == "disabled",
+              f"when it cannot be measured the entry is greyed and says why ({opt['choices'][1]!r})")
+        n, before = len(asks), _args(d)
+        menu._dropdown_callback(blocked)
+        pump(app, 0.2)
+        check(len(asks) == n and _args(d) == before and H.settings_option(d, "Context length")["value"].startswith("Auto"),
+              "picking the greyed entry anyway (keyboard) measures nothing and the row shows the truth")
+        why[0] = None
+        d._resync()
+        pump(app, 0.2)
+        check(H.settings_option(d, "Context length")["choices"][1] == label
+              and str(menu._dropdown_menu.entrycget(1, "state")) == "normal", "and it comes back when the reason is gone")
+        ok, info = _heights_fixed(app, d)
+        check(ok, f"with the result line shown nothing is clipped ({info})")
+        H.close_settings(d)
+        # the app's own answer while the engine is up: never measured then (its own video memory would count)
+        from engines.base import CommandLaunch
+        launch = CommandLaunch(program=EXE, args=tuple(base[1:]))
+        ran: list[str] = []
+        orig = app._run_worker
+        app._run_worker = lambda name, fn, *a: ran.append(name) if name == "hc-fit-largest" else orig(name, fn, *a)  # type: ignore[method-assign]
+        app.fit_largest_reason, app.fit_largest = real_reason, real_largest          # type: ignore[method-assign]
+        for st in (main.ACTIVE, main.STARTING, main.STOPPING):
+            app.state_name = st
+            got = real_reason(launch)
+            check(got == "turn llama.cpp off first" and real_largest(launch, lambda *x: None) is False and not ran,
+                  f"the app, state {st}: '{got}', and no check is started")
+        app.state_name = main.IDLE
+        check(path is not None, "screenshot taken")
+    finally:
+        app.destroy()
+
+
 def test_alias_switch() -> None:
     """Keep Hermes' "llama" alias in step: a row for llama.cpp only, greyed when hermes.exe was not found; the
     switch saves the choice. A stub-built app never runs hermes (no worker is started)."""
@@ -647,7 +784,8 @@ def test_advanced_fold() -> None:
 
 
 def run() -> int:
-    for t in (test_strata_tabs, test_alias_switch, test_download_link, test_llama_tabs_and_controls,
+    for t in (test_strata_tabs, test_fit_largest_entry, test_alias_switch, test_download_link,
+              test_llama_tabs_and_controls,
               test_advanced_fold):
         print(f"-- {t.__name__}")
         try:
