@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
+import idle_watch
+
 log = logging.getLogger("agent_start")
 
 IDLE, STARTING, ACTIVE = "IDLE", "STARTING", "ACTIVE"      # the host's state names this controller reads
@@ -71,6 +73,7 @@ class WatchHost:
     show_window: Callable[[], Any]
     protected_pids: Callable[[], Any]             # the engine's pids (mem_watch never reports them)
     engine_protects: Callable[[Any], bool]        # the engine's own sweep-protection rule (mem_watch)
+    idle_supported: Callable[[], bool] = lambda: True   # the engine says what the model is doing (idle auto-off)
 
 
 class WatchController:
@@ -87,6 +90,8 @@ class WatchController:
         self.mem_action: str = ma if ma in GAME_ACTIONS else "ask"
         ra = saved.get("resume_action")          # a state.json without it means "ask"
         self.resume_action: str = ra if ra in RESUME_ACTIONS else "ask"
+        # idle auto-off: minutes without a request before the app turns the engine off; 0 = never (the default)
+        self.idle_minutes: int = idle_watch.parse(saved.get(idle_watch.STATE_KEY))
         self.games: Any = None                   # game_watch.GameWatcher
         self.memwatch: Any = None                # mem_watch.MemWatcher; runs inside the game scan
         self.resume: Any = None                  # resume_watch.ResumeWatcher
@@ -436,8 +441,16 @@ class WatchController:
         log.info("when that app closes: %s", action)
         return True
 
+    def set_idle_minutes(self, choice: Any) -> bool:
+        """Settings: turn the engine off after this long without a request (a number of minutes or the row's
+        entry; anything else means never). Applies to the running engine from the next poll."""
+        self.idle_minutes = idle_watch.parse(choice)
+        self.host.save_state(idle_watch.STATE_KEY, self.idle_minutes)
+        log.info("idle auto-off: %s", idle_watch.span(self.idle_minutes) if self.idle_minutes else "never")
+        return True
+
     def settings_rows(self, enabled: bool) -> list[dict]:
-        """The three choice rows for the Settings dialog."""
+        """The choice rows for the Settings dialog."""
         name = self.host.engine_name()
         labels, rlabels = action_labels(name), resume_labels(name)
         return [
@@ -447,4 +460,7 @@ class WatchController:
              "value": labels[self.mem_action], "on_change": self.set_memory_action, "enabled": enabled},
             {"key": "resume", "label": "When that app closes", "choices": [rlabels[a] for a in RESUME_ACTIONS],
              "value": rlabels[self.resume_action], "on_change": self.set_resume_action, "enabled": enabled},
+            {"key": "idle", "label": "Idle with no requests", "choices": idle_watch.labels(),
+             "value": idle_watch.label(self.idle_minutes), "on_change": self.set_idle_minutes,
+             "enabled": enabled and bool(self.host.idle_supported())},
         ]

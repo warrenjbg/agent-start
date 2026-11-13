@@ -165,7 +165,8 @@ def test_strata_tabs() -> None:
         check(_shown(d._save_btn) and _shown(d._cancel_btn) and not _shown(d._close_btn) and _shown(d._msg),
               "Model tab: Cancel / Save and the message line")
         U.shot(d, "settings_tabs_strata_model")
-        want_b = [SD.GROUP_OTHER_APPS, "A game starts", "Memory runs low", "That app closes", SD.GROUP_AFTER_OFF,
+        want_b = [SD.GROUP_OTHER_APPS, "A game starts", "Memory runs low", "That app closes",
+                  "Idle with no requests", SD.GROUP_AFTER_OFF,
                   SD.REOPEN_LABEL, SD.PROTECTED_LABEL, SD.GROUP_APP, "Keep running in the tray",
                   "Start with Windows"]
         ok, have = _tab_texts_ok(d, "Behaviour", want_b)
@@ -179,9 +180,9 @@ def test_strata_tabs() -> None:
               "About: the Usage history row (when the app keeps a history)")
         for key, tab in (("reopen", "Behaviour"), ("tray", "Behaviour"), ("autostart", "Behaviour"),
                          ("games", "Behaviour"), ("memory", "Behaviour"), ("resume", "Behaviour"),
-                         ("updates", "About")):
+                         ("idle", "Behaviour"), ("updates", "About")):
             check(H.settings_tab_of(d, d.switches[key][1]) == tab, f"switch {key} sits on {tab}")
-        check(list(d.switches) == ["reopen", "tray", "autostart", "games", "memory", "resume", "updates"],
+        check(list(d.switches) == ["reopen", "tray", "autostart", "games", "memory", "resume", "idle", "updates"],
               f"switch keys keep the app's order ({list(d.switches)})")
         H.show_settings_tab(d, "Behaviour")
         pump(app, 0.1)

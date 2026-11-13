@@ -51,6 +51,7 @@ PROTECTED_LABEL = "Protected apps"
 HISTORY_LABEL = "Usage history"
 # Behaviour rows: the app's switch keys -> the label shown (the callbacks and values are the app's, unchanged)
 ROW_LABELS = {"games": "A game starts", "memory": "Memory runs low", "resume": "That app closes",
+              "idle": "Idle with no requests",
               "tray": "Keep running in the tray", "autostart": "Start with Windows"}
 SOURCE_SUFFIX = " (installed app only)"         # kept on a relabelled row whose switch only works when installed
 VISION_OFF = "Off"

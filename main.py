@@ -23,6 +23,7 @@ import psutil
 import config_store
 import engine_profiles
 import engines
+import idle_watch
 import load_progress
 import ram_plan
 import reopen
@@ -675,6 +676,7 @@ class AgentStartApp(ctk.CTk):
             engine_mb=lambda: self._mem[2] if getattr(self, "_mem", None) and self._mem[2] else None,
             reopen_waiting=lambda: bool(self._reopen_offer),
             request_stop=lambda title, reason: self._request_game_stop(title, reason),
+            idle_supported=lambda: self._idle_supported(),
             cancel_start=lambda: self.cancel_start(),
             turn_on=lambda **kw: self.turn_on(**kw),
             show_window=lambda: self.show_window(),
@@ -691,6 +693,9 @@ class AgentStartApp(ctk.CTk):
         self._last_stop_game: str | None = None  # title of the game the running stop is for
         self._last_stop_reason = "game"          # "game" | "memory": why that stop was asked for (toast wording)
         self._skip_reopen_once = False           # Turn off from the game alert: offer the closed apps, don't relaunch
+        self._idle = idle_watch.IdleWatch()      # idle auto-off: idle time of this serving run (Tk thread)
+        self._idle_epoch = -1
+        self._idle_stop = False                  # the running stop is the idle auto-off (no box if it gets busy)
         self._stop_toast: tuple[str, str] | None = None     # wording for the next stop's toast (safe Turn off)
         self._tray_models_last = None
         self._tray_retry_until = 0.0             # keep retrying the tray icon until then (Explorer busy at logon)
@@ -1829,6 +1834,7 @@ class AgentStartApp(ctk.CTk):
             if isinstance(self.dialog, BusyDialog) and ok:
                 self.dialog.update_activity(self._busy_activity())
             self._check_pending_stop(data_ok=ok)
+            self._idle_check(epoch, sample)
         if not self._iconic:                              # hidden / minimised: no graph redraws
             self._refresh_stats()
 
@@ -2425,7 +2431,7 @@ class AgentStartApp(ctk.CTk):
         if not self.endpoint.stop_endpoint(lambda r: self.post(self.on_stopped, r), force=force):
             log.info("stop_endpoint returned False; reconciling")
             self._switching = False              # no stop happened: a model switch must not restart Strata later
-            self._skip_reopen_once, self._last_stop_game = False, None
+            self._skip_reopen_once, self._last_stop_game, self._idle_stop = False, None, False
             self._reconcile_now()
 
     # ------------------------------------------------------------------ safe stop (busy model) + model switch
@@ -2671,7 +2677,16 @@ class AgentStartApp(ctk.CTk):
             self.show_error("Stop handling failed — see logs\\controller.log")
 
     def _on_stopped(self, result: dict) -> None:
+        idle_stop, self._idle_stop = self._idle_stop, False
         if not result.get("ok") and result.get("unload") == "busy":
+            if idle_stop and not self._exit_pending:
+                # a request arrived just as the idle time ran out: keep serving, ask nothing, count from zero
+                self._skip_reopen_once, self._last_stop_game = False, None
+                self._set_state(ACTIVE)
+                self._idle.reset()
+                log.info("idle auto-off: the model got busy; still serving")
+                self._apply_state()
+                return
             game, self._last_stop_game = self._last_stop_game, None
             if game and not self._exit_pending:  # a request arrived just now: wait for it, no box over the game
                 self._skip_reopen_once = False
@@ -2992,6 +3007,48 @@ class AgentStartApp(ctk.CTk):
 
     def _game_blocked(self) -> bool:
         return self._box_open or self.updates.updating or self._dialog_open()
+
+    # ------------------------------------------------------------------ idle auto-off
+    def _idle_supported(self) -> bool:
+        """The engine says what the model is doing AND lists finished requests: without both, 'no request for N
+        minutes' cannot be known and the app never turns the engine off by itself."""
+        return self.engine.can(CAP_LIVE_ACTIVITY) and self.engine.can(CAP_REQUEST_HISTORY)
+
+    def _idle_check(self, epoch: int, sample: MetricsSample | None) -> None:
+        """Every metrics poll while serving (Tk thread): count idle time; turn off once the chosen time is up.
+        Anything unknown counts as activity (see idle_watch)."""
+        if epoch != self._idle_epoch:            # another server run
+            self._idle_epoch = epoch
+            self._idle.reset()
+        minutes = self.watch.idle_minutes
+        live = sample.live if sample is not None else None
+        known = (live is not None and isinstance(live.state, str) and self.loaded is not False
+                 and self._metrics_fails == 0 and self._idle_supported())
+        busy = known and (live.state != "idle" or bool(live.queued) or self._busy_activity() is not None)
+        ids = [(r.key, r.time) for r in sample.requests] if sample is not None else []
+        if self._idle.observe(time.monotonic(), minutes=minutes, known=known, busy=bool(busy), request_ids=ids):
+            self._idle_off(minutes)
+
+    def _idle_off(self, minutes: int) -> bool:
+        """The idle time is up: the normal Turn off, started by the app. Not while a dialog, a message box or an
+        update is open, not over the user's own pending stop / model switch / engine switch, not while anything
+        runs: then nothing happens now and the next poll looks again (the idle time is kept). Nobody is at the
+        PC, so the apps closed for the engine are NOT started: they become the one-click Reopen offer. No app
+        caused this stop, so nothing is watched for a turn-back-on. Returns True when the stop began."""
+        if (self._destroyed or self._exit_pending or self.state_name != ACTIVE or self.loaded is False
+                or self._stop_pending is not None or self._switching or self._switch_to is not None
+                or self._metrics_fails or self._busy_activity() is not None or self._game_blocked()):
+            return False
+        name = self.engine.name
+        closed = bool(reopen.load_pending())
+        self._skip_reopen_once, self._last_stop_game, self._idle_stop = True, None, True
+        # the toast goes out with the stop's result (endpoint.next_toast), not before it
+        self._stop_toast = (f"{name} turned off", f"No requests for {idle_watch.span(minutes)} · freed {{freed}}."
+                            + (f" The apps closed for {name} are in Agent Start (Reopen)." if closed else ""))
+        log.info("idle auto-off: no request for %s; turning %s off", idle_watch.span(minutes), name)
+        self._idle.reset()
+        self.turn_off(force=False)
+        return True
 
     def _request_game_stop(self, title: str, reason: str = "game") -> None:
         """Safe Turn off because a game started (reason "game") or an app took the memory the engine needs (reason
@@ -3455,6 +3512,7 @@ def _selftest() -> int:
         import strata_tuning  # noqa: F401
         import llama_finder  # noqa: F401
         import llama_models  # noqa: F401
+        import idle_watch  # noqa: F401
         import engine_profiles  # noqa: F401
         import fit_watch  # noqa: F401
         import strata_finder  # noqa: F401

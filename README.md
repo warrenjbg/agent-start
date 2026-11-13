@@ -77,6 +77,17 @@ in a loop, and when a *Reopen* offer is still waiting, because a start would dis
 off. Turning Strata on yourself ends the watch. A game that cancelled a Strata that was still loading is watched
 the same way. It only observes: it never closes anything. The timings are `resume_*` keys in `config.json`.
 
+**Idle with no requests** (Settings; default *Keep running*): turn the engine off by itself after 15 min, 30 min,
+1 hour or 2 hours without a request. It is the normal Turn off, never forced, and it only starts when the engine
+itself says the model is idle: a running or queued request, an agent between tool calls, a reply that finished
+since the last check, an engine that does not answer or a model that is not loaded all put the time back to zero.
+Time the PC spent asleep does not count. It waits while a dialog, a message box or an update is open, and it never
+overrides a Turn off or model switch you already asked for. Nobody is at the PC when it happens, so the apps that
+were closed for the engine are not started again: they wait as the one-click *Reopen*, and the toast says so.
+Nothing turns the engine back on afterwards; *When that app closes* is not involved. The limit: an engine without
+an unload request (llama.cpp) is stopped by ending its process, so a request that arrives in the very second the
+time runs out is cut off, as it would be by clicking Turn off at that moment.
+
 **Updates:** once a day the app asks GitHub for the latest release (one small request, no data about you). When a
 newer version exists, the idle line says *Update to x.y.z available · click to install*. Click → confirm → it
 downloads the installer from this repo's Releases, checks its size and SHA-256 against what GitHub lists, closes,
@@ -156,7 +167,7 @@ the endpoint. Everything on Behaviour and About applies at once.
   every turn) is not counted again.
 - **Switches** (apply at once): *Reopen closed apps after Turn off* (same as the start dialog's checkbox; off = the
   closed apps are offered as one click instead), *Keep running in the tray*, *Start with Windows*, *When a game
-  starts*, *When memory runs low*, *When that app closes*, *Check for updates daily*.
+  starts*, *When memory runs low*, *When that app closes*, *Idle with no requests*, *Check for updates daily*.
 - **Check for updates** (About tab) — asks GitHub now, whatever the daily switch says, and
   shows the answer next to the button: up to date, a new version (the version label becomes the install link),
   or that GitHub could not be reached. It only checks; installing still asks first. Greyed out when the app
@@ -395,6 +406,7 @@ notification area on a runner). *Local* suites open the real window and take scr
 | `tests\test_update_controller.py` | Local | The update flow as its own controller, with a stubbed updater and a fake app: daily check, the manual "Check for updates" (ignores the interval, one request at a time), offer, confirm, download, install hand-off; the Settings button states (one invisible window) |
 | `tests\test_mem_watch.py` | CI | Memory-pressure trigger: the decision function on fake process lists (both conditions, sustain, once per session, protected and system apps, games already reported), config fallbacks, the shared scan |
 | `tests\test_resume_watch.py` | CI | When that app closes: is the game/app still running (fake process lists), the confirm window, gaps and expiry, the watcher with a fake clock and on its own thread, one read-only real snapshot (starts no process) |
+| `tests\test_idle_watch.py` | CI | Idle auto-off: the idle clock (activity, unknown polls, sleep gaps, short replies) and the app's glue on a stand-in object: when it turns off, everything that makes it wait, the busy answer |
 | `tests\test_kill_path.py` | CI | What a stop may kill and when it refuses, on fake processes: kill targets, the launcher cmd.exe, identity, foreign listeners, busy, force |
 | `tests\test_engines.py` | CI | The engine interface: registry and `backend`, the Strata engine's answers, and a fake llama-server-shaped engine driving the supervisor (no unload, no launcher; an engine cannot widen a kill; API key never sent with the identity probe) |
 | `tests\test_fit_check.py` | CI | The pre-check runner: only `llama-fit-params.exe` next to the engine program is ever run, windowless, time-limited |

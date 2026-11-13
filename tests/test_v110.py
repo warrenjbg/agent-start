@@ -161,7 +161,7 @@ def test_resume() -> None:
         check(d is not None, "Settings opens")
         if d is not None:
             keys = list(getattr(d, "switches", {}))
-            check(keys == ["reopen", "tray", "autostart", "games", "memory", "resume", "updates"],
+            check(keys == ["reopen", "tray", "autostart", "games", "memory", "resume", "idle", "updates"],
                   f"the resume row sits right after the memory row ({keys})")
             row = H.settings_option(d, "That app closes")
             check(row["value"] == "Ask me" and row["choices"] == [labels[a] for a in main.RESUME_ACTIONS]
