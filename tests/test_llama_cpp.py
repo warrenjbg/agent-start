@@ -813,8 +813,10 @@ def t_registry_and_compat() -> None:
         elif isinstance(node, ast.ImportFrom):
             mods.add("." + (node.module or "") if node.level else (node.module or "").split(".")[0])
     allowed = {"__future__", "json", "math", "os", "re", "struct", "collections", "typing", ".base", "psutil",
-               "dataclasses", "llama_finder"}       # llama_finder: the bounded, read-only search (imported lazily)
-    check(mods <= allowed, f"imports: standard library, engines.base and llama_finder only ({sorted(mods)})")
+               "dataclasses", "llama_finder",       # llama_finder: the bounded, read-only search (imported lazily)
+               "llama_models"}                      # llama_models: pure per-model settings (imported lazily)
+    check(mods <= allowed, f"imports: standard library, engines.base, llama_finder and llama_models only "
+                           f"({sorted(mods)})")
     check(not any(w in src for w in ("Popen(", "urlopen(", ".connect(", ".terminate(", ".kill(", "send_signal(",
                                       "process_iter(", "psutil.Process(")),
           "no process start, connection or process action in the module")

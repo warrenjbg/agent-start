@@ -336,18 +336,24 @@ def test_llama_tabs_and_controls() -> None:
         H.choose_settings_option(d, "Vision", SD.VISION_OFF)
         check(LF.vision_of(_args(d)) is None, "and Off removes it")
 
-        # ---- model change: a projector belongs to its model
+        # ---- model change: each model has its own context, vision file and extras; the port is shared
         H.choose_settings_option(d, "Vision", "On · mmproj-F16")
-        check(H.choose_settings_option(d, "Model", _label_of(d, MODEL_C)) and LF.vision_of(_args(d)) == PROJ_C
+        H.choose_settings_option(d, "Context length", "32K tokens")
+        check(H.choose_settings_option(d, "Model", _label_of(d, MODEL_C)) and LF.vision_of(_args(d)) is None
+              and LF.context_of(_args(d)) is None and LF.port_of(_args(d)) == 9931
+              and LF.option_value(_args(d), ("--alias", "-a")) == "Qwen-C-Q4"
               and d._msg.cget("text") != SD.VISION_DROPPED,
-              f"model C has the same projector file: vision stays on, with C's file ({_args(d)})")
+              f"model C for the first time: no vision, no context, the same port, its short name ({_args(d)})")
+        check(H.choose_settings_option(d, "Vision", "On · mmproj-F16") and LF.vision_of(_args(d)) == PROJ_C,
+              f"C's own projector can be turned on ({_args(d)})")
         check(H.choose_settings_option(d, "Model", _label_of(d, MODEL_B)) and LF.vision_of(_args(d)) is None
-              and d._msg.cget("text") == SD.VISION_DROPPED,
-              f"model B has none: vision off, said once ({d._msg.cget('text')!r})")
+              and LF.context_of(_args(d)) is None, f"model B for the first time: nothing follows from C ({_args(d)})")
         vis = H.settings_option(d, "Vision")
         check(not vis["enabled"] and vis["value"] == SD.VISION_NONE, f"model B: '{SD.VISION_NONE}', greyed ({vis})")
-        H.choose_settings_option(d, "Context length", "8K tokens")
-        check(d._msg.cget("text") != SD.VISION_DROPPED, "the note goes with the next change")
+        check(H.choose_settings_option(d, "Model", _label_of(d, MODEL_A)) and LF.vision_of(_args(d)) == PROJ_A
+              and LF.context_of(_args(d)) == 32768, f"back to A: its vision file and its context ({_args(d)})")
+        check(H.choose_settings_option(d, "Model", _label_of(d, MODEL_C)) and LF.vision_of(_args(d)) == PROJ_C
+              and LF.context_of(_args(d)) is None, f"and C has its own again ({_args(d)})")
         d._args.set(f'-m "{MODEL_A}" --port 9931')
         pump(app, 0.05)
         check(H.settings_option(d, "Model")["value"] == _label_of(d, MODEL_A)

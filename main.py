@@ -3358,6 +3358,7 @@ def _selftest() -> int:
         import fit_check  # noqa: F401
         import strata_tuning  # noqa: F401
         import llama_finder  # noqa: F401
+        import llama_models  # noqa: F401
         import engine_profiles  # noqa: F401
         import fit_watch  # noqa: F401
         import strata_finder  # noqa: F401

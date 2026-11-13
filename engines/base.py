@@ -488,7 +488,11 @@ class Engine:
                                                      with_context fn(args, tokens | None) -> args
           vision_files  fn(model path) -> [(label, projector path)]   vision_of fn(args) -> path | None
                                                      with_vision fn(args, path | None) -> args
-          port_of       fn(args) -> port | None      with_port fn(args, port) -> args"""
+          port_of       fn(args) -> port | None      with_port fn(args, port) -> args
+        Optional hooks:
+          launch_info   fn(CommandLaunch) -> the launch object to check and save (an engine's own subclass)
+          per_model     True: with_model already brings each model's own arguments (Settings then leaves the
+                        vision file alone when the model changes)"""
         return None
 
     def preferred_launcher(self, found: Any) -> str | None:

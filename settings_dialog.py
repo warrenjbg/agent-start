@@ -847,6 +847,12 @@ class SettingsDialog(ctk.CTkToplevel):
         then can it be saved. Nothing is run. Also keeps the friendly controls and the GPU-fit note in step."""
         program = self._program.get().strip().strip('"')
         info = CommandLaunch(program=program, args=tuple(split_args(self._args.get())))
+        wrap = self._opts.get("launch_info")
+        if callable(wrap):                           # the engine's own launch type (it may carry more to save)
+            try:
+                info = wrap(info)
+            except Exception:  # noqa: BLE001
+                log.debug("launch_info failed", exc_info=True)
         self._info = None
         self._sync_option_menus(program, info.args)
         if self._port_bad:
@@ -1034,7 +1040,7 @@ class SettingsDialog(ctk.CTkToplevel):
             else:
                 new = tuple(self._opts["default_args"](path))
             old = self._call("vision_of", args) if self._has_vision else None
-            if old:                                  # a projector belongs to its model
+            if old and not self._opts.get("per_model"):  # a projector belongs to its model
                 base = os.path.basename(str(old)).casefold()
                 same = next((p for _l, p in self._vision_list(self._model_path(new)) if
                              os.path.basename(p).casefold() == base), None)

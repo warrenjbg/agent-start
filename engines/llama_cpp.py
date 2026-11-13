@@ -774,7 +774,9 @@ def judge_fit(stdout: Any, block_count: int | None) -> FitReport:
 
 @dataclass(frozen=True)
 class LlamaLaunch(CommandLaunch):
-    """A CommandLaunch that names its model (the app's notes say "Model set to <model>", not the program)."""
+    """A CommandLaunch that names its model (the app's notes say "Model set to <model>", not the program).
+    `models`: per-model settings to save with this launch (llama_models.Snapshot; empty = none changed)."""
+    models: tuple = ()
 
     @property
     def model_name(self) -> str:
@@ -883,14 +885,16 @@ class LlamaCppEngine(Engine):
         return {"launch_cmd": [build.program]} if build is not None else {}
 
     def auto_launch(self, found: list[Any], cfg: Mapping[str, Any]) -> Any:
-        """A build and exactly one model: `-m <model> --port 9931`, nothing else. Several models: the user picks."""
+        """A build and exactly one model: `-m <model> --port 9931` plus the model's short name (--alias), nothing
+        else. Several models: the user picks."""
         try:
-            import llama_finder
+            import llama_models
             choice = getattr(found[0], "choice", None) if len(found) == 1 else None
             if choice is None or not choice.clear or choice.build is None or choice.model is None:
                 return None
-            return LlamaLaunch(program=choice.build.program,
-                               args=llama_finder.default_args(choice.model.path, DEFAULT_PORT))
+            session = llama_models.Session(cfg, os.path.dirname(choice.build.program))
+            args = session.first_setup(choice.model.path, DEFAULT_PORT)
+            return LlamaLaunch(program=choice.build.program, args=args, models=session.touched())
         except Exception:  # noqa: BLE001
             return None
 
@@ -906,10 +910,13 @@ class LlamaCppEngine(Engine):
         return tag, line
 
     def switch_choices(self, found: Any, cfg: Mapping[str, Any]) -> list[tuple[str, Any, bool]]:
-        """One entry per model file found. Configured: the same program and arguments with only the model
-        replaced. Not configured yet: the best build with `-m <model> --port 9931`."""
+        """One entry per model file found. Configured: the same program and shared options (port, key) with
+        that model's own remembered arguments (llama_models; a model never configured gets a copy of the current
+        ones without context, vision and alias). Not configured yet: the best build with `-m <model> --port 9931`
+        and the model's short name."""
         try:
             import llama_finder
+            import llama_models
             models = list(getattr(found, "models", ()) or ())
             if not models:
                 return []
@@ -922,10 +929,13 @@ class LlamaCppEngine(Engine):
             out: list[tuple[str, Any, bool]] = []
             for label, m in zip(llama_finder.unique_labels(models, llama_finder.model_label), models):
                 if prog is not None:
-                    info = LlamaLaunch(program=raw[0], args=tuple(llama_finder.with_model(raw[1:], m.path)))
+                    args, snap = llama_models.switch_args(cfg, raw[1:], m.path, os.path.dirname(prog))
+                    info = LlamaLaunch(program=raw[0], args=args, models=snap)
                 else:
                     assert build is not None
-                    info = LlamaLaunch(program=build.program, args=llama_finder.default_args(m.path, DEFAULT_PORT))
+                    session = llama_models.Session(cfg, os.path.dirname(build.program))
+                    info = LlamaLaunch(program=build.program, args=session.first_setup(m.path, DEFAULT_PORT),
+                                       models=session.touched())
                 same = bool(cur) and os.path.normcase(os.path.normpath(cur or "")) == \
                     os.path.normcase(os.path.normpath(m.path))
                 out.append((label, info, same))
@@ -940,11 +950,19 @@ class LlamaCppEngine(Engine):
     def launch_options(self, found: Any, cfg: Mapping[str, Any]) -> dict | None:
         try:
             import llama_finder
+            import llama_models
             builds, models = list(getattr(found, "builds", ())), list(getattr(found, "models", ()))
+            prog = configured_program(cfg)
+            # one working copy of the per-model settings for this Settings window: picking a model swaps the
+            # arguments that belong to a model and keeps the shared ones; what changed is saved with the launch
+            session = llama_models.Session(cfg, os.path.dirname(prog) if prog else "")
 
             def model_of(args: Any) -> str | None:
                 m = _last_value([str(a) for a in args], _MODEL_PATH_FLAGS)
                 return m.strip('"') if m else None
+
+            def launch_info(info: Any) -> Any:
+                return LlamaLaunch(program=info.program, args=tuple(info.args), models=session.touched())
 
             return {
                 "program_title": "Build", "model_title": "Model",
@@ -952,9 +970,9 @@ class LlamaCppEngine(Engine):
                                      [b.program for b in builds])),
                 "models": list(zip(llama_finder.unique_labels(models, llama_finder.model_label),
                                    [m.path for m in models])),
-                "with_model": llama_finder.with_model,
-                "default_args": lambda model: llama_finder.default_args(model, DEFAULT_PORT),
-                "model_of": model_of,
+                "with_model": session.switch,
+                "default_args": lambda model: session.first_setup(model, DEFAULT_PORT),
+                "model_of": model_of, "launch_info": launch_info, "per_model": True,
                 "context_choices": list(llama_finder.CONTEXT_CHOICES),
                 "context_of": llama_finder.context_of, "with_context": llama_finder.with_context,
                 "vision_files": llama_finder.vision_files,
@@ -1065,6 +1083,9 @@ class LlamaCppEngine(Engine):
     def same_launch(self, cfg: Mapping[str, Any], info: Any) -> bool:
         if not super().same_launch(cfg, info):
             return False
+        import llama_models
+        if not llama_models.same(cfg, getattr(info, "models", ())):
+            return False                                 # another model's remembered settings changed
         port = effective_port(info.args) if isinstance(info, CommandLaunch) else None
         if port is None:
             return True
@@ -1073,10 +1094,17 @@ class LlamaCppEngine(Engine):
     def apply_launcher(self, cfg: dict, info: Any) -> None:
         """launch_cmd / launch_cwd (base), plus `port` and `endpoint_url` from --port, and `api_key` from --api-key
         (the first key of a comma list) so the app can read /slots and /v1/models. Nothing else is touched; an
-        absent --port leaves port and endpoint_url as they are (plan_launch then asks for one)."""
+        absent --port leaves port and endpoint_url as they are (plan_launch then asks for one). The per-model
+        memory (llama_models) is brought up to date: the arguments the config had are remembered under their model,
+        then the entries the launch carries, then the new arguments under theirs."""
+        old_args = None
+        if isinstance(info, CommandLaunch) and configured_program(cfg) is not None:
+            old_args = [str(x) for x in (cfg.get("launch_cmd") or [])][1:]      # only a llama.cpp command
         super().apply_launcher(cfg, info)
         if not isinstance(info, CommandLaunch):
             return
+        import llama_models
+        llama_models.apply(cfg, old_args, info.args, getattr(info, "models", ()), os.path.dirname(info.program))
         if not any(_flag(a).startswith("--port=") for a in info.args) and len(_values(info.args, {"--port"})) == 1:
             port = effective_port(info.args)
             if port is not None:

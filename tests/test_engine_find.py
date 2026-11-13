@@ -78,8 +78,8 @@ def test_engine_side() -> None:
     one, two = _found([M1]), _found([M1, M2])
     info = eng.auto_launch([one], {})
     check(info is not None and info.program == CUDA.program
-          and tuple(info.args) == ("-m", M1.path, "--port", "9931"),
-          f"one model: the CUDA build with -m and --port 9931, nothing else ({info})")
+          and tuple(info.args) == ("-m", M1.path, "--port", "9931", "--alias", M1.name),
+          f"one model: the CUDA build with -m, --port 9931 and the model's short name, nothing else ({info})")
     check(eng.auto_launch([two], {}) is None and eng.auto_launch([_found([])], {}) is None
           and eng.auto_launch([], {}) is None and eng.auto_launch([one, one], {}) is None
           and eng.auto_launch([object()], {}) is None, "several / no models, nothing found, garbage: no auto set-up")
@@ -90,7 +90,8 @@ def test_engine_side() -> None:
           and opts["programs"][0][0].startswith("CUDA") and len(opts["models"]) == 2
           and opts["program_title"] == "Build", f"options: builds best first, both models ({opts and opts['programs']})")
     check(opts["model_of"](("-c", "8192", "-m", M2.path)) == M2.path and opts["model_of"](("--port", "1")) is None
-          and tuple(opts["default_args"](M1.path)) == ("-m", M1.path, "--port", "9931"), "options: helpers")
+          and tuple(opts["default_args"](M1.path)) == ("-m", M1.path, "--port", "9931", "--alias", M1.name),
+          "options: helpers")
     none = eng.launch_options(object(), {})
     check(none is not None and none["programs"] == [] and none["models"] == []
           and all(callable(none[k]) for k in ("with_context", "with_vision", "with_port", "model_of")),
