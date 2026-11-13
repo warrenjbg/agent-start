@@ -13,6 +13,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 import test_ui_smoke as U  # noqa: E402  (first: it redirects the data dir)
 
+import app_workers  # noqa: E402
 import main  # noqa: E402
 import metrics_worker  # noqa: E402
 import theme as T  # noqa: E402
@@ -124,7 +125,7 @@ def test_worker() -> None:
         import time
         release = threading.Event()
         fit_check.run = lambda chk, prog: (release.wait(5), "-c 8192 -ngl 10")[1]
-        main.FIT_PRECHECK_WAIT_S = 0.4
+        app_workers.FIT_PRECHECK_WAIT_S = 0.4
         t0 = time.monotonic()
         main._fit_check_worker(_Eng(chk, FitReport(False, "late")), cfg, chk, post, done, 9)
         dt = time.monotonic() - t0
@@ -132,7 +133,7 @@ def test_worker() -> None:
         time.sleep(0.2)
         check(posted == [(done, (9, None))] and dt < 2.0, f"a hanging tool: launch after the wait, no verdict ({dt:.1f}s)")
     finally:
-        fit_check.run, main.FIT_PRECHECK_WAIT_S = real, real_wait
+        fit_check.run, app_workers.FIT_PRECHECK_WAIT_S = real, real_wait
 
 
 class _SeqEngine:
