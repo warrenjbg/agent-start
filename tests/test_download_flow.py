@@ -156,6 +156,7 @@ class FakeHf:
         self.pending: dict[str, int] = {}
         self.free: int | None = 500 * GIB
         self.script: list = []
+        self.scripts: dict[str, list] = {}       # per repo path; files not named here follow `script`
         self.calls: list[tuple] = []
         self.off_worker: list[str] = []
         self.threads: set[int] = set()
@@ -218,7 +219,7 @@ class FakeHf:
         self.last_progress, self.last_stop = progress, stop_evt
         self.download_kwargs = {"progress": progress, "stop_evt": stop_evt, **kw}
         try:
-            for step in list(self.script):
+            for step in list(self.scripts.get(file.path, self.script)):
                 op = step[0]
                 if op == "p":                       # ("p", done, seconds before it)
                     self.clock.advance(step[2] if len(step) > 2 else 0.0)
@@ -905,6 +906,482 @@ def test_dest_dir() -> None:
     e2.poster.drain()
     eq("only the newest folder's free space", (e2.flow.dest_text, e2.flow.free_text), ("B", "7.0 GB free"))
 
+# ----------------------------------------------------------------------------------------- batch downloads
+def P(f: HfFile) -> str:
+    return os.path.join(DEST, f.name)
+
+
+def downloads(e: Env) -> list[str]:
+    """The repo paths hf.download was called with, in call order."""
+    return [c[1] for c in e.hf.calls if c[0] == "download"]
+
+
+def tick(f: DownloadFlow, *files: HfFile) -> None:
+    for x in files:
+        f.toggle(x)
+
+
+def drain_q(q: queue.SimpleQueue, cond, timeout: float = 5.0) -> bool:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        try:
+            fn, args = q.get(timeout=0.02)
+            fn(*args)
+        except queue.Empty:
+            pass
+        if cond():
+            return True
+    return bool(cond())
+
+
+def test_batch_ticks() -> None:
+    section("batch 1: any number of rows ticked; list order; what cannot be ticked; what clears the ticks")
+    e = Env()
+    f = e.flow
+    f.set_repo_text(REPO)
+    f.list_now()
+    check("no tick while listing", not f.toggle(MODEL_A))
+    e.runner.run_all()
+    check("tick C, then A (by its row), then the vision file",
+          f.toggle(MODEL_C) and f.toggle(e.row(MODEL_A)) and f.toggle(VISION))
+    eq("ticked in list order, not in the order of ticking", f.ticked, (MODEL_A, MODEL_C, VISION))
+    check("a click on a ticked row unticks it", f.toggle(MODEL_C))
+    eq("C unticked, the others stay", f.ticked, (MODEL_A, VISION))
+    check("split row cannot be ticked", not f.toggle(SPLIT))
+    eq("split: its reason", (f.message, f.message_kind), (SPLIT.note, "warn"))
+    check("unsupported row cannot be ticked", not f.toggle(ODD))
+    eq("unsupported: its reason", f.message, ODD.note)
+    check("a file of another listing cannot be ticked", not f.toggle(TINY))
+    eq("refused rows leave the ticks alone", f.ticked, (MODEL_A, VISION))
+    check("ticking clears the warning", f.toggle(MODEL_B) and f.message == "")
+    eq("three ticked", f.ticked, (MODEL_A, MODEL_B, VISION))
+    # a row downloaded in this window cannot be ticked
+    f.select(MODEL_B)
+    e.hf.script = [("p", MODEL_B.size, 1.0)]
+    f.start()
+    e.runner.run_all()
+    check("a downloaded row cannot be ticked", not f.toggle(MODEL_B) and MODEL_B not in f.ticked)
+    eq("...and is not selectable", e.row(MODEL_B).selectable, False)
+    # a new listing, or typing in the repo box, clears the ticks
+    tick(f, MODEL_A, MODEL_C)
+    eq("two ticked", f.ticked, (MODEL_A, MODEL_C))
+    e.listed()
+    eq("a new listing (the same repo again) clears the ticks", f.ticked, ())
+    tick(f, MODEL_A, MODEL_C)
+    f.set_repo_text("acme/Tiny-GGUF")
+    eq("typing another repo clears the ticks with the list", (f.ticked, f.rows), ((), ()))
+    f.set_repo_text(REPO)
+    e.listed()
+    eq("...and they do not come back", f.ticked, ())
+    # select(x) stays 'tick only x'
+    tick(f, MODEL_A, MODEL_C)
+    check("select(x) ticks only x", f.select(MODEL_B) and f.ticked == (MODEL_B,))
+    check("select(None) clears every tick", f.select(None) and f.ticked == ())
+
+
+def test_batch_one_ticked() -> None:
+    section("batch 2: exactly one ticked row reads and behaves as today")
+    e = Env()
+    e.hf.pending[MODEL_B.path] = int(4.6 * GIB)
+    f = e.listed()
+    check("tick B by a click", f.toggle(MODEL_B))
+    eq("one ticked: it is the selected file", f.selected, MODEL_B)
+    eq("Resume", f.download_label, "Resume")
+    check("Discard offered", f.can_discard)
+    eq("its kept part under the bar", f.progress_text,
+       "4.6 of 12.2 GB already downloaded · Resume continues from there")
+    eq("title: the bare name", f.progress_title, MODEL_B.name)
+    f.toggle(MODEL_B)
+    eq("unticked: nothing to do", (f.selected, f.download_label, f.can_download, f.can_discard, f.progress_title),
+       (None, "Download", False, False, ""))
+    f.toggle(MODEL_A)
+    eq("A ticked: Download", f.download_label, "Download")
+    e.hf.free = 5 * GIB
+    f.start()
+    e.runner.run_all()
+    eq("one file: the space check with its own bytes", [c for c in e.hf.calls if c[0] == "space_ok"],
+       [("space_ok", DEST, MODEL_A.size)])
+    need = MODEL_A.size + GIB
+    eq("one file: today's sentence", f.message, dd.NO_SPACE.format(
+        need=dd.fmt_size(need), margin="1 GB", free="5.0 GB", missing=dd.fmt_size(need - 5 * GIB)))
+    e.hf.free = 500 * GIB
+    seen: dict = {}
+    e.hf.script = [("p", GIB, 1.0), ("call", lambda: seen.update(title=f.progress_title)), ("p", MODEL_A.size, 1.0)]
+    f.start()
+    e.runner.run_all()
+    eq("one file: the bare name while it runs", seen.get("title"), MODEL_A.name)
+    eq("one file: today's done message", (f.message, f.message_kind, f.phase), (dd.DONE_MODEL, "ok", "done"))
+    eq("one file: done line and full bar", (f.progress_title, f.progress_text, f.progress_fraction),
+       (MODEL_A.name, "9.8 of 9.8 GB · 100%", 1.0))
+    eq("on_done once", e.done, [P(MODEL_A)])
+
+
+def test_batch_label() -> None:
+    section("batch 3: several ticked: 'Download N files'; no Discard")
+    e = Env()
+    e.hf.pending[MODEL_B.path] = int(4.6 * GIB)
+    f = e.listed()
+    f.toggle(MODEL_B)
+    check("one ticked with a kept part: Discard offered", f.can_discard)
+    f.toggle(MODEL_A)
+    eq("two ticked", (f.download_label, f.can_download), ("Download 2 files", True))
+    check("Discard not offered with two, although one has a kept part", not f.can_discard and not f.discard_partial())
+    eq("nothing named under the bar while several wait", (f.progress_title, f.progress_text, f.progress_fraction),
+       ("", "", 0.0))
+    f.toggle(VISION)
+    eq("three ticked", f.download_label, "Download 3 files")
+    f.toggle(MODEL_C)
+    eq("four ticked", f.download_label, "Download 4 files")
+    tick(f, MODEL_A, VISION, MODEL_C)
+    eq("back to one: Resume and Discard", (f.download_label, f.can_discard), ("Resume", True))
+    eq("nothing was discarded", e.hf.discarded, [])
+
+
+def test_batch_space() -> None:
+    section("batch 4: one free-space check for the whole batch, before anything is fetched")
+    e = Env()
+    e.hf.pending[MODEL_A.path] = 2 * GIB
+    f = e.listed()
+    tick(f, VISION, MODEL_C, MODEL_A)
+    need = (MODEL_A.size - 2 * GIB) + MODEL_C.size + VISION.size
+    e.hf.free = 15 * GIB             # every file fits alone (the largest: 13.4 + 1 GB); the three together do not
+    check("start", f.start())
+    e.runner.run_all()
+    eq("one space_ok, with the summed bytes still to fetch", [c for c in e.hf.calls if c[0] == "space_ok"],
+       [("space_ok", DEST, need)])
+    eq("nothing fetched", e.hf.download_calls, 0)
+    want = dd.NO_SPACE.format(need=dd.fmt_size(need + GIB), margin="1 GB", free=dd.fmt_size(15 * GIB),
+                              missing=dd.fmt_size(need + GIB - 15 * GIB))
+    eq("today's sentence with the batch's figures", (f.message, f.message_kind), (want, "error"))
+    check("figures: needs 23.1 GB, free 15.0 GB, 8.1 GB more",
+          "needs 23.1 GB free" in f.message and "has 15.0 GB" in f.message and "Free up 8.1 GB more" in f.message,
+          f.message)
+    eq("nothing started; the ticks stay", (f.phase, f.ticked, e.done, e.runner.jobs),
+       ("list", (MODEL_A, MODEL_C, VISION), [], []))
+    e.hf.free = 500 * GIB
+    e.hf.calls.clear()
+    f.start()
+    e.runner.run_all()
+    eq("enough room: one check, then the three downloads",
+       [c[0] for c in e.hf.calls if c[0] in ("space_ok", "download")], ["space_ok", "download", "download", "download"])
+    eq("the check's bytes", [c[2] for c in e.hf.calls if c[0] == "space_ok"], [need])
+    eq("all three arrived", len(e.done), 3)
+
+
+def test_batch_sequence() -> None:
+    section("batch 5: one file at a time, in list order, 'File k of n'")
+    e = Env()
+    e.hf.pending[VISION.path] = int(0.3 * GIB)
+    f = e.listed()
+    tick(f, VISION, MODEL_C, MODEL_A)                 # ticked backwards
+    seen: list = []
+
+    def look(tag: str) -> tuple:
+        return ("call", lambda: seen.append((tag, f.progress_title, f.progress_text, round(f.progress_fraction, 3),
+                                             f.total_bytes, e.hf.active, f.batch_index, f.batch_size)))
+
+    e.hf.scripts = {
+        MODEL_A.path: [("p", GIB, 1.0), ("p", 2 * GIB, 1.0), look("A"), ("p", MODEL_A.size, 1.0)],
+        MODEL_C.path: [("p", GIB, 1.0), ("p", 2 * GIB, 1.0), look("C"), ("p", MODEL_C.size, 1.0)],
+        VISION.path: [("p", int(0.1 * GIB), 0.1), look("V"), ("p", int(0.3 * GIB), 0.1), ("p", VISION.size, 1.0)],
+    }
+    check("start", f.start())
+    eq("one worker queued, nothing fetched yet", (len(e.runner.jobs), e.hf.download_calls), (1, 0))
+    e.runner.run(0)
+    eq("file 1 answered: only then is file 2 queued", (len(e.runner.jobs), e.hf.download_calls), (1, 1))
+    eq("first came A", downloads(e), [MODEL_A.path])
+    e.runner.run(0)
+    eq("file 2 answered: file 3 queued", (len(e.runner.jobs), e.hf.download_calls), (1, 2))
+    e.runner.run(0)
+    eq("file 3 answered: nothing more", (len(e.runner.jobs), e.hf.download_calls), (0, 3))
+    eq("downloaded in list order", downloads(e), [MODEL_A.path, MODEL_C.path, VISION.path])
+    eq("never two at once", e.hf.max_active, 1)
+    eq("the title names the file and its place", [s[1] for s in seen],
+       [f"File 1 of 3: {MODEL_A.name}", f"File 2 of 3: {MODEL_C.name}", f"File 3 of 3: {VISION.name}"])
+    eq("the figures are the current file's", [(s[2].split(" · ")[0], s[4]) for s in seen[:2]],
+       [("2.0 of 9.8 GB", MODEL_A.size), ("2.0 of 13.4 GB", MODEL_C.size)])
+    eq("the bar is the current file's", [s[3] for s in seen[:2]],
+       [round(2 * GIB / MODEL_A.size, 3), round(2 * GIB / MODEL_C.size, 3)])
+    check("the third's kept part is checked first (a resume, as today)",
+          seen[2][2].startswith("Checking the part already downloaded"), seen[2][2])
+    eq("one download active each time", [s[5] for s in seen], [1, 1, 1])
+    eq("batch_index / batch_size", [(s[6], s[7]) for s in seen], [(1, 3), (2, 3), (3, 3)])
+    eq("the same hf.download call: progress + stop_evt",
+       (callable(e.hf.download_kwargs.get("progress")), isinstance(e.hf.download_kwargs.get("stop_evt"),
+                                                                   threading.Event)), (True, True))
+    eq("every hf call on a worker", e.hf.off_worker, [])
+    eq("after the batch: no file running", (f.batch_index, f.batch_size), (0, 0))
+
+    section("batch 5: real threads - never two hf.download calls at once")
+    clock = Clock()
+    hf = FakeHf(clock, None)
+    q: queue.SimpleQueue = queue.SimpleQueue()
+    done: list[str] = []
+
+    def post(fn, *args) -> None:
+        q.put((fn, args))
+
+    def run_worker(fn) -> None:
+        threading.Thread(target=fn, daemon=True, name="test-hf-batch").start()
+
+    fl = DownloadFlow(DEST, hf=hf, run_worker=run_worker, post=post, on_done=done.append, clock=clock)
+    drain_q(q, lambda: fl.free_bytes is not None)
+    fl.set_repo_text(REPO)
+    fl.list_now()
+    check("threaded listing arrives", drain_q(q, lambda: fl.phase == "list"))
+    tick(fl, MODEL_C, MODEL_A, VISION)
+    gate = threading.Event()
+    hf.script = [("p", 0, 0.0), ("wait", gate)]
+    timer = threading.Timer(0.3, gate.set)
+    timer.start()
+    check("threaded batch start", fl.start())
+    check("threaded batch finishes", drain_q(q, lambda: fl.phase == "done", 10.0))
+    timer.cancel()
+    gate.set()
+    eq("three files, one after another", ([c[1] for c in hf.calls if c[0] == "download"], hf.max_active),
+       ([MODEL_A.path, MODEL_C.path, VISION.path], 1))
+    eq("each reported once", done, [P(MODEL_A), P(MODEL_C), P(VISION)])
+
+
+def test_batch_on_done() -> None:
+    section("batch 6: each finished file is reported at once, exactly once; its row becomes a downloaded row")
+    e = Env()
+    f = e.listed()
+    tick(f, VISION, MODEL_A, MODEL_C)
+    moments: list = []
+
+    def on_done(path: str) -> None:
+        e.done.append(path)
+        row = next(r for r in f.rows if r.file.name == os.path.basename(path))
+        moments.append((row.file.name, e.hf.download_calls, row.note, row.selectable, row.file in f.ticked))
+
+    f._on_done = on_done
+    for x in (MODEL_A, MODEL_C, VISION):
+        e.hf.scripts[x.path] = [("p", x.size, 1.0)]
+    f.start()
+    e.runner.run(0)
+    eq("file 1 done: reported before file 2 runs", e.done, [P(MODEL_A)])
+    r = e.row(MODEL_A)
+    eq("A's row: downloaded, not tickable, not ticked", (r.note, r.selectable, MODEL_A in f.ticked),
+       ("· downloaded", False, False))
+    eq("the rest still ticked", f.ticked, (MODEL_C, VISION))
+    e.runner.run_all()
+    e.poster.drain()
+    eq("each reported once, in list order", e.done, [P(MODEL_A), P(MODEL_C), P(VISION)])
+    eq("reported when it finished (before the next fetch), its row already a downloaded row", moments,
+       [(MODEL_A.name, 1, "· downloaded", False, False), (MODEL_C.name, 2, "· downloaded", False, False),
+        (VISION.name, 3, "· downloaded", False, False)])
+    eq("no tick left", f.ticked, ())
+    e.runner.run_all()
+    e.poster.drain()
+    eq("still three", len(e.done), 3)
+
+
+def test_batch_cancel() -> None:
+    section("batch 7: Cancel stops the current file and starts none of the rest")
+    e = Env()
+    f = e.listed()
+    tick(f, VISION, MODEL_C, MODEL_A)
+    kept = int(5.5 * GIB)
+    seen: dict = {}
+
+    def press() -> None:
+        seen["r"] = f.cancel()
+        seen["msg"] = f.message
+        e.hf.pending[MODEL_C.path] = kept
+
+    e.hf.scripts = {MODEL_A.path: [("p", MODEL_A.size, 1.0)],
+                    MODEL_C.path: [("p", kept, 1.0), ("call", press), ("stop",), ("p", MODEL_C.size, 1.0)],
+                    VISION.path: [("p", VISION.size, 1.0)]}
+    f.start()
+    e.runner.run_all()
+    eq("cancel accepted", (seen.get("r"), seen.get("msg")), (True, dd.CANCELLING))
+    check("the current file was told to stop", e.hf.last_stop is not None and e.hf.last_stop.is_set())
+    eq("C stopped; the vision file never started", (downloads(e), e.runner.jobs), ([MODEL_A.path, MODEL_C.path], []))
+    eq("today's cancelled sentence", (f.message, f.message_kind), (hf_download._DEFAULT_MSG["cancelled"], "info"))
+    eq("A stays downloaded and reported", (e.done, e.row(MODEL_A).note), ([P(MODEL_A)], "· downloaded"))
+    eq("the unfinished rows stay ticked", f.ticked, (MODEL_C, VISION))
+    eq("C's part is kept", e.row(MODEL_C).pending, kept)
+    eq("Download continues from there", (f.phase, f.download_label, f.can_download, f.can_cancel),
+       ("list", "Download 2 files", True, False))
+    # the second Download resumes C, then fetches the vision file
+    e.hf.calls.clear()
+    seen2: dict = {}
+    e.hf.scripts[MODEL_C.path] = [("p", GIB, 0.1),
+                                  ("call", lambda: seen2.update(text=f.progress_text, title=f.progress_title)),
+                                  ("p", kept, 0.1), ("p", MODEL_C.size, 1.0)]
+    check("Download again", f.start())
+    e.runner.run_all()
+    eq("one check for the rest: C's remaining bytes + the vision file",
+       [c[2] for c in e.hf.calls if c[0] == "space_ok"], [MODEL_C.size - kept + VISION.size])
+    eq("C first (resumed), then the vision file", downloads(e), [MODEL_C.path, VISION.path])
+    check("C resumed: its kept part is checked first", str(seen2.get("text", "")).startswith(
+        "Checking the part already downloaded"), repr(seen2))
+    eq("title", seen2.get("title"), f"File 1 of 2: {MODEL_C.name}")
+    eq("all three reported once", e.done, [P(MODEL_A), P(MODEL_C), P(VISION)])
+    eq("done", (f.phase, f.message, f.ticked), ("done", dd.DONE_MANY.format(n=2), ()))
+    # a cancel that comes too late for the current file: it arrives and is reported, the rest waits
+    e2 = Env()
+    f2 = e2.listed()
+    tick(f2, MODEL_A, MODEL_B, MODEL_C)
+    e2.hf.scripts = {MODEL_A.path: [("p", MODEL_A.size - MIB, 1.0), ("call", f2.cancel), ("p", MODEL_A.size, 0.1)]}
+    e2.hf.script = [("p", GIB, 1.0)]
+    f2.start()
+    e2.runner.run_all()
+    eq("A arrived (the cancel came after its last chunk) and was reported", e2.done, [P(MODEL_A)])
+    eq("B was not started", (downloads(e2), e2.runner.jobs), ([MODEL_A.path], []))
+    eq("B and C stay ticked", f2.ticked, (MODEL_B, MODEL_C))
+    eq("the cancelled sentence", (f2.phase, f2.message), ("list", hf_download._DEFAULT_MSG["cancelled"]))
+    check("usable: Download continues", f2.can_download and not f2.can_cancel and f2.download_label ==
+          "Download 2 files")
+
+
+def test_batch_failure() -> None:
+    section("batch 8: a failing file stops the batch there")
+    for kind in ("network", "mismatch", "disk", "timeout", None):
+        e = Env()
+        f = e.listed()
+        tick(f, MODEL_A, MODEL_C, VISION)
+        err: BaseException = HfError(kind) if kind else RuntimeError("boom")
+        e.hf.scripts = {MODEL_A.path: [("p", MODEL_A.size, 1.0)],
+                        MODEL_C.path: [("p", GIB, 1.0), ("call", lambda e=e: e.hf.pending.update({MODEL_C.path: GIB})),
+                                       ("raise", err)],
+                        VISION.path: [("p", VISION.size, 1.0)]}
+        f.start()
+        e.runner.run_all()
+        want = (err.message, dd._KIND_TONE.get(kind, "error")) if isinstance(err, HfError) else (dd.UNEXPECTED,
+                                                                                                    "error")
+        got = (downloads(e), e.runner.jobs, e.done, (f.message, f.message_kind), f.ticked, f.phase, f.download_label,
+               f.can_download, e.row(MODEL_A).note, e.row(MODEL_C).pending)
+        eq(f"{kind or 'unexpected'} on file 2: its sentence; nothing further; A stays; C and the vision file ticked",
+           got, ([MODEL_A.path, MODEL_C.path], [], [P(MODEL_A)], want, (MODEL_C, VISION), "list", "Download 2 files",
+                 True, "· downloaded", GIB))
+    e = Env()
+    f = e.listed()
+    tick(f, MODEL_A, MODEL_C, VISION)
+    e.hf.scripts = {MODEL_A.path: [("raise", HfError("network"))]}
+    f.start()
+    e.runner.run_all()
+    eq("a failure on file 1: nothing fetched after it, all three still ticked",
+       (downloads(e), e.done, f.ticked, f.message), ([MODEL_A.path], [], (MODEL_A, MODEL_C, VISION),
+                                                     hf_download._DEFAULT_MSG["network"]))
+
+
+def test_batch_done_message() -> None:
+    section("batch 9: all done: one sentence for several files")
+    e = Env()
+    f = e.listed()
+    tick(f, MODEL_A, VISION, MODEL_C)
+    f.start()
+    e.runner.run_all()
+    eq("several: DONE_MANY", (f.message, f.message_kind, f.phase), (dd.DONE_MANY.format(n=3), "ok", "done"))
+    check("plain words: how many, checked, in the lists, no exclamation mark",
+          "3 files" in f.message and "checked" in f.message and "in the lists" in f.message and "!" not in f.message,
+          f.message)
+    check("not a one-file sentence", f.message not in (dd.DONE_MODEL, dd.DONE_VISION))
+    eq("nothing ticked, nothing to download", (f.ticked, f.can_download, f.download_label), ((), False, "Download"))
+    eq("the bar shows the last file, full", (f.progress_title, f.progress_text, f.progress_fraction),
+       (VISION.name, "922 of 922 MB · 100%", 1.0))
+    eq("result_path: the last file", f.result_path, P(VISION))
+    e2 = Env()
+    f2 = e2.listed()
+    tick(f2, VISION, MODEL_B)
+    f2.start()
+    e2.runner.run_all()
+    eq("two files, the last one a vision file: still the several-files sentence", f2.message,
+       dd.DONE_MANY.format(n=2))
+    e3 = Env()
+    f3 = e3.listed()
+    f3.toggle(VISION)
+    f3.start()
+    e3.runner.run_all()
+    eq("one vision file: today's sentence", f3.message, dd.DONE_VISION)
+    check("then a click on another row starts over", f3.toggle(MODEL_A) and f3.phase == "list" and f3.message == "")
+
+
+def test_batch_close() -> None:
+    section("batch 10: closing mid-batch stops the current file; nothing further starts")
+    e = Env()
+    f = e.listed()
+    tick(f, MODEL_A, MODEL_C, VISION)
+    seen: dict = {}
+
+    def press() -> None:
+        seen["r"] = f.close()
+        seen["state"] = (f.closing, f.closed, f.message, f.can_close)
+        e.hf.pending[MODEL_C.path] = 3 * GIB
+
+    e.hf.scripts = {MODEL_A.path: [("p", MODEL_A.size, 1.0)],
+                    MODEL_C.path: [("p", 3 * GIB, 1.0), ("call", press), ("stop",), ("p", MODEL_C.size, 1.0)],
+                    VISION.path: [("p", VISION.size, 1.0)]}
+    f.start()
+    e.runner.run_all()
+    eq("close refused while it runs", seen.get("r"), False)
+    eq("closing state", seen.get("state"), (True, False, dd.CLOSING, False))
+    eq("C stopped, the vision file never started", (downloads(e), e.runner.jobs), ([MODEL_A.path, MODEL_C.path], []))
+    eq("A reported, C's part kept", (e.done, e.row(MODEL_C).pending), ([P(MODEL_A)], 3 * GIB))
+    check("stopped: the window may close now", f.can_close and f.close() and f.closed)
+    e.runner.run_all()
+    e.poster.drain()
+    eq("nothing after the close", (downloads(e), e.done), ([MODEL_A.path, MODEL_C.path], [P(MODEL_A)]))
+    # a close asked during the last chunk of file 1: it arrives, nothing further starts
+    e2 = Env()
+    f2 = e2.listed()
+    tick(f2, MODEL_A, MODEL_C, VISION)
+    seen2: dict = {}
+    e2.hf.scripts = {MODEL_A.path: [("p", MODEL_A.size - MIB, 1.0), ("call", lambda: seen2.update(r=f2.close())),
+                                    ("p", MODEL_A.size, 0.1)]}
+    e2.hf.script = [("p", GIB, 1.0)]
+    f2.start()
+    e2.runner.run_all()
+    eq("close refused at first", seen2.get("r"), False)
+    eq("A arrived and was reported; C never started", (e2.done, downloads(e2), e2.runner.jobs),
+       ([P(MODEL_A)], [MODEL_A.path], []))
+    check("the window may close now", f2.can_close and f2.close())
+    # abandoned (owner destroyed) between two files: nothing further starts, nothing is reported
+    e3 = Env(queued=True)
+    f3 = e3.listed()
+    e3.poster.drain()
+    tick(f3, MODEL_A, MODEL_C)
+    e3.hf.script = [("p", GIB, 1.0)]
+    f3.start()
+    e3.runner.run_all()                               # file 1's worker; its answer waits in the queue
+    f3.abandon()
+    changes = e3.changes
+    e3.poster.drain()
+    e3.runner.run_all()
+    e3.poster.drain()
+    eq("abandoned: no on_done, no next file, no change", (e3.done, downloads(e3), e3.changes),
+       ([], [MODEL_A.path], changes))
+
+
+def test_batch_one_action() -> None:
+    section("batch 11: one action at a time while a batch runs")
+    e = Env()
+    f = e.listed()
+    tick(f, MODEL_A, MODEL_C)
+    seen: dict = {}
+
+    def probe(tag: str):
+        def fn() -> None:
+            seen[tag] = (f.busy, f.can_list, f.list_now(), f.can_change_dest, f.set_dest_dir("D:\\X"), f.start(),
+                         f.toggle(VISION), f.select(MODEL_B), f.set_repo_text("x/y"), f.can_discard,
+                         f.discard_partial(), f.can_download)
+        return fn
+
+    e.hf.scripts = {MODEL_A.path: [("p", GIB, 1.0), ("call", probe("file 1"))],
+                    MODEL_C.path: [("call", probe("file 2")), ("p", MODEL_C.size, 1.0)]}
+    f.start()
+    e.runner.run(0)
+    probe("between files")()                         # file 1 answered, file 2's worker not run yet
+    e.runner.run_all()
+    want = (True, False, False, False, False, False, False, False, False, False, False, False)
+    for tag in ("file 1", "between files", "file 2"):
+        eq(f"{tag}: nothing else can start", seen.get(tag), want)
+    eq("only the two ticked files, once each", downloads(e), [MODEL_A.path, MODEL_C.path])
+    eq("max one at a time; nothing changed meanwhile", (e.hf.max_active, f.dest_dir, f.repo_text, f.ticked),
+       (1, DEST, REPO, ()))
+
 
 def test_source_tripwire() -> None:
     section("source tripwire")
@@ -923,7 +1400,9 @@ def main() -> int:
                    test_resume_and_discard, test_not_enough_space, test_download_done, test_errors_on_listing,
                    test_errors_on_download, test_cancel, test_restart_from_zero, test_close_during_download,
                    test_abandon, test_late_listing, test_unexpected, test_never_twice, test_dest_dir,
-                   test_source_tripwire):
+                   test_batch_ticks, test_batch_one_ticked, test_batch_label, test_batch_space, test_batch_sequence,
+                   test_batch_on_done, test_batch_cancel, test_batch_failure, test_batch_done_message,
+                   test_batch_close, test_batch_one_action, test_source_tripwire):
             try:
                 fn()
             except Exception:

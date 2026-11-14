@@ -91,6 +91,7 @@ class FakeHf:
         self.pending: dict[str, int] = {}
         self.free: int | None = 212 * GIB
         self.script: list = []
+        self.scripts: dict[str, list] = {}       # per repo path; files not named here follow `script`
         self.download_calls = 0
         self.max_active = 0
         self.active = 0
@@ -129,7 +130,7 @@ class FakeHf:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
         try:
-            for step in list(self.script):
+            for step in list(self.scripts.get(file.path, self.script)):
                 op = step[0]
                 if op == "p":
                     if progress is not None:
@@ -606,6 +607,111 @@ def test_close_paths(root) -> None:
     check(dlg.flow.closed, "its flow was abandoned (late answers ignored)")
 
 
+def glyphs(dlg) -> list[tuple[str, str, str]]:
+    """Per row as drawn: (mark glyph, its colour, the row's background)."""
+    return [(str(g.cget("text")), str(g.cget("text_color")), str(fr.cget("fg_color")))
+            for _row, fr, g, _l in dlg._row_widgets]
+
+
+def x_span(dlg, w) -> tuple[float, float]:
+    """Left and right edge of widget w inside the window, in logical px."""
+    scale = ctk.ScalingTracker.get_window_scaling(dlg)
+    dlg.update_idletasks()
+    left = (w.winfo_rootx() - dlg.winfo_rootx()) / scale
+    return left, left + w.winfo_width() / scale
+
+
+def test_batch(root) -> Path | None:
+    """Several ticked files: checkbox marks, 'Download N files', no Discard, 'File 2 of 3: ...' while it runs."""
+    hf = FakeHf()
+    hf.pending[MODEL_B.path] = int(4.6 * GIB)
+    gate = threading.Event()
+    hf.scripts = {MODEL_B.path: [("p", int(4.6 * GIB), 0.6), ("p", int(5.5 * GIB), 0.6), ("p", int(6.1 * GIB), 0.1),
+                                 ("hold", gate), ("p", MODEL_B.size)]}
+    hf.script = [("p", 0), ("p", GIB // 2)]
+    dlg, done = open_dialog(root, hf, hidden=False, threaded=True)
+    path = None
+    try:
+        dlg.set_repo(REPO)
+        dlg.list_files()
+        check(pump_until(root, lambda: len(dlg.row_texts()) == 5), "batch: listing arrives")
+        T_ = dd.T
+        off_sel, off_grey = (dd.CHECK_OFF, T_.TEXT_2, T_.SURFACE), (dd.CHECK_OFF, T_.HAIRLINE, T_.SURFACE)
+        on = (dd.CHECK_ON, T_.TEXT, T_.RAISED)
+        eq(glyphs(dlg), [off_sel] * 4 + [off_grey], "empty checkboxes; the split row's greyed")
+        eq(dd.CHECK_OFF, "\uE739", "the empty mark is Segoe Fluent Icons Checkbox")
+        eq(dd.CHECK_ON, "\uE73D", "the ticked mark is CheckboxCompositeReversed")
+        g0 = dlg._row_widgets[0][2]
+        eq((str(g0.cget("font").cget("family")), int(g0.cget("font").cget("size")), int(g0.cget("width")),
+            g0.grid_info()["column"]), (T_.icon_family(), 12, 16, 0), "the mark: same font, size, width, column")
+        name1 = dlg._row_widgets[1][3][0]
+        name1._label.event_generate("<Button-1>")      # a click on row 2's name ticks it
+        pump(root, 0.05)
+        eq(dlg.ticked_rows(), [1], "a click ticks the row")
+        eq(glyphs(dlg)[1], on, "a ticked row: the ticked box, today's selected look")
+        states = dlg.button_states()
+        eq((states.get("Resume"), states.get("Discard partial download")), (True, True),
+           "one ticked with a kept part: Resume and Discard, as today")
+        dlg.choose_row(0)
+        pump(root, 0.05)
+        eq((dlg.ticked_rows(), [s for _a, s in dlg.row_states()]), ([0, 1], [True, True, False, False, False]),
+           "two ticked")
+        states = dlg.button_states()
+        eq((states.get("Download 2 files"), "Discard partial download" in states, "Resume" in states),
+           (True, False, False), "two ticked: 'Download 2 files', no Discard")
+        eq((dlg.progress_title(), dlg.progress_text()), ("", ""), "nothing named under the bar while several wait")
+        dlg.choose_row(3)
+        pump(root, 0.05)
+        eq(dlg.button_states().get("Download 3 files"), True, "three ticked: 'Download 3 files'")
+        eq(glyphs(dlg), [on, on, off_sel, on, off_grey], "three ticked boxes, the others empty")
+        dlg.choose_row(4)
+        pump(root, 0.05)
+        eq(dlg.ticked_rows(), [0, 1, 3], "the split row cannot be ticked")
+        dlg.choose_row(3)
+        pump(root, 0.05)
+        eq((dlg.ticked_rows(), glyphs(dlg)[3]), ([0, 1], off_sel), "a second click unticks")
+        dlg.choose_row(0)
+        pump(root, 0.05)
+        eq(dlg.button_states().get("Resume"), True, "back to one ticked: Resume")
+        dlg.choose_row(0)
+        dlg.choose_row(3)
+        pump(root, 0.05)
+        # the wider button: right-aligned, Close to its left with the same gap
+        b, c = dlg._download_btn, dlg._close_btn
+        bl, br = x_span(dlg, b)
+        cl, cr = x_span(dlg, c)
+        check(abs(br - (dd.WIDTH - dd.PAD)) <= 1 and abs(bl - cr - 8) <= 1,
+              f"Download stays right-aligned, Close 8 px to its left (close {cl:.0f}-{cr:.0f}, "
+              f"download {bl:.0f}-{br:.0f})")
+        text_w = dlg._measure(12, "Download 12 files")
+        check(text_w + 2 * 8 <= br - bl, f"'Download 12 files' has room in the button ({br - bl:.0f} px, text {text_w})")
+        ok, why = fits(dlg)
+        check(ok, f"batch: three ticked, the window fits: {why}")
+        dlg._download_btn.invoke()
+        want_title = f"File 2 of 3: {MODEL_B.name}"
+        check(pump_until(root, lambda: dlg.progress_title() == want_title and dlg.progress_text().startswith("6.1 of")),
+              f"while file 2 of 3 runs: {dlg.progress_title()!r} / {dlg.progress_text()!r}")
+        eq(done, [os.path.join(DEST, MODEL_A.name)], "file 1 already reported")
+        eq(dlg.row_texts()[0][1], "· downloaded", "file 1's row: downloaded")
+        eq((dlg.ticked_rows(), glyphs(dlg)[0][0]), ([1, 3], dd.CHECK_OFF), "file 1 no longer ticked")
+        states = dlg.button_states()
+        eq((states.get("Cancel download"), states.get("Download 2 files"), "Discard partial download" in states),
+           (True, False, False), "while it runs: Cancel; Download greyed")
+        check(abs(dlg.progress_value() - 6.1 / 12.2) < 0.02, f"the bar is file 2's: {dlg.progress_value()}")
+        ok, why = fits(dlg)
+        check(ok, f"batch: the window fits while file 2 of 3 runs: {why}")
+        path = shot(dlg, "batch")
+        gate.set()
+        check(pump_until(root, lambda: dlg.flow.phase == "done"), "the batch finishes")
+        eq((dlg.message_text(), dlg.message_kind()), (dd.DONE_MANY.format(n=3), "ok"), "the several-files sentence")
+        eq(done, [os.path.join(DEST, x.name) for x in (MODEL_A, MODEL_B, VISION)], "each reported once, in list order")
+        eq((dlg.ticked_rows(), hf.max_active), ([], 1), "nothing ticked; never two at once")
+    finally:
+        gate.set()
+        close_dialog(root, dlg)
+    return path
+
+
 def test_no_after_leaks(root, errs: list[str]) -> None:
     pump(root, 0.3)
     before = pending_afters(root)
@@ -636,7 +742,8 @@ def run() -> int:
     pump(root, 0.4)
     try:
         for fn in (test_enter_and_bad_repo, test_list_and_select, test_resume_and_discard, test_progress_and_cancel,
-                   test_done, test_errors, test_long_list_scrolls, test_change_folder, test_close_paths):
+                   test_done, test_errors, test_long_list_scrolls, test_change_folder, test_close_paths,
+                   test_batch):
             gc.collect()
             print(f"-- {fn.__name__}", flush=True)
             try:

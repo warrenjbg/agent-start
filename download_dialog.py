@@ -1,19 +1,23 @@
 """DownloadDialog: "Download a model" (opened from Settings > Model). Paste a Hugging Face repo (owner/name or a
-huggingface.co link), see its .gguf files with their sizes, pick one and download it into the models folder, with
-progress, cancel and resume. All network and file work is hf_download's; this module only drives it and shows it.
+huggingface.co link), see its .gguf files with their sizes, tick one or more and download them into the models
+folder, one after another in list order, with progress, cancel and resume. All network and file work is
+hf_download's; this module only drives it and shows it.
 
 Two parts:
   * DownloadFlow - the whole behaviour, no Tk: a small state machine over hf_download. Every hf_download call runs
     on a worker (run_worker); every state change happens on the UI thread (post); the view redraws from the public
     state on on_change(). A late answer of an older request (another repo typed meanwhile, the window closed) is
-    dropped by a sequence number. One action at a time; hf_download.download never runs twice at once.
+    dropped by a sequence number. One action at a time; hf_download.download never runs twice at once: the files of
+    a batch are fetched one by one, each on its own worker started when the one before has answered.
   * DownloadDialog - a thin CTkToplevel view over one DownloadFlow, in the house style (history_dialog /
     settings_dialog). No Tk call is ever made off the main thread.
 
 Layout (420 logical px wide, fixed height, as the v1.13 mockup): title + "Hugging Face"; repo box + List files; the
-file list (scrolls when long; split / unsupported rows are greyed and cannot be picked); "To <folder> · N GB free ·
-Change…"; Close + Download (Resume when a kept partial file exists); a hairline; the chosen file, its progress bar,
-"4.6 of 12.2 GB · 38% · 41 MB/s · about 3 min left" and Cancel download (or Discard partial download); the message.
+file list (scrolls when long; a click ticks / unticks a row; split / unsupported rows are greyed and cannot be
+ticked); "To <folder> · N GB free · Change…"; Close + Download (Resume when the one ticked file has a kept partial
+file; "Download N files" with several); a hairline; the file being fetched ("File 2 of 3: <name>" in a batch), its
+progress bar, "4.6 of 12.2 GB · 38% · 41 MB/s · about 3 min left" and Cancel download (or Discard partial download,
+one ticked file only); the message.
 
 Policy (on top of hf_download's own): gated and private repos only show hf_download's sentence (no login, no token).
 Nothing downloaded is executed or opened here: the finished path only goes to on_done(path) as data. Repo text, file
@@ -56,6 +60,7 @@ UNEXPECTED_LIST = "Listing the files failed unexpectedly; see the log."
 DONE_MODEL = "Downloaded and checked (SHA-256 matches Hugging Face). It is now in the Model list."
 DONE_VISION = ("Downloaded and checked (SHA-256 matches Hugging Face). It is now in the Vision list of the models in "
                "that folder.")
+DONE_MANY = "Downloaded and checked {n} files (SHA-256 matches Hugging Face); they are now in the lists."
 CANCELLING = "Cancelling the download…"
 CLOSING = "Stopping the download first; the window closes when it has stopped. The partial file is kept."
 STARTING = "Starting the download…"
@@ -256,7 +261,6 @@ class DownloadFlow:
         self.repo_text = ""
         self.listing: RepoListing | None = None
         self.rows: tuple[Row, ...] = ()
-        self.selected: HfFile | None = None
         self.done_bytes = 0
         self.total_bytes = 0
         self.rate_bps: float | None = None
@@ -274,6 +278,10 @@ class DownloadFlow:
         self._listed_text = ""             # the repo text the shown list belongs to
         self._pending: dict[str, int] = {}   # repo path -> kept partial bytes
         self._downloaded: set[str] = set()   # repo paths downloaded in this window (for this listing)
+        self._ticks: list[str] = []          # repo paths of the ticked rows (the work order is the list order)
+        self._shown: HfFile | None = None    # the file a finished download leaves in the progress area
+        self._batch: tuple[HfFile, ...] = ()  # the files of the running (or last) Download, in list order
+        self._batch_pos = 0                  # index in _batch of the file being fetched
         self._stop: threading.Event | None = None
         self._cancel_requested = False
         self._dl_file: HfFile | None = None
@@ -296,21 +304,40 @@ class DownloadFlow:
     def can_edit(self) -> bool:
         return not self.closed and self._job != "download"
 
+    @property
+    def ticked(self) -> tuple[HfFile, ...]:
+        """The ticked files in list order: the order Download fetches them in, whatever order they were ticked."""
+        return tuple(r.file for r in self.rows if r.file.path in self._ticks)
+
+    @property
+    def selected(self) -> HfFile | None:
+        """The file the progress area is about: the one ticked file; with none ticked after a finished download,
+        the file that finished last; otherwise (nothing, or several ticked) None."""
+        t = self.ticked
+        if len(t) == 1:
+            return t[0]
+        if not t and self.phase == "done":
+            return self._shown
+        return None
+
     def _selected_row(self) -> Row | None:
-        if self.selected is None:
+        sel = self.selected
+        if sel is None:
             return None
-        return next((r for r in self.rows if r.file == self.selected), None)
+        return next((r for r in self.rows if r.file == sel), None)
 
     @property
     def can_download(self) -> bool:
-        row = self._selected_row()
-        return (not self.closed and self._job is None and self.phase in ("list", "done") and row is not None
-                and row.selectable)
+        return (not self.closed and self._job is None and self.phase in ("list", "done")
+                and any(r.selectable for r in self.rows if r.file.path in self._ticks))
 
     @property
     def download_label(self) -> str:
+        n = len(self.ticked)
+        if n > 1:
+            return f"Download {n} files"
         row = self._selected_row()
-        return "Resume" if row is not None and row.pending > 0 and row.selectable else "Download"
+        return "Resume" if n == 1 and row is not None and row.pending > 0 and row.selectable else "Download"
 
     @property
     def can_cancel(self) -> bool:
@@ -350,8 +377,24 @@ class DownloadFlow:
         return fmt_eta(max(0, self.total_bytes - self.done_bytes) / self.rate_bps)
 
     @property
+    def batch_size(self) -> int:
+        """How many files the running Download fetches (0 when none runs)."""
+        return len(self._batch) if self._job == "download" else 0
+
+    @property
+    def batch_index(self) -> int:
+        """1-based number of the file being fetched in the running Download (0 when none runs)."""
+        return self._batch_pos + 1 if self._job == "download" else 0
+
+    @property
     def progress_title(self) -> str:
-        f = self._dl_file if self.phase == "downloading" else self.selected
+        if self.phase == "downloading":
+            f = self._dl_file
+            if f is None:
+                return ""
+            n = len(self._batch)
+            return f"File {self._batch_pos + 1} of {n}: {f.name}" if n > 1 else f.name
+        f = self.selected
         return f.name if f is not None else ""
 
     @property
@@ -424,8 +467,9 @@ class DownloadFlow:
                             kind=f.kind, supported=f.supported, note=_row_note(f, pending, done), pending=pending,
                             selectable=f.supported and f.kind != "split" and not done))
         self.rows = tuple(rows)
-        if self.selected is not None and self._selected_row() is None:
-            self.selected = None
+        self._ticks = [p for p in self._ticks if any(r.file.path == p and r.selectable for r in self.rows)]
+        if self._shown is not None and all(r.file != self._shown for r in self.rows):
+            self._shown = None
 
     def _pending_of(self, listing: RepoListing, dest: str) -> dict[str, int]:
         """Worker: kept partial bytes per supported file (hf.pending_part never raises)."""
@@ -487,7 +531,7 @@ class DownloadFlow:
             self._seq += 1                         # a listing under way is answered into the void
             if self._job == "list":
                 self._job = None
-            self.listing, self.rows, self.selected = None, (), None
+            self.listing, self.rows, self._ticks, self._shown = None, (), [], None
             self._pending, self._downloaded = {}, set()
             self.result_path = None
             self.phase = "enter"
@@ -506,7 +550,7 @@ class DownloadFlow:
         seq, text, dest = self._seq, self.repo_text.strip(), self.dest_dir
         self._job = "list"
         self.phase = "listing"
-        self.listing, self.rows, self.selected = None, (), None
+        self.listing, self.rows, self._ticks, self._shown = None, (), [], None
         self._pending, self._downloaded = {}, set()
         self.result_path = None
         self._say("")
@@ -565,7 +609,7 @@ class DownloadFlow:
         if want is not None:
             row = next((r for r in self.rows if r.file.path == want and r.selectable), None)
             if row is not None:
-                self.selected = row.file
+                self._ticks = [row.file.path]
         if not any(r.selectable for r in self.rows):
             self._say(NO_SUPPORTED, "warn")
         else:
@@ -573,50 +617,90 @@ class DownloadFlow:
         self._changed()
 
     # ------------------------------------------------------------------ selection
-    def select(self, file: HfFile | Row | None) -> bool:
-        """Pick a file of the list (None clears). Split and unsupported rows cannot be picked (their reason is
-        shown instead). Not while something runs."""
-        if self.closed or self._job is not None or self.phase not in ("list", "done"):
-            return False
+    def _pickable_row(self, file: HfFile | Row | None) -> Row | None:
+        """The row of file when it may be ticked now; else None (a split / unsupported row says why)."""
+        if self.closed or self._job is not None or self.phase not in ("list", "done") or file is None:
+            return None
         if isinstance(file, Row):
             file = file.file
-        if file is None:
-            self.selected = None
-            self._changed()
-            return True
         row = next((r for r in self.rows if r.file == file), None)
         if row is None:
-            return False
+            return None
         if not row.selectable:
             if not row.supported or row.kind == "split":
                 self._say(row.file.note or "This file cannot be downloaded by Agent Start.", "warn")
                 self._changed()
+            return None
+        return row
+
+    def select(self, file: HfFile | Row | None) -> bool:
+        """Tick only this file (None clears every tick). Split and unsupported rows cannot be ticked (their reason
+        is shown instead). Not while something runs."""
+        if file is None:
+            if self.closed or self._job is not None or self.phase not in ("list", "done"):
+                return False
+            self._ticks, self._shown = [], None
+            self._changed()
+            return True
+        row = self._pickable_row(file)
+        if row is None:
             return False
-        if self.selected != file or self.phase == "done":
-            self.selected = file
+        if self._ticks != [row.file.path] or self.phase == "done":
+            self._ticks = [row.file.path]
             if self.phase == "done":
                 self.phase = "list"
             self._say("")
         self._changed()
         return True
 
+    def toggle(self, file: HfFile | Row) -> bool:
+        """A click on a row: tick it, or untick it when it is ticked. Any number of rows can be ticked; the same
+        rows as select() refuse. Not while something runs."""
+        row = self._pickable_row(file)
+        if row is None:
+            return False
+        if row.file.path in self._ticks:
+            self._ticks.remove(row.file.path)
+        else:
+            self._ticks.append(row.file.path)
+        if self.phase == "done":
+            self.phase = "list"
+        self._say("")
+        self._changed()
+        return True
+
     # ------------------------------------------------------------------ download
     def start(self) -> bool:
-        """Download (or Resume) the selected file: free space first (hf.space_ok), then hf.download - both on one
-        worker. Progress, the result and errors come back through post."""
+        """Download (or Resume) the ticked files, one after another in list order. Before anything is fetched: one
+        free-space check for the whole batch (hf.space_ok with the bytes still to fetch, summed); then each file
+        through hf.download on its own worker, the next one started only when the one before has answered.
+        Progress, the results and errors come back through post."""
         if not self.can_download:
             return False
-        row = self._selected_row()
-        listing = self.listing
-        if row is None or listing is None:
+        batch = self.ticked
+        if self.listing is None or not batch:
             return False
-        self._seq += 1
-        seq, dest, f, pending = self._seq, self.dest_dir, row.file, row.pending
-        stop = threading.Event()
-        self._stop = stop
+        rows = {r.file.path: r for r in self.rows}
+        need = sum(max(0, f.size - rows[f.path].pending) for f in batch)
+        self._stop = threading.Event()
         self._job = "download"
         self._cancel_requested = False
         self.closing = False
+        self._batch = batch
+        self.result_path = None
+        self._shown = None
+        self._fetch(0, need)
+        return True
+
+    def _fetch(self, pos: int, need: int | None) -> None:
+        """Start file pos of the batch on a worker. need: the batch's bytes for the one free-space check (the
+        first file only; None for the rest)."""
+        listing, stop = self.listing, self._stop
+        f = self._batch[pos]
+        pending = max(0, int(self._pending.get(f.path, 0)))
+        self._seq += 1
+        seq, dest = self._seq, self.dest_dir
+        self._batch_pos = pos
         self._dl_file = f
         self._resume_from = pending
         self._checking = pending > 0
@@ -626,7 +710,6 @@ class DownloadFlow:
         self.done_bytes = 0
         self.total_bytes = f.size
         self.rate_bps = None
-        self.result_path = None
         self._say(STARTING)
         hf, margin = self._hf, self._margin
 
@@ -639,8 +722,7 @@ class DownloadFlow:
             unexpected = False
             no_space: tuple[int | None, int] | None = None
             try:
-                need = max(0, f.size - pending)
-                if not hf.space_ok(dest, need):
+                if need is not None and not hf.space_ok(dest, need):
                     no_space = (self._free_of(dest), need + margin)
                 else:
                     path = hf.download(listing, f, dest, progress=progress, stop_evt=stop)
@@ -660,10 +742,10 @@ class DownloadFlow:
 
         if not self._spawn(work):
             self._job = None
+            self._stop = None
             self.phase = "list"
             self._say(UNEXPECTED, "error")
         self._changed()
-        return True
 
     def _progress_answer(self, seq: int, done: int, total: int) -> None:
         if not self._current(seq) or self._job != "download":
@@ -692,27 +774,14 @@ class DownloadFlow:
         if not self._current(seq):
             log.debug("download dialog: late download answer dropped")
             return
-        self._job = None
-        self._stop = None
         self._checking = False
         self.rate_bps = None
         self.free_bytes = free                     # a fresh reading of the same folder (None: unknown now)
         if path is not None:
-            self._pending.pop(f.path, None)
-            self._downloaded.add(f.path)
-            self.result_path = path
-            self.done_bytes = self.total_bytes = f.size
-            self.phase = "done"
-            self._build_rows()
-            self.selected = f
-            self._say(DONE_VISION if f.kind == "vision" else DONE_MODEL, "ok")
-            self._changed()
-            if self._on_done is not None:
-                try:
-                    self._on_done(path)
-                except Exception:  # noqa: BLE001
-                    log.exception("download dialog: on_done callback failed")
+            self._file_done(f, path)
             return
+        self._job = None
+        self._stop = None
         if pend > 0:
             self._pending[f.path] = pend
         else:
@@ -731,6 +800,39 @@ class DownloadFlow:
         else:
             self._say(err.message, _KIND_TONE.get(err.kind, "error"))
         self._changed()
+
+    def _file_done(self, f: HfFile, path: str) -> None:
+        """File f of the batch arrived: it is reported (on_done) at once and its row becomes a downloaded row
+        (no tick). Then the next file starts, unless a cancel or a close was asked or it was the last one."""
+        self._pending.pop(f.path, None)
+        self._downloaded.add(f.path)
+        self._shown = f
+        self.result_path = path
+        self.done_bytes = self.total_bytes = f.size
+        self._build_rows()
+        nxt = self._batch_pos + 1
+        rest = nxt < len(self._batch)
+        go_on = rest and not self._cancel_requested     # (a close asks the cancel too)
+        if not go_on:
+            self._job = None
+            self._stop = None
+            if rest:                               # a cancel came too late for this file: the rest waits
+                self.phase = "list"
+                self._say(HfError("cancelled").message, _KIND_TONE["cancelled"])
+            else:
+                self.phase = "done"
+                if len(self._batch) > 1:
+                    self._say(DONE_MANY.format(n=len(self._batch)), "ok")
+                else:
+                    self._say(DONE_VISION if f.kind == "vision" else DONE_MODEL, "ok")
+        self._changed()
+        if self._on_done is not None:
+            try:
+                self._on_done(path)
+            except Exception:  # noqa: BLE001
+                log.exception("download dialog: on_done callback failed")
+        if go_on and not self.closed and self._job == "download":
+            self._fetch(nxt, None)
 
     def cancel(self) -> bool:
         """Cancel download: hf_download stops between chunks and keeps the partial file for a resume."""
@@ -855,8 +957,9 @@ LIST_H = 150             # about five rows; longer lists scroll
 ROW_H = 28
 ARM_S = 0.4              # a close in the first moment waits until the window is armed (see history_dialog)
 PUMP_MS = 40             # own answer queue (only when the master has no post())
-RADIO_OFF = "\uECCA"     # Segoe Fluent Icons RadioBtnOff
-RADIO_ON = "\uECCB"      # RadioBtnOn
+CHECK_OFF = "\uE739"     # Segoe Fluent Icons Checkbox
+CHECK_ON = "\uE73D"      # CheckboxCompositeReversed
+DOWNLOAD_W = 130         # room for "Download 12 files"
 _TONE_COLOR = {"info": T.TEXT_2, "warn": T.AMBER, "error": T.RED_TEXT, "ok": T.ACCENT}
 
 
@@ -977,7 +1080,7 @@ class DownloadDialog(ctk.CTkToplevel):
                                         fg_color="transparent", border_width=1, border_color=T.RAISED_HOVER,
                                         hover_color=T.RAISED, text_color=T.TEXT, command=self.close)
         self._close_btn.grid(row=0, column=1, sticky="e", padx=(0, 8))
-        self._download_btn = ctk.CTkButton(foot, text="Download", width=100, height=28, corner_radius=8,
+        self._download_btn = ctk.CTkButton(foot, text="Download", width=DOWNLOAD_W, height=28, corner_radius=8,
                                            font=self._body, fg_color=T.RAISED, hover_color=T.PRIMARY_HOVER,
                                            text_color=T.ON_PRIMARY, text_color_disabled=T.TEXT_3,
                                            command=self.download, state="disabled")
@@ -1077,9 +1180,10 @@ class DownloadDialog(ctk.CTkToplevel):
             self.flow.list_now()
 
     def choose_row(self, index: int) -> None:
+        """A click on row index: ticks it, or unticks it when it is ticked."""
         if self._destroyed or not 0 <= index < len(self.flow.rows):
             return
-        self.flow.select(self.flow.rows[index])
+        self.flow.toggle(self.flow.rows[index])
 
     def download(self) -> None:
         if not self._destroyed:
@@ -1115,9 +1219,13 @@ class DownloadDialog(ctk.CTkToplevel):
         return out
 
     def row_states(self) -> list[tuple[bool, bool]]:
-        """(can be picked, picked) per row."""
-        return [(row.selectable, self.flow.selected is not None and row.file == self.flow.selected)
-                for row, _f, _g, _l in self._row_widgets]
+        """(can be ticked, ticked) per row."""
+        ticked = set(self.flow.ticked)
+        return [(row.selectable, row.file in ticked) for row, _f, _g, _l in self._row_widgets]
+
+    def ticked_rows(self) -> list[int]:
+        """The indexes of the ticked rows, as drawn (the glyph shows the ticked box)."""
+        return [i for i, (_row, _f, glyph, _l) in enumerate(self._row_widgets) if glyph.cget("text") == CHECK_ON]
 
     def list_placeholder(self) -> str:
         """The muted line inside the empty list ('' when rows are shown)."""
@@ -1203,7 +1311,7 @@ class DownloadDialog(ctk.CTkToplevel):
             frame = ctk.CTkFrame(self._list, fg_color=T.SURFACE, corner_radius=6, height=ROW_H)
             frame.grid(row=i, column=0, sticky="ew", padx=2, pady=0)
             frame.grid_columnconfigure(2, weight=1)
-            glyph = ctk.CTkLabel(frame, text=RADIO_OFF, width=16, height=ROW_H, font=self._glyph,
+            glyph = ctk.CTkLabel(frame, text=CHECK_OFF, width=16, height=ROW_H, font=self._glyph,
                                  text_color=T.TEXT_3)
             glyph.grid(row=0, column=0, padx=(6, 6))
             size_w = self._measure(12, row.size_text) + 8
@@ -1241,12 +1349,12 @@ class DownloadDialog(ctk.CTkToplevel):
             last.update(new)
 
     def _paint_rows(self) -> None:
-        sel = self.flow.selected
+        ticked = set(self.flow.ticked)
         for i, (row, frame, glyph, _labels) in enumerate(self._row_widgets):
-            on = sel is not None and row.file == sel
+            on = row.file in ticked
             hover = self._hover_row == i and row.selectable and not self.flow.busy
             self._cfg(frame, fg_color=T.RAISED if on or hover else T.SURFACE)
-            self._cfg(glyph, text=RADIO_ON if on else RADIO_OFF,
+            self._cfg(glyph, text=CHECK_ON if on else CHECK_OFF,
                       text_color=T.TEXT if on else (T.TEXT_2 if row.selectable else T.HAIRLINE))
 
     def _render(self) -> None:
