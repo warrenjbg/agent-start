@@ -20,8 +20,9 @@ here can end the wrong process or install the wrong file.
    it imports an app module. Never read or write `%APPDATA%\AgentStart` from a test.
 4. **A process is only ended when its identity is proven.** Never "whatever listens on the port", never by name
    alone, never `taskkill`, `os.kill` or `/T`. Targets are (pid, create time) pairs from the scan the user saw.
-5. **A file is only deleted or overwritten when the app made it.** In folders the user also uses (a models
-   folder, Downloads) the app marks its own partial files first and leaves every other file alone.
+5. **A file is only deleted or overwritten when the app made it, or when the user picked that one file and
+   confirmed.** In folders the user also uses (a models folder, Downloads) the app marks its own partial files
+   first; a file the user picked and confirmed is deleted through `model_files.delete` and nowhere else.
 6. **Text from files, the network or window titles never becomes part of a command.** Process arguments are
    lists, never a shell string; a launcher `.bat` is parsed, never run.
 7. **Private keys and secrets are never read or printed.** That covers the release keys, the `api_key` in a
@@ -49,6 +50,7 @@ A change to one of these is read line by line by a second, stronger reviewer bef
 | `update_sig.py` | decides whether a release is signed by the publisher |
 | `update_controller.py` | drives the in-app update |
 | `hf_download.py` | writes, resumes and deletes files in a folder the user also uses |
+| `model_files.py` | deletes model files the user picked |
 | `hermes_alias.py` | the one place that runs hermes.exe and changes its configuration |
 | `toasts.py` | passes text to PowerShell |
 | `tools/sign_release.py` | signs a release |

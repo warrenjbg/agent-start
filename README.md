@@ -495,6 +495,7 @@ notification area on a runner). *Local* suites open the real window and take scr
 | `tests\test_idle_watch.py` | CI | Idle auto-off: the idle clock (activity, unknown polls, sleep gaps, short replies) and the app's glue on a stand-in object: when it turns off, everything that makes it wait, the busy answer |
 | `tests\test_llama_models.py` | CI | Per-model arguments for llama.cpp: what is kept per model and what is shared, a first-time model, the short `--alias`, an old config loading unchanged |
 | `tests\test_hf_download.py` | CI | The Hugging Face module against local stand-in servers: listing, allowed hosts and redirects, size and SHA-256, resume, free space, never overwriting, only touching its own partial files |
+| `tests\test_model_files.py` | CI | The models folder's own files: listing only the plain `.gguf` files directly in it, and deleting one confirmed file only after every check (name, same folder, no link or junction, unchanged since listed, not being served, not in use), on real files, junctions and hard links in a temp folder |
 | `tests\test_download_flow.py` | CI | The download window's logic without a window: listing, selection, progress, cancel, resume, discard, every error sentence |
 | `tests\test_download_dialog.py` | Local | The download window itself (opens windows), with a stand-in for the Hugging Face module |
 | `tests\test_hermes_alias.py` | CI | The Hermes alias module with a stand-in for `hermes.exe` (no process is started): the one-argument write, the read-back, reading first, leaving an entry with other keys alone |
