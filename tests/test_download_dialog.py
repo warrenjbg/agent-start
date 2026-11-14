@@ -233,6 +233,19 @@ def placeholder_look(dlg) -> tuple[str, int, str]:
     return str(ph.cget("text_color")), int(ph.cget("font").cget("size")), str(ph._label.cget("justify"))
 
 
+def side_margins(dlg) -> dict[str, tuple[int, int]]:
+    """Left and right margin, in logical px, of every section of the window that is on screen."""
+    scale = ctk.ScalingTracker.get_window_scaling(dlg)
+    dlg.update_idletasks()
+    width = dlg.winfo_width() / scale
+    out = {}
+    for w in dlg.grid_slaves(column=0):
+        if w.winfo_manager() and w.winfo_ismapped():
+            left = w.winfo_x() / scale
+            out[f"row {w.grid_info()['row']}"] = (round(left), round(width - left - w.winfo_width() / scale))
+    return out
+
+
 def fits(dlg) -> tuple[bool, str]:
     scale = ctk.ScalingTracker.get_window_scaling(dlg)
     dlg.update_idletasks()
@@ -369,6 +382,18 @@ def test_progress_and_cancel(root) -> Path | None:
         eq((states.get("Cancel download"), states.get("Download"), states.get("List files"), states.get("Change…")),
            (True, False, False, False), "only Cancel (and Close) while downloading")
         eq(dlg.entry_enabled(), False, "the repo box is locked while downloading")
+        cancel = dlg._cancel_btn
+        eq((str(cancel.cget("text_color")), str(cancel.cget("font").cget("weight")), int(cancel.cget("font").cget("size"))),
+           (dd.T.RED_TEXT, "bold", 12), "Cancel download: bold, in the error text's colour")
+        eq(str(dlg._download_btn.cget("font").cget("weight")), "normal", "...and it is the only bold button")
+        margins = side_margins(dlg)
+        eq(dd.PAD, 20, "the side margin is 20 px")
+        check(len(margins) >= 9 and all(lr == (dd.PAD, dd.PAD) for name, lr in margins.items() if name != "row 10")
+              and margins["row 10"][0] == dd.PAD and margins["row 10"][1] >= dd.PAD,
+              f"every section starts and ends on the side margin while downloading: {margins}")
+        cw = cancel.winfo_width() / ctk.ScalingTracker.get_window_scaling(dlg)
+        check(cw <= dd.WIDTH - 2 * dd.PAD and dlg._measure(12, "Cancel download") * 1.12 + 16 <= cw,
+              f"the bold label has room in its button ({cw:.0f} px)")
         check(abs(dlg.progress_value() - 4.6 / 12.2) < 0.02, f"bar follows: {dlg.progress_value()}")
         path = shot(dlg, "progress")
         hf.pending[MODEL_B.path] = int(4.6 * GIB)

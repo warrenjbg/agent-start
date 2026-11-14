@@ -850,7 +850,7 @@ class DownloadFlow:
 # ================================================================================================ the window
 WIDTH = 420
 HEIGHT = 528            # the content's own height (the message line under the progress bar was cut off at 480)
-PAD = 12
+PAD = 20                # the one side margin: every section starts and ends on it
 LIST_H = 150             # about five rows; longer lists scroll
 ROW_H = 28
 ARM_S = 0.4              # a close in the first moment waits until the window is armed (see history_dialog)
@@ -913,6 +913,7 @@ class DownloadDialog(ctk.CTkToplevel):
         ui = T.ui_family()
         self._small = ctk.CTkFont(family=ui, size=11)
         self._body = ctk.CTkFont(family=ui, size=12)
+        self._body_bold = ctk.CTkFont(family=ui, size=12, weight="bold")
         self._mono = ctk.CTkFont(family=T.mono_family(), size=11)
         self._glyph = ctk.CTkFont(family=T.icon_family(), size=12)
         self._link_font = ctk.CTkFont(family=ui, size=11, underline=True)
@@ -996,9 +997,10 @@ class DownloadDialog(ctk.CTkToplevel):
         act.grid(row=9, column=0, sticky="ew", padx=PAD, pady=(8, 0))
         act.grid_columnconfigure(0, weight=1)
         act.grid_propagate(False)
+        # the one action here that stops something: bold, in the colour of the error text
         self._cancel_btn = ctk.CTkButton(act, text="Cancel download", width=130, height=28, corner_radius=8,
-                                         font=self._body, fg_color=T.RAISED, hover_color=T.RAISED_HOVER,
-                                         text_color=T.TEXT, text_color_disabled=T.TEXT_3, command=self.cancel)
+                                         font=self._body_bold, fg_color=T.RAISED, hover_color=T.RAISED_HOVER,
+                                         text_color=T.RED_TEXT, text_color_disabled=T.TEXT_3, command=self.cancel)
         self._discard_btn = ctk.CTkButton(act, text="Discard partial download", width=170, height=28, corner_radius=8,
                                           font=self._body, fg_color="transparent", border_width=1,
                                           border_color=T.RAISED_HOVER, hover_color=T.RAISED, text_color=T.TEXT_2,
