@@ -23,7 +23,8 @@ import traceback
 import types
 from pathlib import Path
 
-TMP = Path(tempfile.mkdtemp(prefix="agentstart-modelfiles-test-"))
+# realpath: a temp folder can be spelled with a short name (C:\Users\RUNNER~1\...), and the module reports long ones
+TMP = Path(os.path.realpath(tempfile.mkdtemp(prefix="agentstart-modelfiles-test-")))
 os.environ["AGENT_START_HOME"] = str(TMP / "home")
 
 ROOT = Path(__file__).resolve().parent.parent
