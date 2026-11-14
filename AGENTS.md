@@ -51,6 +51,7 @@ A change to one of these is read line by line by a second, stronger reviewer bef
 | `update_controller.py` | drives the in-app update |
 | `hf_download.py` | writes, resumes and deletes files in a folder the user also uses |
 | `model_files.py` | deletes model files the user picked |
+| `folder_flow.py` | decides which file is handed to model_files.delete, and when |
 | `hermes_alias.py` | the one place that runs hermes.exe and changes its configuration |
 | `toasts.py` | passes text to PowerShell |
 | `tools/sign_release.py` | signs a release |

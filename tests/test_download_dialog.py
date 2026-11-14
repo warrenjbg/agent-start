@@ -3,8 +3,9 @@
 Run:  .venv\\Scripts\\python.exe -u -X faulthandler tests\\test_download_dialog.py
 Exit code 0 = all checks passed. Screenshots land in tests\\ui_download_<state>.png (git-ignored).
 Opens only a bare CTk root and this dialog (no app window). It pops windows: ask before running it while the PC is
-in use. Never contacts a server, never starts or stops a process, never writes a model file: the fake hf only
-pretends. Clicks are invoke() / event_generate on the dialog's own widgets, never real mouse input.
+in use. Never contacts a server, never starts or stops a process, never writes or deletes a model file: the fake hf
+and the fake `files` (in place of model_files, passed to EVERY dialog this suite opens) only pretend. Clicks are
+invoke() / event_generate on the dialog's own widgets, never real mouse input.
 """
 from __future__ import annotations
 
@@ -33,8 +34,10 @@ import customtkinter as ctk  # noqa: E402
 import config_store  # noqa: E402
 import download_dialog as dd  # noqa: E402
 import hf_download  # noqa: E402
+import folder_flow  # noqa: E402
 from download_dialog import DownloadDialog  # noqa: E402
 from hf_download import HfError, HfFile, RepoListing  # noqa: E402
+from model_files import ModelFile, ModelFileError  # noqa: E402
 
 assert config_store.DATA_DIR == HOME, "tests must not write to the real data dir"
 logging.getLogger("agent_start").addHandler(logging.NullHandler())
@@ -96,6 +99,7 @@ class FakeHf:
         self.max_active = 0
         self.active = 0
         self.lock = threading.Lock()
+        self.list_calls = 0
 
     def parse_repo(self, text):
         m = re.fullmatch(r"(?:https?://)?(?:huggingface\.co/)?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/\S*)?",
@@ -105,6 +109,7 @@ class FakeHf:
         return f"{m.group(1)}/{m.group(2)}"
 
     def list_files(self, repo):
+        self.list_calls += 1
         r = self.listings.get(repo)
         if isinstance(r, BaseException):
             raise r
@@ -154,6 +159,43 @@ class FakeHf:
                 self.active -= 1
 
 
+OTHER = os.path.normpath("D:/Other/Models")
+LA = ("Ornith-1.5-9B-Q4_K_M.gguf", int(5.4 * GIB), 111)
+LB = ("Ornith-1.5-9B-Q8_0.gguf", int(9.1 * GIB), 222)
+LQ = ("Qwen3.8-27B-UD-IQ4_XS.gguf", int(13.4 * GIB), 333)
+LM = ("mmproj-Ornith-1.5-9B-BF16.gguf", 879 * MIB, 444)
+
+
+class FakeFiles:
+    """model_files' surface for the folder view: list_folder, serving_paths, delete. It only pretends: no folder is
+    read, no process is scanned, nothing on disk is touched. LQ is 'served by llama.cpp'."""
+
+    def __init__(self) -> None:
+        self.folders: dict[str, list[tuple[str, int, int]]] = {DEST: [LA, LB, LQ, LM], OTHER: [LB]}
+        self.serving: set[str] = {os.path.join(DEST, LQ[0])}
+        self.deletes: list[tuple[ModelFile, str, object]] = []
+        self.delete_error: BaseException | None = None
+        self.lists: list[str] = []
+        self.lock = threading.Lock()
+
+    def list_folder(self, folder):
+        with self.lock:
+            self.lists.append(folder)
+            return tuple(ModelFile(os.path.join(folder, n), n, s, t) for n, s, t in self.folders.get(folder, []))
+
+    def serving_paths(self):
+        return frozenset(os.path.normcase(os.path.realpath(p)) for p in self.serving)
+
+    def delete(self, file, folder, serving=frozenset()):
+        with self.lock:
+            self.deletes.append((file, folder, serving))
+            if self.delete_error is not None:
+                raise self.delete_error
+            listed = self.folders.get(folder, [])
+            listed[:] = [x for x in listed if x[0] != file.name]
+            return file.size
+
+
 def sync_runner(fn) -> None:
     fn()
 
@@ -199,12 +241,16 @@ def pending_afters(root) -> int:
     return len(str(root.tk.call("after", "info")).split())
 
 
-def open_dialog(root, hf: FakeHf, hidden: bool = True, threaded: bool = False) -> tuple[DownloadDialog, list[str]]:
+def open_dialog(root, hf: FakeHf, hidden: bool = True, threaded: bool = False, files: FakeFiles | None = None,
+                deleted: list[str] | None = None) -> tuple[DownloadDialog, list[str]]:
     done: list[str] = []
+    files = files if files is not None else FakeFiles()          # never the real model_files
+    on_deleted = deleted.append if deleted is not None else None
     if threaded:      # the dialog's own fallback: daemon threads + its own answer queue (a bare root has no post())
-        dlg = DownloadDialog(root, DEST, on_done=done.append, hf=hf)
+        dlg = DownloadDialog(root, DEST, on_done=done.append, on_deleted=on_deleted, hf=hf, files=files)
     else:
-        dlg = DownloadDialog(root, DEST, on_done=done.append, hf=hf, run_worker=sync_runner, post=direct_post)
+        dlg = DownloadDialog(root, DEST, on_done=done.append, on_deleted=on_deleted, hf=hf, files=files,
+                             run_worker=sync_runner, post=direct_post)
     if hidden:
         dlg.attributes("-alpha", 0.0)
     pump(root, 0.6)                                   # past ARM_S and the 200 ms raise
@@ -549,7 +595,7 @@ def test_close_paths(root) -> None:
         pump(root, 0.1)
         check(not alive(dlg), f"{how} closes the idle window")
     # an early close waits for the arm time
-    dlg = DownloadDialog(root, DEST, hf=hf, run_worker=sync_runner, post=direct_post)
+    dlg = DownloadDialog(root, DEST, hf=hf, files=FakeFiles(), run_worker=sync_runner, post=direct_post)
     dlg.attributes("-alpha", 0.0)
     pump(root, 0.05)
     dlg.close()
@@ -586,7 +632,7 @@ def test_close_paths(root) -> None:
     pump(root, 0.5)
     gate2 = threading.Event()
     hf.script = [("p", GIB, 0.1), ("wait", gate2), ("p", int(1.5 * GIB)), ("stop",)]
-    dlg = DownloadDialog(master, DEST, hf=hf)
+    dlg = DownloadDialog(master, DEST, hf=hf, files=FakeFiles())
     dlg.attributes("-alpha", 0.0)
     pump(root, 0.6)
     dlg.set_repo(REPO)
@@ -712,6 +758,300 @@ def test_batch(root) -> Path | None:
     return path
 
 
+def boxes(dlg) -> dict[int, tuple[int, int]]:
+    """Top and height, in logical px, of every section of the window that is on screen, by grid row."""
+    scale = ctk.ScalingTracker.get_window_scaling(dlg)
+    dlg.update_idletasks()
+    out = {}
+    for w in dlg.grid_slaves(column=0):
+        if w.winfo_manager() and w.winfo_ismapped():
+            out[int(w.grid_info()["row"])] = (round(w.winfo_y() / scale), round(w.winfo_height() / scale))
+    return out
+
+
+def label_look(w) -> tuple[str, int, str]:
+    return str(w.cget("text_color")), int(w.cget("font").cget("size")), str(w.cget("font").cget("weight"))
+
+
+def row_colours(dlg) -> list[tuple[str, str, str, str]]:
+    """Per row as drawn: (mark, mark colour, name colour, size colour)."""
+    return [(str(g.cget("text")), str(g.cget("text_color")), str(lab[0].cget("text_color")),
+             str(lab[2].cget("text_color"))) for _r, _f, g, lab in dlg._row_widgets]
+
+
+def test_folder_view(root) -> Path | None:
+    """The 'In this folder' view: the switch, the rows, Delete…, the question, Keep, Delete for good, a refusal."""
+    hf = FakeHf()
+    files = FakeFiles()
+    deleted: list[str] = []
+    dlg, _done = open_dialog(root, hf, hidden=False, files=files, deleted=deleted)
+    path = None
+    T_ = dd.T
+    try:
+        # ---- the Hugging Face view: the window as it was, with the switch in the heading
+        eq((dlg.view(), dlg.heading_text()), ("hf", "Download a model"), "the window opens on Hugging Face")
+        eq(dlg.switch_states(), {"Hugging Face": (True, True), "In this folder": (False, True)},
+           "the switch: Hugging Face chosen, both parts usable")
+        eq(files.lists, [], "the folder is not read while its view is not shown")
+        tabs = dlg._tabs
+        eq((str(tabs["hf"].cget("fg_color")), str(tabs["folder"].cget("fg_color")),
+            str(dlg._switch.cget("fg_color"))), (T_.RAISED, T_.SURFACE, T_.SURFACE),
+           "switch: the track SURFACE, the chosen part RAISED")
+        eq([label_look(t)[:2] for t in tabs.values()], [(T_.TEXT, 11), (T_.TEXT, 11)], "switch text: TEXT, 11 px")
+        hf_boxes = boxes(dlg)
+        scale = ctk.ScalingTracker.get_window_scaling(dlg)
+        sw_h = dlg._switch.winfo_height() / scale
+        check(abs(sw_h - 20) <= 1 and abs(hf_boxes[0][1] - 20) <= 1,
+              f"the switch is about 20 px high; the heading row keeps its height ({sw_h:.0f}, {hf_boxes[0]})")
+        # ---- switch to the folder view with a click
+        tabs["folder"]._label.event_generate("<Button-1>")
+        pump(root, 0.1)
+        eq((dlg.view(), dlg.heading_text()), ("folder", "Models in this folder"), "a click on 'In this folder'")
+        eq(dlg.switch_states(), {"Hugging Face": (False, True), "In this folder": (True, True)},
+           "the switch follows")
+        eq((str(tabs["hf"].cget("fg_color")), str(tabs["folder"].cget("fg_color"))), (T_.SURFACE, T_.RAISED),
+           "the chosen part is raised")
+        eq(files.lists, [DEST], "the folder is read when its view is chosen")
+        check(not dlg._repo_box.winfo_manager(), "no repo box and no List files in the folder view")
+        fb = boxes(dlg)
+        check(1 not in fb and abs((fb[2][1] - hf_boxes[2][1]) - dd.LIST_GROW) <= 1 and dd.LIST_GROW == 38,
+              f"the list is 38 px taller ({hf_boxes[2]} -> {fb[2]})")
+        same = {r: (hf_boxes[r][0], fb.get(r, (None,))[0]) for r in (3, 4, 5, 6, 7, 8, 9, 10)}
+        check(all(a is not None and b is not None and abs(a - b) <= 1 for a, b in same.values())
+              and abs(sum(fb[2]) - sum(hf_boxes[2])) <= 1,
+              f"everything below the list stays where it was (row: hf y, folder y) {same}")
+        ok, why = fits(dlg)
+        check(ok, f"folder view content fits: {why}")
+        eq(dlg.folder_rows(), [(LA[0], "", "5.4 GB"), (LB[0], "", "9.1 GB"),
+                               (LQ[0], "· in use by llama.cpp", "13.4 GB"), (LM[0], "", "879 MB")],
+           "the folder's .gguf files with their sizes; the served one says so")
+        eq([s for s, _c in dlg.row_states()], [True, True, False, True], "the served file cannot be chosen")
+        off = (dd.RADIO_OFF, T_.TEXT_2, T_.TEXT, T_.TEXT_2)
+        grey = (dd.RADIO_OFF, T_.HAIRLINE, T_.TEXT_3, T_.TEXT_3)
+        eq(row_colours(dlg), [off, off, grey, off], "round marks; the served row greyed as an unsupported row")
+        eq((dd.RADIO_OFF, dd.RADIO_ON), ("\uECCA", "\uECCB"), "the round marks: Segoe Fluent Icons RadioBtnOff / On")
+        eq(dlg.dest_line(), "In Models\\llama-models · 212 GB free · Change…", "the folder line says In")
+        eq(dlg.button_states(), {"Close": True, "Delete…": False, "Change…": True},
+           "Close and a greyed Delete… (nothing chosen)")
+        db = dlg._delete_btn
+        eq((str(db.cget("fg_color")), str(db.cget("text_color")), str(db.cget("text_color_disabled")),
+            str(db.cget("font").cget("weight")), int(db.cget("width"))),
+           (T_.RAISED, T_.RED_TEXT, T_.TEXT_3, "bold", dd.DOWNLOAD_W),
+           "Delete…: RAISED fill, bold, red text; TEXT_3 greyed")
+        dl, dr = x_span(dlg, db)
+        cl, cr = x_span(dlg, dlg._close_btn)
+        check(abs(dr - (dd.WIDTH - dd.PAD)) <= 1 and abs(dl - cr - 8) <= 1,
+              f"Delete… where Download was: right-aligned, Close 8 px to its left "
+              f"({cl:.0f}-{cr:.0f}, {dl:.0f}-{dr:.0f})")
+        eq((dlg.progress_title(), dlg.progress_text(), dlg.question_text(), str(dlg._bar.cget("progress_color")),
+            str(dlg._bar.cget("fg_color"))), ("", "", "", T_.BG, T_.BG), "under the hairline: nothing shown")
+        # ---- choosing
+        dlg._row_widgets[1][3][0]._label.event_generate("<Button-1>")      # a click on row 2's name
+        pump(root, 0.05)
+        eq(dlg.ticked_rows(), [1], "a click chooses the row")
+        eq(row_colours(dlg)[1][:2], (dd.RADIO_ON, T_.TEXT), "the chosen row: the filled circle")
+        eq(str(dlg._row_widgets[1][1].cget("fg_color")), T_.RAISED, "...on the selected background")
+        eq(dlg.button_states()["Delete…"], True, "Delete… is on with a row chosen")
+        dlg.choose_folder_row(2)
+        pump(root, 0.05)
+        eq(dlg.ticked_rows(), [1], "the served row cannot be chosen")
+        dlg.choose_folder_row(0)
+        dlg.choose_folder_row(0)
+        pump(root, 0.05)
+        eq(dlg.ticked_rows(), [0], "one row at a time; a click on the chosen row keeps it")
+        dlg.choose_folder_row(1)
+        pump(root, 0.05)
+        margins = side_margins(dlg)
+        check(all(lr == (dd.PAD, dd.PAD) for name, lr in margins.items() if name != "row 10")
+              and margins["row 10"][0] == dd.PAD and margins["row 10"][1] >= dd.PAD,
+              f"folder view: every section on the side margin: {margins}")
+        path = shot(dlg, "folder")
+        # ---- Delete…: the question
+        asked = dlg.folder.rows[1].file
+        dlg.press_delete()
+        pump(root, 0.05)
+        eq(dlg.question_text(), "Delete Ornith-1.5-9B-Q8_0.gguf (9.1 GB) for good? This cannot be undone.",
+           "the question names the file and its size")
+        eq(dlg.button_states(), {"Close": True, "Delete…": False, "Keep": True, "Delete for good": True,
+                                 "Change…": False}, "the question up: Delete… and Change… off, Keep, Delete for good")
+        eq(dlg.switch_states(), {"Hugging Face": (False, False), "In this folder": (True, False)},
+           "the switch is off while the question is up")
+        eq([label_look(t)[0] for t in tabs.values()], [T_.TEXT_3, T_.TEXT_3], "...and greyed")
+        dlg.choose_folder_row(0)
+        pump(root, 0.05)
+        eq(dlg.ticked_rows(), [1], "rows cannot be chosen while the question is up")
+        check(not dlg.set_view("hf") and dlg.view() == "folder", "the view cannot be switched")
+        qt = dlg._ask_text
+        eq((label_look(qt)[:2], str(qt._label.cget("justify")), str(qt.cget("anchor"))), ((T_.TEXT, 12), "left", "nw"),
+           "the question: 12 px, TEXT, left-aligned")
+        kb, yb = dlg._keep_btn, dlg._yes_btn
+        eq((str(kb.cget("fg_color")), int(kb.cget("border_width")), str(kb.cget("border_color")),
+            str(kb.cget("text_color")), str(kb.cget("font").cget("weight"))),
+           ("transparent", 1, T_.RAISED_HOVER, T_.TEXT, "normal"), "Keep: an outline button, as Close")
+        eq((str(yb.cget("fg_color")), str(yb.cget("hover_color")), str(yb.cget("text_color")),
+            str(yb.cget("font").cget("weight"))), (T_.DANGER, T_.DANGER_HOVER, T_.TEXT, "bold"),
+           "Delete for good: the danger fill, bold")
+        yl, yr = x_span(dlg, yb)
+        kl, kr = x_span(dlg, kb)
+        check(abs(yr - (dd.WIDTH - dd.PAD)) <= 1 and abs(yl - kr - 8) <= 1,
+              f"Keep and Delete for good right-aligned, 8 px apart ({kl:.0f}-{kr:.0f}, {yl:.0f}-{yr:.0f})")
+        cb = boxes(dlg)
+        check(abs(cb[10][0] - hf_boxes[10][0]) <= 1 and 6 in cb and 7 not in cb,
+              f"the question takes the name / bar rows; the message line stays put ({cb})")
+        ok, why = fits(dlg)
+        check(ok, f"the question fits: {why}")
+        margins = side_margins(dlg)
+        check(all(lr == (dd.PAD, dd.PAD) for name, lr in margins.items() if name != "row 10"),
+              f"question: every section on the side margin: {margins}")
+        path = shot(dlg, "folder_confirm") or path
+        # ---- Keep
+        dlg.press_keep()
+        pump(root, 0.05)
+        eq((dlg.question_text(), dlg.ticked_rows(), files.deletes), ("", [1], []),
+           "Keep: the question goes, the same row stays chosen, nothing deleted")
+        eq(dlg.switch_states()["In this folder"], (True, True), "...and the switch is back")
+        # ---- Delete for good
+        hf.free = 221 * GIB
+        dlg.press_delete()
+        dlg.press_delete_for_good()
+        pump(root, 0.1)
+        eq(len(files.deletes), 1, "Delete for good: one delete")
+        check(files.deletes[0][0] is asked and files.deletes[0][1] == DEST,
+              "...of the very file the question named, in the folder")
+        eq([r[0] for r in dlg.folder_rows()], [LA[0], LQ[0], LM[0]], "the row goes (the folder is read again)")
+        eq(dlg.ticked_rows(), [], "no row is chosen")
+        eq((dlg.message_text(), dlg.message_kind()), ("Deleted Ornith-1.5-9B-Q8_0.gguf (9.1 GB).", "info"),
+           "the message says what went")
+        eq(dlg.dest_line(), "In Models\\llama-models · 221 GB free · Change…", "the free space is read again")
+        eq(deleted, [asked.path], "on_deleted once, with the path")
+        eq(dlg.question_text(), "", "the question is gone")
+        # ---- a refusal
+        msg = "Ornith-1.5-9B-Q4_K_M.gguf is in use by another program; close that program, then try again."
+        files.delete_error = ModelFileError("in_use", msg)
+        dlg.choose_folder_row(0)
+        dlg.press_delete()
+        dlg.press_delete_for_good()
+        pump(root, 0.1)
+        eq((dlg.message_text(), dlg.message_kind()), (msg, "warn"), "a refusal: its sentence, in the warning colour")
+        eq((dlg.ticked_rows(), len(files.deletes), deleted), ([0], 2, [asked.path]),
+           "...the choice is kept, one delete call, no on_deleted")
+        files.delete_error = ModelFileError("changed", "x changed.")
+        dlg.press_delete()
+        dlg.press_delete_for_good()
+        pump(root, 0.1)
+        eq(dlg.message_kind(), "error", "another refusal: the error colour")
+        # ---- back to Hugging Face
+        dlg.set_view("hf")
+        pump(root, 0.05)
+        eq((dlg.view(), dlg.heading_text(), bool(dlg._repo_box.winfo_manager())), ("hf", "Download a model", True),
+           "back to Hugging Face: heading and repo row")
+        eq(dlg.button_states(), {"List files": False, "Close": True, "Download": False, "Change…": True},
+           "the download side's buttons, as before")
+        eq((dlg.dest_line().split(" ")[0], dlg.list_placeholder(), dlg.message_text()), ("To", dd.HINT_ENTER, ""),
+           "'To', the hint and the download side's (empty) message")
+        eq(boxes(dlg), {**hf_boxes}, "the layout is the Hugging Face one again")
+        eq((str(dlg._bar.cget("fg_color")), str(dlg._bar.cget("progress_color"))), (T_.RAISED, T_.ACCENT),
+           "the bar is back")
+    finally:
+        close_dialog(root, dlg)
+    return path
+
+
+def test_folder_switch_rules(root) -> None:
+    """The download side is left as it was; listed again only after a delete; the switch is off while downloading;
+    Close / Escape answer Keep first; Change… in the folder view; an empty folder."""
+    hf = FakeHf()
+    files = FakeFiles()
+    dlg, _done = open_dialog(root, hf, files=files)
+    saved = dd.filedialog.askdirectory
+    try:
+        listed(root, dlg)
+        dlg.choose_row(1)
+        dlg.choose_row(3)
+        dlg.choose_row(4)                                   # the split row: its warning in the message line
+        pump(root, 0.05)
+        before = (dlg.row_texts(), dlg.ticked_rows(), dlg.message_text(), hf.list_calls)
+        dlg.set_view("folder")
+        pump(root, 0.05)
+        dlg.set_view("hf")
+        pump(root, 0.05)
+        eq((dlg.row_texts(), dlg.ticked_rows(), dlg.message_text(), hf.list_calls), before,
+           "back to Hugging Face: the listing, the ticks and the message as they were, nothing fetched")
+        dlg.set_view("folder")
+        dlg.choose_folder_row(0)
+        dlg.press_delete()
+        dlg.press_delete_for_good()
+        pump(root, 0.05)
+        dlg.set_view("hf")
+        pump(root, 0.05)
+        eq(hf.list_calls, before[3] + 1, "a file was deleted meanwhile: the shown listing is listed again")
+        eq(len(dlg.row_texts()), 5, "...and shown")
+        dlg.set_view("folder")
+        dlg.set_view("hf")
+        pump(root, 0.05)
+        eq(hf.list_calls, before[3] + 1, "nothing deleted this time: nothing fetched")
+        # Escape and Close with the question up
+        dlg.set_view("folder")
+        dlg.choose_folder_row(0)
+        dlg.press_delete()
+        pump(root, 0.05)
+        dlg.event_generate("<Escape>")
+        pump(root, 0.1)
+        check(alive(dlg) and dlg.question_text() == "" and dlg.ticked_rows() == [0],
+              "Escape with the question up answers Keep (the window stays)")
+        dlg.press_delete()
+        dlg._close_btn.invoke()
+        pump(root, 0.1)
+        check(alive(dlg) and dlg.question_text() == "", "Close with the question up answers Keep first")
+        eq(len(files.deletes), 1, "...and deletes nothing")
+        # Change… in the folder view
+        dd.filedialog.askdirectory = lambda **kw: "D:/Other/Models"      # no native picker in a test
+        dlg._change_link._label.event_generate("<Button-1>")
+        pump(root, 0.1)
+        eq((dlg.flow.dest_dir, dlg.folder.dest_dir), (OTHER, OTHER), "Change… sets the one folder of both views")
+        eq((dlg.folder_rows(), dlg.ticked_rows()), ([(LB[0], "", "9.1 GB")], []), "...and reads the new folder")
+        eq(dlg.dest_line().split(" ")[:2], ["In", "Other\\Models"], "the folder line follows")
+        files.folders[OTHER] = []
+        dlg.set_view("hf")
+        dlg.set_view("folder")
+        pump(root, 0.05)
+        eq((dlg.list_placeholder(), placeholder_look(dlg)), (folder_flow.HINT_EMPTY, (dd.T.TEXT_3, 11, "left")),
+           "an empty folder: the placeholder, drawn as a hint")
+        eq(dlg.button_states()["Delete…"], False, "...and Delete… off")
+        dlg._close_btn.invoke()
+        pump(root, 0.1)
+        check(not alive(dlg), "Close with no question closes the window")
+    finally:
+        dd.filedialog.askdirectory = saved
+        close_dialog(root, dlg)
+    # the switch is off while downloading
+    gate = threading.Event()
+    hf = FakeHf()
+    hf.script = [("p", GIB, 0.1), ("hold", gate), ("stop",)]
+    files = FakeFiles()
+    dlg, _done = open_dialog(root, hf, threaded=True, files=files)
+    try:
+        dlg.set_repo(REPO)
+        dlg.list_files()
+        eq(dlg.switch_states()["In this folder"], (False, False), "listing: the switch is off")
+        check(pump_until(root, lambda: len(dlg.row_texts()) == 5), "listing arrives")
+        dlg.choose_row(0)
+        dlg._download_btn.invoke()
+        check(pump_until(root, lambda: dlg.flow.done_bytes >= GIB), "the download runs")
+        eq(dlg.switch_states(), {"Hugging Face": (True, False), "In this folder": (False, False)},
+           "downloading: the switch is greyed")
+        dlg._tabs["folder"]._label.event_generate("<Button-1>")
+        pump(root, 0.05)
+        eq((dlg.view(), files.lists), ("hf", []), "a click on it does nothing")
+        dlg.cancel()
+        gate.set()
+        check(pump_until(root, lambda: dlg.flow.phase == "list"), "the download stopped")
+        eq(dlg.switch_states()["In this folder"], (False, True), "the switch is back")
+    finally:
+        gate.set()
+        close_dialog(root, dlg)
+
+
 def test_no_after_leaks(root, errs: list[str]) -> None:
     pump(root, 0.3)
     before = pending_afters(root)
@@ -743,7 +1083,7 @@ def run() -> int:
     try:
         for fn in (test_enter_and_bad_repo, test_list_and_select, test_resume_and_discard, test_progress_and_cancel,
                    test_done, test_errors, test_long_list_scrolls, test_change_folder, test_close_paths,
-                   test_batch):
+                   test_batch, test_folder_view, test_folder_switch_rules):
             gc.collect()
             print(f"-- {fn.__name__}", flush=True)
             try:

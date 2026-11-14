@@ -9,15 +9,23 @@ Two parts:
     state on on_change(). A late answer of an older request (another repo typed meanwhile, the window closed) is
     dropped by a sequence number. One action at a time; hf_download.download never runs twice at once: the files of
     a batch are fetched one by one, each on its own worker started when the one before has answered.
-  * DownloadDialog - a thin CTkToplevel view over one DownloadFlow, in the house style (history_dialog /
-    settings_dialog). No Tk call is ever made off the main thread.
+  * DownloadDialog - a thin CTkToplevel view over one DownloadFlow and one folder_flow.FolderFlow (the second
+    view, "In this folder"), in the house style (history_dialog / settings_dialog). No Tk call is ever made off the
+    main thread.
 
-Layout (420 logical px wide, fixed height, as the v1.13 mockup): title + "Hugging Face"; repo box + List files; the
+Layout (420 logical px wide, fixed height, as the v1.13 mockup): title + the view switch "Hugging Face | In this
+folder" (the window opens on Hugging Face); repo box + List files; the
 file list (scrolls when long; a click ticks / unticks a row; split / unsupported rows are greyed and cannot be
 ticked); "To <folder> · N GB free · Change…"; Close + Download (Resume when the one ticked file has a kept partial
 file; "Download N files" with several); a hairline; the file being fetched ("File 2 of 3: <name>" in a batch), its
 progress bar, "4.6 of 12.2 GB · 38% · 41 MB/s · about 3 min left" and Cancel download (or Discard partial download,
 one ticked file only); the message.
+
+"In this folder" (FolderFlow; the owner-approved mockup): heading "Models in this folder"; no repo row, the list 38 px
+taller in its place; the folder's .gguf files with their sizes, one chosen at a time (round marks), a file a running
+llama-server serves greyed and not choosable; "In <folder> · N GB free · Change…"; Close + Delete…; under the
+hairline nothing until Delete… asks "Delete <name> (<size>) for good? This cannot be undone." with Keep and Delete
+for good. The file is deleted by model_files.delete only (FolderFlow calls it); this module deletes nothing.
 
 Policy (on top of hf_download's own): gated and private repos only show hf_download's sentence (no login, no token).
 Nothing downloaded is executed or opened here: the finished path only goes to on_done(path) as data. Repo text, file
@@ -42,7 +50,9 @@ from typing import Any, Callable
 import customtkinter as ctk
 
 import hf_download
+import model_files
 import theme as T
+from folder_flow import FolderFlow, fmt_size, question_for
 from hf_download import HfError, HfFile, RepoListing
 from sweep_dialog import center_over, later, release_modal, style_dialog
 
@@ -86,16 +96,7 @@ _SPLIT_N_RE = re.compile(r"-[0-9]{5}-of-([0-9]{5})\.gguf$", re.IGNORECASE)
 
 
 # ================================================================================================ pure formatters
-def fmt_size(n: Any) -> str:
-    """'12.2 GB' (GB = 1024^3 bytes, as Explorer and the Model list show it); '922 MB' below 1 GB."""
-    try:
-        v = int(n)
-    except (TypeError, ValueError):
-        return "? GB"
-    if v >= GIB:
-        return f"{v / GIB:.1f} GB"
-    return f"{max(1, round(v / MIB))} MB"
-
+# fmt_size ('12.2 GB', '922 MB') lives in folder_flow, which shows the same sizes; it is imported above.
 
 def fmt_free(n: int | None) -> str:
     """Free space for the folder line: '212 GB free', '8.4 GB free'; '' when unknown."""
@@ -505,6 +506,12 @@ class DownloadFlow:
             self._post(self._info_answer, seq, dest, listing, free, pend)
 
         self._spawn(work)
+
+    def refresh_free(self) -> None:
+        """Read the free space (and the kept parts of the shown list) of dest_dir again, on a worker: after a model
+        file was deleted in the folder view."""
+        if not self.closed:
+            self._refresh_info()
 
     def _info_answer(self, seq: int, dest: str, listing: RepoListing | None, free: int | None,
                      pend: dict[str, int] | None) -> None:
@@ -959,7 +966,21 @@ ARM_S = 0.4              # a close in the first moment waits until the window is
 PUMP_MS = 40             # own answer queue (only when the master has no post())
 CHECK_OFF = "\uE739"     # Segoe Fluent Icons Checkbox
 CHECK_ON = "\uE73D"      # CheckboxCompositeReversed
-DOWNLOAD_W = 130         # room for "Download 12 files"
+RADIO_OFF = "\uECCA"     # Segoe Fluent Icons RadioBtnOff: the folder view chooses one file at a time
+RADIO_ON = "\uECCB"      # RadioBtnOn
+DOWNLOAD_W = 130         # room for "Download 12 files"; Delete… and Delete for good use the same width
+VIEW_HF = "hf"           # the two views of the window
+VIEW_FOLDER = "folder"
+TAB_HF = "Hugging Face"
+TAB_FOLDER = "In this folder"
+TITLE_HF = "Download a model"
+TITLE_FOLDER = "Models in this folder"
+DELETE_LABEL = "Delete…"
+KEEP_LABEL = "Keep"
+DELETE_YES_LABEL = "Delete for good"
+LIST_GROW = 38           # the folder view has no repo row: the list takes its 28 px and its 10 px gap
+ASK_H = 88               # the question area: the file name, bar, figures and action row's 100 px minus its gap
+Q_NAME_MAX = 110         # a longer file name is shortened in the question so it stays within three lines
 _TONE_COLOR = {"info": T.TEXT_2, "warn": T.AMBER, "error": T.RED_TEXT, "ok": T.ACCENT}
 
 
@@ -975,12 +996,14 @@ def _named_runner(run: Callable[..., None]) -> Callable[[Callable[[], None]], No
 
 
 class DownloadDialog(ctk.CTkToplevel):
-    """The "Download a model" window over one DownloadFlow. dest_dir: the models folder (it must exist).
-    on_done(path) runs once per finished download, on the Tk thread."""
+    """The "Download a model" window over one DownloadFlow and one FolderFlow. dest_dir: the models folder (it must
+    exist). on_done(path) runs once per finished download, on_deleted(path) once per file deleted in the folder view,
+    both on the Tk thread. hf / files: the hf_download and model_files stand-ins of a test."""
 
     def __init__(self, master, dest_dir: str, *, on_done: Callable[[str], None] | None = None,
+                 on_deleted: Callable[[str], None] | None = None,
                  run_worker: Callable[[Callable[[], None]], None] | None = None,
-                 post: Callable[..., None] | None = None, hf: Any = None) -> None:
+                 post: Callable[..., None] | None = None, hf: Any = None, files: Any = None) -> None:
         super().__init__(master, fg_color=T.BG)
         style_dialog(self)
         self._master = master
@@ -994,6 +1017,10 @@ class DownloadDialog(ctk.CTkToplevel):
         self.logical_width = WIDTH
         self.logical_height = HEIGHT
         self._configured: dict[int, dict[str, Any]] = {}
+        self._view = VIEW_HF
+        self._drawn_view = VIEW_HF
+        self._on_deleted = on_deleted
+        self._deleted_meanwhile = False       # a file was deleted in the folder view since it was switched to
 
         if post is None:
             mpost = getattr(master, "post", None)
@@ -1025,14 +1052,25 @@ class DownloadDialog(ctk.CTkToplevel):
         head = ctk.CTkFrame(self, fg_color="transparent")
         head.grid(row=0, column=0, sticky="ew", padx=PAD, pady=(12, 0))
         head.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(head, text="Download a model", anchor="w", height=20,
-                     font=ctk.CTkFont(family=ui, size=14, weight="bold")).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(head, text="Hugging Face", anchor="e", height=20, font=self._small,
-                     text_color=T.TEXT_3).grid(row=0, column=1, sticky="e")
+        self._title = ctk.CTkLabel(head, text=TITLE_HF, anchor="w", height=20,
+                                   font=ctk.CTkFont(family=ui, size=14, weight="bold"))
+        self._title.grid(row=0, column=0, sticky="w")
+        # the view switch "Hugging Face | In this folder": a 20 px track, the chosen part raised
+        self._switch = ctk.CTkFrame(head, fg_color=T.SURFACE, corner_radius=8)
+        self._switch.grid(row=0, column=1, sticky="e")
+        self._tabs: dict[str, ctk.CTkLabel] = {}
+        for i, (key, text) in enumerate(((VIEW_HF, TAB_HF), (VIEW_FOLDER, TAB_FOLDER))):
+            tab = ctk.CTkLabel(self._switch, text=text, height=16, width=self._measure(11, text) + 16,
+                               corner_radius=6, font=self._small, fg_color=T.SURFACE, text_color=T.TEXT)
+            tab.grid(row=0, column=i, padx=(2, 2 if i else 0), pady=2)
+            tab.bind("<Button-1>", lambda _e, k=key: self.set_view(k))
+            self._tabs[key] = tab
+        self._switch_enabled = True
 
         # ---- 2. repo box + List files
         box = ctk.CTkFrame(self, fg_color="transparent")
         box.grid(row=1, column=0, sticky="ew", padx=PAD, pady=(10, 0))
+        self._repo_box = box
         box.grid_columnconfigure(0, weight=1)
         self._repo_var = ctk.StringVar(value="")
         self._entry = ctk.CTkEntry(box, textvariable=self._repo_var, height=28, corner_radius=8, font=self._mono,
@@ -1053,8 +1091,8 @@ class DownloadDialog(ctk.CTkToplevel):
         # no fixed height: a failed listing shows its reason here, and that wraps onto several lines
         self._placeholder = ctk.CTkLabel(self._list, text=HINT_ENTER, anchor="w", justify="left", font=self._small,
                                          text_color=T.TEXT_3, wraplength=WIDTH - 2 * PAD - 48)
-        self._row_widgets: list[tuple[Row, ctk.CTkFrame, ctk.CTkLabel, list[Any]]] = []
-        self._rows_drawn: tuple[Row, ...] | None = None
+        self._row_widgets: list[tuple[Any, ctk.CTkFrame, ctk.CTkLabel, list[Any]]] = []   # Row or FolderRow
+        self._rows_drawn: tuple[Any, ...] | None = None
         self._hover_row: int | None = None
 
         # ---- 4. To <folder> · N GB free · Change…
@@ -1085,6 +1123,13 @@ class DownloadDialog(ctk.CTkToplevel):
                                            text_color=T.ON_PRIMARY, text_color_disabled=T.TEXT_3,
                                            command=self.download, state="disabled")
         self._download_btn.grid(row=0, column=2, sticky="e")
+        # the folder view's button in the same place: bold, in the colour of the error text, as Cancel download
+        self._delete_btn = ctk.CTkButton(foot, text=DELETE_LABEL, width=DOWNLOAD_W, height=28, corner_radius=8,
+                                         font=self._body_bold, fg_color=T.RAISED, hover_color=T.RAISED_HOVER,
+                                         text_color=T.RED_TEXT, text_color_disabled=T.TEXT_3,
+                                         command=self.ask_delete, state="disabled")
+        self._delete_btn.grid(row=0, column=2, sticky="e")
+        self._delete_btn.grid_remove()
 
         # ---- 6. progress: hairline, file name, bar, figures, Cancel download / Discard partial download
         ctk.CTkFrame(self, fg_color=T.HAIRLINE, bg_color=T.HAIRLINE, height=1, corner_radius=0).grid(
@@ -1100,6 +1145,25 @@ class DownloadDialog(ctk.CTkToplevel):
         act.grid(row=9, column=0, sticky="ew", padx=PAD, pady=(8, 0))
         act.grid_columnconfigure(0, weight=1)
         act.grid_propagate(False)
+        self._act = act
+        # the folder view's question, in place of the four rows above (same height: nothing below moves)
+        self._ask = ctk.CTkFrame(self, fg_color="transparent", height=ASK_H)
+        self._ask.grid(row=6, column=0, rowspan=4, sticky="ew", padx=PAD, pady=(12, 0))
+        self._ask.grid_columnconfigure(0, weight=1)
+        self._ask.grid_propagate(False)
+        self._ask_text = ctk.CTkLabel(self._ask, text="", anchor="nw", justify="left", height=32,
+                                      wraplength=WIDTH - 2 * PAD, font=self._body, text_color=T.TEXT)
+        self._ask_text.grid(row=0, column=0, columnspan=3, sticky="ew")
+        self._keep_btn = ctk.CTkButton(self._ask, text=KEEP_LABEL, width=90, height=28, corner_radius=8,
+                                       font=self._body, fg_color="transparent", border_width=1,
+                                       border_color=T.RAISED_HOVER, hover_color=T.RAISED, text_color=T.TEXT,
+                                       text_color_disabled=T.TEXT_3, command=self.keep)
+        self._keep_btn.grid(row=1, column=1, sticky="e", padx=(0, 8), pady=(8, 0))
+        self._yes_btn = ctk.CTkButton(self._ask, text=DELETE_YES_LABEL, width=DOWNLOAD_W, height=28, corner_radius=8,
+                                      font=self._body_bold, fg_color=T.DANGER, hover_color=T.DANGER_HOVER,
+                                      text_color=T.TEXT, text_color_disabled=T.TEXT_3, command=self.delete_for_good)
+        self._yes_btn.grid(row=1, column=2, sticky="e", pady=(8, 0))
+        self._ask.grid_remove()
         # the one action here that stops something: bold, in the colour of the error text
         self._cancel_btn = ctk.CTkButton(act, text="Cancel download", width=130, height=28, corner_radius=8,
                                          font=self._body_bold, fg_color=T.RAISED, hover_color=T.RAISED_HOVER,
@@ -1116,6 +1180,8 @@ class DownloadDialog(ctk.CTkToplevel):
         self._msg.grid(row=10, column=0, sticky="new", padx=PAD, pady=(10, 12))
         self._msg_kind = "info"
 
+        self.folder = FolderFlow(dest_dir, files=files if files is not None else model_files, run_worker=run_worker,
+                                 post=post, on_change=self._render, on_deleted=self._folder_deleted)
         self.flow = DownloadFlow(dest_dir, hf=hf if hf is not None else hf_download, run_worker=run_worker,
                                  post=post, on_change=self._render, on_done=on_done)
         self._repo_var.trace_add("write", lambda *_a: self._repo_changed())
@@ -1185,6 +1251,81 @@ class DownloadDialog(ctk.CTkToplevel):
             return
         self.flow.toggle(self.flow.rows[index])
 
+    def choose_folder_row(self, index: int) -> None:
+        """A click on row index of the folder view: chooses it (one at a time)."""
+        if self._destroyed or not 0 <= index < len(self.folder.rows):
+            return
+        self.folder.choose(self.folder.rows[index])
+
+    def _click_row(self, index: int) -> None:
+        if self._view == VIEW_FOLDER:
+            self.choose_folder_row(index)
+        else:
+            self.choose_row(index)
+
+    def ask_delete(self) -> None:
+        """Delete…: the question under the hairline."""
+        if not self._destroyed:
+            self.folder.ask()
+
+    def keep(self) -> None:
+        if not self._destroyed:
+            self.folder.keep()
+
+    def delete_for_good(self) -> None:
+        if not self._destroyed:
+            self.folder.confirm()
+
+    def _can_switch(self) -> bool:
+        """The view switch is off while the download side lists or downloads and while the question or a delete is
+        up."""
+        return (not self._destroyed and not self.flow.closed and not self.flow.busy and not self.folder.closed
+                and self.folder.phase not in ("asking", "deleting"))
+
+    def set_view(self, name: str) -> bool:
+        """Show the Hugging Face view or the folder view (the switch). The folder view reads the folder again each
+        time it is chosen; the download side is shown as it was left, listed again only when a file was deleted
+        meanwhile and a listing is on screen (its rows could name a deleted file as downloaded)."""
+        if self._destroyed or name not in (VIEW_HF, VIEW_FOLDER):
+            return False
+        if name == self._view:
+            return True
+        if not self._can_switch():
+            return False
+        self._view = name
+        folder = name == VIEW_FOLDER
+        self._shown(self._repo_box, not folder)
+        self._list.configure(height=self._list_drawn_h() + LIST_GROW if folder else LIST_H)
+        if folder:
+            self._deleted_meanwhile = False
+            self.folder.refresh()
+        else:
+            f = self.flow
+            if self._deleted_meanwhile and f.rows and f.phase in ("list", "done") and f.can_list:
+                f.list_now()
+            self._deleted_meanwhile = False
+        self._render()
+        return True
+
+    def _list_drawn_h(self) -> int:
+        """The list's inner height as drawn in the Hugging Face view. CTkScrollableFrame is as tall as the taller of
+        its canvas (LIST_H) and its scrollbar (200 by default), so the folder view grows from that, not from LIST_H."""
+        try:
+            bar = int(self._list._scrollbar.cget("height"))      # CTk internal, read only
+        except Exception:  # noqa: BLE001
+            bar = 200
+        return max(LIST_H, bar)
+
+    def _folder_deleted(self, path: str) -> None:
+        """FolderFlow deleted path: the free space is read again, the download side is told, then the app."""
+        self._deleted_meanwhile = True
+        self.flow.refresh_free()
+        if self._on_deleted is not None:
+            try:
+                self._on_deleted(path)
+            except Exception:  # noqa: BLE001
+                log.exception("download dialog: on_deleted callback failed")
+
     def download(self) -> None:
         if not self._destroyed:
             self.flow.start()
@@ -1198,17 +1339,21 @@ class DownloadDialog(ctk.CTkToplevel):
             self.flow.discard_partial()
 
     def change_folder(self) -> None:
-        """Change…: pick another models folder (a folder picker; nothing is written until a download starts)."""
-        if self._destroyed or not self.flow.can_change_dest:
+        """Change…: pick another models folder (a folder picker; nothing is written until a download starts). Both
+        views use the one folder; in the folder view the new folder is read at once."""
+        folder = self._view == VIEW_FOLDER
+        if self._destroyed or not self.flow.can_change_dest or (folder and not self.folder.can_change_dest):
             return
         try:
             path = filedialog.askdirectory(parent=self, initialdir=self.flow.dest_dir, mustexist=True,
-                                           title="Download models to")
+                                           title="Models folder" if folder else "Download models to")
         except Exception:  # noqa: BLE001
             log.exception("folder picker failed")
             return
         if path and not self._destroyed:
-            self.flow.set_dest_dir(os.path.normpath(str(path)))
+            p = os.path.normpath(str(path))
+            if self.flow.set_dest_dir(p):
+                self.folder.set_dest_dir(p, read=folder)
 
     # ------------------------------------------------------------------ public read-only helpers (tests)
     def row_texts(self) -> list[tuple[str, str, str]]:
@@ -1219,13 +1364,42 @@ class DownloadDialog(ctk.CTkToplevel):
         return out
 
     def row_states(self) -> list[tuple[bool, bool]]:
-        """(can be ticked, ticked) per row."""
-        ticked = set(self.flow.ticked)
+        """(can be ticked / chosen, ticked / chosen) per row of the view shown."""
+        ticked = self._view_chosen()
         return [(row.selectable, row.file in ticked) for row, _f, _g, _l in self._row_widgets]
 
     def ticked_rows(self) -> list[int]:
-        """The indexes of the ticked rows, as drawn (the glyph shows the ticked box)."""
-        return [i for i, (_row, _f, glyph, _l) in enumerate(self._row_widgets) if glyph.cget("text") == CHECK_ON]
+        """The indexes of the ticked (chosen) rows, as drawn (the glyph shows the ticked box / the filled circle)."""
+        on = self._view_marks()[1]
+        return [i for i, (_row, _f, glyph, _l) in enumerate(self._row_widgets) if glyph.cget("text") == on]
+
+    def view(self) -> str:
+        """VIEW_HF or VIEW_FOLDER."""
+        return self._view
+
+    def heading_text(self) -> str:
+        return str(self._title.cget("text"))
+
+    def switch_states(self) -> dict[str, tuple[bool, bool]]:
+        """Each part of the view switch: label -> (chosen, can be clicked)."""
+        return {str(t.cget("text")): (k == self._view, self._switch_enabled) for k, t in self._tabs.items()}
+
+    def folder_rows(self) -> list[tuple[str, str, str]]:
+        """The folder view's rows as shown: (file name, note, size); [] in the other view."""
+        return self.row_texts() if self._view == VIEW_FOLDER else []
+
+    def question_text(self) -> str:
+        """The question under the hairline ('' when it is not up)."""
+        return str(self._ask_text.cget("text")) if self._ask.winfo_manager() else ""
+
+    def press_delete(self) -> None:
+        self._delete_btn.invoke()
+
+    def press_keep(self) -> None:
+        self._keep_btn.invoke()
+
+    def press_delete_for_good(self) -> None:
+        self._yes_btn.invoke()
 
     def list_placeholder(self) -> str:
         """The muted line inside the empty list ('' when rows are shown)."""
@@ -1234,8 +1408,11 @@ class DownloadDialog(ctk.CTkToplevel):
     def button_states(self) -> dict[str, bool]:
         """Every visible button (and the Change… link): label -> enabled."""
         out: dict[str, bool] = {}
-        for b in (self._list_btn, self._close_btn, self._download_btn, self._cancel_btn, self._discard_btn):
-            if b.winfo_manager():
+        repo, ask = bool(self._repo_box.winfo_manager()), bool(self._ask.winfo_manager())
+        for b, shown in ((self._list_btn, repo), (self._close_btn, True), (self._download_btn, True),
+                         (self._delete_btn, True), (self._cancel_btn, True), (self._discard_btn, True),
+                         (self._keep_btn, ask), (self._yes_btn, ask)):
+            if shown and b.winfo_manager():
                 out[str(b.cget("text"))] = str(b.cget("state")) != "disabled"
         out["Change…"] = self._change_enabled
         return out
@@ -1288,6 +1465,32 @@ class DownloadDialog(ctk.CTkToplevel):
                 hi = mid - 1
         return text[:lo] + "…"
 
+    # the view shown: its rows, chosen files, marks, whether rows can be clicked now, the empty list's line
+    def _view_rows(self) -> tuple[Any, ...]:
+        return self.folder.rows if self._view == VIEW_FOLDER else self.flow.rows
+
+    def _view_chosen(self) -> set[Any]:
+        if self._view == VIEW_FOLDER:
+            return {self.folder.chosen} if self.folder.chosen is not None else set()
+        return set(self.flow.ticked)
+
+    def _view_marks(self) -> tuple[str, str]:
+        return (RADIO_OFF, RADIO_ON) if self._view == VIEW_FOLDER else (CHECK_OFF, CHECK_ON)
+
+    def _view_locked(self) -> bool:
+        return not self.folder.can_choose if self._view == VIEW_FOLDER else self.flow.busy
+
+    def _view_hint(self) -> str:
+        return self.folder.hint if self._view == VIEW_FOLDER else self._hint_for(self.flow)
+
+    @staticmethod
+    def _shown(w: Any, on: bool) -> None:
+        """Grid w again (with its own options) or take it out; nothing when it already is so."""
+        if on and not w.winfo_manager():
+            w.grid()
+        elif not on and w.winfo_manager():
+            w.grid_remove()
+
     def _rebuild_rows(self) -> None:
         for _row, frame, glyph, _l in self._row_widgets:
             self._configured.pop(id(frame), None)
@@ -1296,22 +1499,26 @@ class DownloadDialog(ctk.CTkToplevel):
         self._row_widgets = []
         self._hover_row = None
         f = self.flow
-        self._rows_drawn = f.rows
-        if not f.rows:
-            reason = f.phase == "error" and bool(f.list_hint)       # something to act on, not a hint
+        rows = self._view_rows()
+        self._rows_drawn = rows
+        self._drawn_view = self._view
+        if not rows:
+            # something to act on (a failed listing), not a hint; the folder view only ever shows a hint here
+            reason = self._view == VIEW_HF and f.phase == "error" and bool(f.list_hint)
             self._placeholder.configure(
-                text=self._hint_for(f), font=self._body if reason else self._small,
+                text=self._view_hint(), font=self._body if reason else self._small,
                 text_color=_TONE_COLOR.get(f.list_hint_kind, T.RED_TEXT) if reason else T.TEXT_3)
             self._placeholder.grid(row=0, column=0, sticky="ew", padx=10)
             return
         self._placeholder.grid_remove()
         inner = WIDTH - 2 * PAD - 8 - 20                    # list padding + scrollbar
-        for i, row in enumerate(f.rows):
+        mark_off = self._view_marks()[0]
+        for i, row in enumerate(rows):
             muted = not row.selectable and row.note != "· downloaded"
             frame = ctk.CTkFrame(self._list, fg_color=T.SURFACE, corner_radius=6, height=ROW_H)
             frame.grid(row=i, column=0, sticky="ew", padx=2, pady=0)
             frame.grid_columnconfigure(2, weight=1)
-            glyph = ctk.CTkLabel(frame, text=CHECK_OFF, width=16, height=ROW_H, font=self._glyph,
+            glyph = ctk.CTkLabel(frame, text=mark_off, width=16, height=ROW_H, font=self._glyph,
                                  text_color=T.TEXT_3)
             glyph.grid(row=0, column=0, padx=(6, 6))
             size_w = self._measure(12, row.size_text) + 8
@@ -1327,7 +1534,7 @@ class DownloadDialog(ctk.CTkToplevel):
                                   text_color=T.TEXT_3 if muted else T.TEXT_2)
             size_l.grid(row=0, column=3, sticky="e", padx=(4, 8))
             for w in (frame, glyph, name_l, note_l, size_l):
-                w.bind("<Button-1>", lambda _e, k=i: self.choose_row(k))
+                w.bind("<Button-1>", lambda _e, k=i: self._click_row(k))
                 w.bind("<Enter>", lambda _e, k=i: self._set_hover(k))
                 w.bind("<Leave>", lambda _e: self._set_hover(None))
                 if row.selectable:
@@ -1349,22 +1556,36 @@ class DownloadDialog(ctk.CTkToplevel):
             last.update(new)
 
     def _paint_rows(self) -> None:
-        ticked = set(self.flow.ticked)
+        ticked = self._view_chosen()
+        mark_off, mark_on = self._view_marks()
+        locked = self._view_locked()
         for i, (row, frame, glyph, _labels) in enumerate(self._row_widgets):
             on = row.file in ticked
-            hover = self._hover_row == i and row.selectable and not self.flow.busy
+            hover = self._hover_row == i and row.selectable and not locked
             self._cfg(frame, fg_color=T.RAISED if on or hover else T.SURFACE)
-            self._cfg(glyph, text=CHECK_ON if on else CHECK_OFF,
+            self._cfg(glyph, text=mark_on if on else mark_off,
                       text_color=T.TEXT if on else (T.TEXT_2 if row.selectable else T.HAIRLINE))
 
     def _render(self) -> None:
         """Redraw from the flow's public state (on_change; always on the Tk thread)."""
         f = getattr(self, "flow", None)
-        if self._destroyed or f is None:              # (the flow's first answer can come while it is built)
+        ff = getattr(self, "folder", None)
+        if self._destroyed or f is None or ff is None:   # (a flow's first answer can come while it is built)
             return
-        if f.rows is not self._rows_drawn or (not f.rows and self._placeholder.cget("text") != self._hint_for(f)):
+        folder = self._view == VIEW_FOLDER
+        rows = self._view_rows()
+        if (rows is not self._rows_drawn or self._drawn_view != self._view
+                or (not rows and self._placeholder.cget("text") != self._view_hint())):
             self._rebuild_rows()
         self._paint_rows()
+        # heading + the view switch
+        self._cfg(self._title, text=TITLE_FOLDER if folder else TITLE_HF)
+        self._switch_enabled = self._can_switch()
+        for key, tab in self._tabs.items():
+            chosen = key == self._view
+            self._cfg(tab, fg_color=T.RAISED if chosen else T.SURFACE,
+                      text_color=T.TEXT if self._switch_enabled else T.TEXT_3,
+                      cursor="hand2" if self._switch_enabled and not chosen else "")
         # entry + buttons
         self._cfg(self._entry, state="normal" if f.can_edit else "disabled",
                   text_color=T.TEXT if f.can_edit else T.TEXT_3)
@@ -1374,34 +1595,65 @@ class DownloadDialog(ctk.CTkToplevel):
         can = f.can_download
         self._cfg(self._download_btn, text=f.download_label, state="normal" if can else "disabled",
                   fg_color=T.TEXT if can else T.SURFACE)
-        if f.phase == "downloading":
-            self._discard_btn.grid_remove()
-            self._cancel_btn.grid(row=0, column=1, sticky="e")
-            self._cfg(self._cancel_btn, state="normal" if f.can_cancel else "disabled")
-        else:
+        if folder:
+            self._shown(self._download_btn, False)
+            self._shown(self._delete_btn, True)
+            self._cfg(self._delete_btn, state="normal" if ff.can_delete else "disabled")
             self._cancel_btn.grid_remove()
-            if f.can_discard:
-                self._discard_btn.grid(row=0, column=1, sticky="e")
-                self._cfg(self._discard_btn, state="normal")
-            else:
+            self._discard_btn.grid_remove()
+        else:
+            self._shown(self._delete_btn, False)
+            self._shown(self._download_btn, True)
+            if f.phase == "downloading":
                 self._discard_btn.grid_remove()
-        # folder line
+                self._cancel_btn.grid(row=0, column=1, sticky="e")
+                self._cfg(self._cancel_btn, state="normal" if f.can_cancel else "disabled")
+            else:
+                self._cancel_btn.grid_remove()
+                if f.can_discard:
+                    self._discard_btn.grid(row=0, column=1, sticky="e")
+                    self._cfg(self._discard_btn, state="normal")
+                else:
+                    self._discard_btn.grid_remove()
+        # folder line ("In" the folder in the folder view, "To" it in the other)
+        self._cfg(self._dest_to, text="In" if folder else "To")
         self._cfg(self._dest_folder, text=f.dest_text)
         self._cfg(self._dest_free, text=f"· {f.free_text} ·" if f.free_text else "·")
-        self._change_enabled = f.can_change_dest
+        self._change_enabled = f.can_change_dest and (not folder or ff.can_change_dest)
         self._cfg(self._change_link, text_color=T.TEXT_2 if self._change_enabled else T.TEXT_3,
                   cursor="hand2" if self._change_enabled else "")
-        # progress
-        self._cfg(self._prog_title, text=self._fit(f.progress_title, WIDTH - 2 * PAD))
-        self._cfg(self._prog_text, text=f.progress_text)
-        frac = f.progress_fraction
-        if abs(float(self._bar.get()) - frac) > 1e-4:
-            self._bar.set(frac)
+        if folder:
+            # under the hairline: nothing (no name, no bar) until Delete… puts the question there
+            asked = ff.asked
+            for w in (self._prog_title, self._bar, self._prog_text, self._act):
+                self._shown(w, asked is None)
+            self._shown(self._ask, asked is not None)
+            self._cfg(self._prog_title, text="")
+            self._cfg(self._prog_text, text="")
+            self._cfg(self._bar, fg_color=T.BG, progress_color=T.BG)
+            if asked is not None:
+                answer = "normal" if ff.phase == "asking" else "disabled"
+                self._cfg(self._ask_text, text=question_for(asked, Q_NAME_MAX))
+                self._cfg(self._keep_btn, state=answer)
+                self._cfg(self._yes_btn, state=answer)
+            message, kind = ff.message, ff.message_kind
+        else:
+            self._shown(self._ask, False)
+            for w in (self._prog_title, self._bar, self._prog_text, self._act):
+                self._shown(w, True)
+            self._cfg(self._bar, fg_color=T.RAISED, progress_color=T.ACCENT)
+            # progress
+            self._cfg(self._prog_title, text=self._fit(f.progress_title, WIDTH - 2 * PAD))
+            self._cfg(self._prog_text, text=f.progress_text)
+            frac = f.progress_fraction
+            if abs(float(self._bar.get()) - frac) > 1e-4:
+                self._bar.set(frac)
+            message, kind = f.message, f.message_kind
         # message
-        self._msg_kind = f.message_kind if f.message else "info"
-        self._cfg(self._msg, text=f.message, text_color=_TONE_COLOR.get(self._msg_kind, T.TEXT_2))
-        # a close that waited for the download to stop
-        if self._close_wanted and f.can_close and not self._closing:
+        self._msg_kind = kind if message else "info"
+        self._cfg(self._msg, text=message, text_color=_TONE_COLOR.get(self._msg_kind, T.TEXT_2))
+        # a close that waited for the download (or a delete) to stop
+        if self._close_wanted and f.can_close and ff.can_close and not self._closing:
             later(self, 1, self.close)
 
     @staticmethod
@@ -1416,9 +1668,14 @@ class DownloadDialog(ctk.CTkToplevel):
 
     # ------------------------------------------------------------------ closing
     def close(self) -> None:
-        """Close / X / Escape. While a download runs it is cancelled first (the partial file is kept) and the
-        window closes once hf_download has stopped. In the first ARM_S seconds the close waits for the arm time."""
+        """Close / X / Escape. While the folder view's question is up, the first close answers Keep. While a
+        download runs it is cancelled first (the partial file is kept) and the window closes once hf_download has
+        stopped; while a delete runs the window closes when it has answered. In the first ARM_S seconds the close
+        waits for the arm time."""
         if self._destroyed or self._closing:
+            return
+        if self.folder.phase == "asking":
+            self.folder.keep()
             return
         wait = self._armed_at - time.monotonic()
         if wait > 0:
@@ -1426,7 +1683,7 @@ class DownloadDialog(ctk.CTkToplevel):
                 self._close_pending = True
                 later(self, int(wait * 1000) + 20, self._close_armed)
             return
-        if not self.flow.close():
+        if not self.folder.close() or not self.flow.close():
             self._close_wanted = True
             return
         self._closing = True
@@ -1459,3 +1716,6 @@ class DownloadDialog(ctk.CTkToplevel):
         flow = getattr(self, "flow", None)
         if flow is not None:
             flow.abandon()
+        folder = getattr(self, "folder", None)
+        if folder is not None:
+            folder.abandon()

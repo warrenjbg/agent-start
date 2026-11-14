@@ -1887,7 +1887,8 @@ class AgentStartApp(AppView, AppTray, ctk.CTk):
         try:
             os.makedirs(dest, exist_ok=True)
             import download_dialog
-            self._download_win = download_dialog.DownloadDialog(self, dest, on_done=self._model_downloaded)
+            self._download_win = download_dialog.DownloadDialog(self, dest, on_done=self._model_downloaded,
+                                                                on_deleted=self._model_deleted)
         except Exception:  # noqa: BLE001
             log.exception("the download window could not be opened")
             self._download_win = None
@@ -1898,6 +1899,18 @@ class AgentStartApp(AppView, AppTray, ctk.CTk):
         """A model file arrived (checked by hf_download): look for models again, so Settings and the model menu
         list it. Nothing is started and nothing about the running engine changes."""
         log.info("model downloaded: %s", os.path.basename(str(path)))
+        self._models_changed()
+
+    def _model_deleted(self, path: str) -> None:
+        """The download window's folder view deleted a model file (model_files.delete, after the user confirmed):
+        look for models again, so Settings and the model menu drop it. Nothing is started or stopped, and the
+        running engine is not touched (model_files refuses a file an engine serves)."""
+        log.info("model deleted: %s", os.path.basename(str(path)))
+        self._models_changed()
+
+    def _models_changed(self) -> None:
+        """The models folder changed (a download arrived, a file was deleted): the model search again, on a
+        worker."""
         if getattr(self, "_no_finder", False) or not self.engine.can(CAP_FIND_INSTALL):
             return
 

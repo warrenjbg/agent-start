@@ -287,14 +287,17 @@ card, so treat them as a starting point. Strata is not checked: it manages its o
 
 Settings → Model → **Download a model…** closes Settings and opens a window on the main window; the app stays
 usable while it is open. Paste a Hugging Face repository (`owner/name` or a `huggingface.co` link) and press
-*List files*: the `.gguf` files are listed with their sizes. Pick one and press *Download*.
+*List files*: the `.gguf` files are listed with their sizes. Tick one or more and press *Download* (it reads
+*Download 3 files* with three ticked).
 
 - The file goes beside the model in use, or to `Downloads\llama-models` when there is none (*Change…* picks
   another folder on a local drive). When it has arrived and been checked, the app looks for models again, so the
   Model list and the ⇄ button show it. Nothing is started.
 - The window shows progress, speed and time left. *Cancel download* (or closing the window) stops it and keeps the
   partial file; *Resume* continues it later, after hashing what is already there; *Discard partial download*
-  deletes it. One download at a time.
+  deletes it (with one file ticked). Ticked files download one after another in list order: one free-space
+  check for all of them first, *File 2 of 3* while they run; *Cancel download* or a failure stops the rest, and
+  the files that already arrived stay.
 - Checks: the first request goes only to `huggingface.co`, later ones only to it or a `*.hf.co` download host, over
   HTTPS; the download is pinned to the listed commit; free space (the rest of the file plus 1 GB) is checked first;
   the bytes are hashed while they arrive, and the file only gets its final name when size and SHA-256 match the
@@ -304,6 +307,14 @@ usable while it is open. Paste a Hugging Face repository (`owner/name` or a `hug
 - Not supported: gated or private repositories (they need a Hugging Face login), and models split over several
   files (listed greyed out). Vision files (`mmproj-*.gguf`) are listed and can be downloaded like a model.
 - Tested against local stand-in servers only; a download from the real Hugging Face has not been run yet.
+
+**In this folder:** the switch at the top right of the window (*Hugging Face | In this folder*) lists the
+`.gguf` files that are in the models folder, with their sizes and the free space. Choose one and press
+*Delete…*; the window asks "Delete <name> (<size>) for good? This cannot be undone.", and *Delete for good*
+deletes that one file permanently (it does not go to the Recycle Bin), so the space comes back at once; the app
+then looks for models again. A model an engine is running right now is greyed (*in use by llama.cpp*) and cannot
+be deleted. The delete is also refused, and the file left as it was, when the file changed since it was listed,
+is a link, is open in another program or is not directly in the folder. Only `model_files.py` deletes such a file.
 
 **Switching back and forth:** each engine keeps its own launch settings (program or launcher, port, model) in
 `config.json` under `engine_profiles`, so switching back restores them. A `config.json` from 1.11.0 that still
@@ -496,8 +507,9 @@ notification area on a runner). *Local* suites open the real window and take scr
 | `tests\test_llama_models.py` | CI | Per-model arguments for llama.cpp: what is kept per model and what is shared, a first-time model, the short `--alias`, an old config loading unchanged |
 | `tests\test_hf_download.py` | CI | The Hugging Face module against local stand-in servers: listing, allowed hosts and redirects, size and SHA-256, resume, free space, never overwriting, only touching its own partial files |
 | `tests\test_model_files.py` | CI | The models folder's own files: listing only the plain `.gguf` files directly in it, and deleting one confirmed file only after every check (name, same folder, no link or junction, unchanged since listed, not being served, not in use), on real files, junctions and hard links in a temp folder |
-| `tests\test_download_flow.py` | CI | The download window's logic without a window: listing, selection, progress, cancel, resume, discard, every error sentence |
-| `tests\test_download_dialog.py` | Local | The download window itself (opens windows), with a stand-in for the Hugging Face module |
+| `tests\test_download_flow.py` | CI | The download window's logic without a window: listing, selection, ticking several files and downloading them one after another (one space check, cancel or a failure stops the rest), progress, cancel, resume, discard, every error sentence |
+| `tests\test_folder_flow.py` | CI | The window's *In this folder* view without a window, with a stand-in for `model_files`: the listing and the served file, choosing, the question, Keep, deleting exactly the confirmed file with a serving check made after the click, every refusal, late answers; one delete with the real `model_files` in a temp folder |
+| `tests\test_download_dialog.py` | Local | The download window itself (opens windows), both views, with stand-ins for the Hugging Face module and for `model_files` (nothing is deleted) |
 | `tests\test_hermes_alias.py` | CI | The Hermes alias module with a stand-in for `hermes.exe` (no process is started): the one-argument write, the read-back, reading first, leaving an entry with other keys alone |
 | `tests\test_alias_wiring.py` | CI | The app's side of the Hermes alias on a stand-in object: when an update starts, everything that keeps it from starting, one attempt per model and port |
 | `tests\test_metrics_worker.py` | CI | The metrics worker (the poll while serving) on a stand-in object, one turn at a time with a stand-in clock: what it polls and hands on, everything that keeps it from polling, serving time and GPU energy for the usage history, a failing line never ending the loop |

@@ -543,6 +543,63 @@ def test_download_link() -> None:
         app.destroy()
 
 
+def test_download_wiring() -> None:
+    """The app opens the download window with on_done AND on_deleted; a deleted model file runs the same model
+    search as a finished download (the worker launcher is a recorder: nothing is searched, no window is opened)."""
+    import download_dialog
+    app, det, ep = _llama_app([EXE, "-m", MODEL_A, "--port", "9931"], _found())
+    made: list[dict] = []
+
+    class Recorder:                                    # in place of the window: records how it was made
+        def __init__(self, master, dest, **kw) -> None:
+            made.append(dict(kw, master=master, dest=dest))
+
+        def winfo_exists(self) -> bool:
+            return True
+
+        def lift(self) -> None:
+            pass
+
+        def focus_force(self) -> None:
+            pass
+
+    saved = download_dialog.DownloadDialog
+    keep = (app._no_finder, app._download_dir)
+    calls: list = []
+    orig = app._run_worker
+    dest = str(TMP / "download-wiring")
+    try:
+        download_dialog.DownloadDialog = Recorder      # type: ignore[misc,assignment]
+        app._download_dir = lambda: dest               # type: ignore[method-assign]
+        win = app.open_download()
+        check(isinstance(win, Recorder) and len(made) == 1, f"open_download made the window once ({made})")
+        kw = made[0] if made else {}
+        check(kw.get("on_done") == app._model_downloaded and kw.get("on_deleted") == app._model_deleted
+              and kw.get("dest") == dest and kw.get("master") is app,
+              f"the app passes on_done=_model_downloaded and on_deleted=_model_deleted ({sorted(kw)})")
+        app._no_finder = False                          # the search is wired; the recorder keeps it from running
+
+        def record(name, fn, *a):
+            return calls.append((name, fn, a)) if name == "hc-find-install" else orig(name, fn, *a)
+
+        app._run_worker = record                        # type: ignore[method-assign]
+        kw["on_deleted"](os.path.join(dest, "gone-Q4.gguf"))
+        kw["on_done"](os.path.join(dest, "new-Q4.gguf"))
+        check(len(calls) == 2 and calls[0][:2] == calls[1][:2] == ("hc-find-install", main._find_install_worker)
+              and calls[0][2][0] is calls[1][2][0] is app.engine and calls[0][2][3] is calls[1][2][3],
+              f"a deleted model runs the same model search as a finished download ({calls})")
+        check(app.state_name != main.ACTIVE, "nothing was started")
+        app._no_finder = True
+        kw["on_deleted"](os.path.join(dest, "x.gguf"))
+        check(len(calls) == 2, "with the search switched off (as the test app has it) nothing runs")
+    finally:
+        download_dialog.DownloadDialog = saved          # type: ignore[misc]
+        app._no_finder, app._download_dir = keep        # type: ignore[method-assign]
+        app._run_worker = orig                          # type: ignore[method-assign]
+        app._download_win = None
+        app.destroy()
+
+
 def test_llama_tabs_and_controls() -> None:
     SD.FIT_DEBOUNCE_MS = 200                          # the debounce itself is the same code; shorter for the test
     fit = FakeFit()
@@ -819,7 +876,7 @@ def test_advanced_fold() -> None:
 
 def run() -> int:
     for t in (test_strata_tabs, test_fit_largest_entry, test_alias_switch, test_download_link,
-              test_llama_tabs_and_controls,
+              test_download_wiring, test_llama_tabs_and_controls,
               test_advanced_fold):
         print(f"-- {t.__name__}")
         try:
