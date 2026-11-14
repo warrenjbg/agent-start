@@ -111,7 +111,7 @@ def snapshot(root: Path = TMP) -> dict[str, tuple]:
         with os.scandir(d) as it:
             for e in it:
                 st = e.stat(follow_symlinks=False)
-                if e.is_symlink() or e.is_junction() or st.st_file_attributes & REPARSE:
+                if e.is_symlink() or st.st_file_attributes & REPARSE:      # (a junction is a reparse point)
                     try:
                         out[e.path] = ("link", os.readlink(e.path))
                     except OSError:
